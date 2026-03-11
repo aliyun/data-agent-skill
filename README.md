@@ -229,15 +229,24 @@ data-agent-skill/
 
 ## 在 AI Agent 中使用
 
-### 在 Claude Code 中使用
+### 在 OpenClaw 中使用
 
-```bash
-# 将本项目添加为 Skill 源
-/plugin marketplace add <your-repo>/data-agent-skill
+* 直接告诉OpenClaw本项目地址即可
 
-# 或直接引用本地路径
-# 在 Claude Code 中，Claude 会自动读取 dms-data-agent/SKILL.md
-```
+<img width="2528" height="1694" alt="image" src="https://github.com/user-attachments/assets/2f3795c4-4ab5-4805-9d49-7088cbf4a0f9" />
+
+* 查看有哪些数据库
+
+<img width="2364" height="1478" alt="image" src="https://github.com/user-attachments/assets/ae1295ae-ddc9-4ac9-8fbf-d0d13bee1c2e" />
+
+* 问数
+<img width="2358" height="1456" alt="image" src="https://github.com/user-attachments/assets/99a4c166-61e8-404c-9042-7ffded595124" />
+
+* 分析出报告
+
+<img width="1500" height="2076" alt="image" src="https://github.com/user-attachments/assets/763f459a-ad07-4d9a-8611-06a49318f5d7" />
+
+
 
 ### 在其他 AI Agent 中使用
 
