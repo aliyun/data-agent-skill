@@ -1,5 +1,7 @@
 # Data Agent CLI 依赖
-# 使用: pip install -r requirements.txt
+# 推荐使用虚拟环境安装:
+# python3 -m venv venv && source venv/bin/activate
+# pip install -r requirements.txt
 
 # 阿里云 SDK
 alibabacloud-tea-openapi>=0.3.0

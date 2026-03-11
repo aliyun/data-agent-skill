@@ -53,7 +53,9 @@
 git clone <repo-url>
 cd data-agent-skill
 
-# 2. 安装依赖
+# 2. 创建虚拟环境并安装依赖
+python3 -m venv venv
+source venv/bin/activate  # Windows 用户请使用: venv\Scripts\activate
 pip install -r requirements.txt
 
 # 3. 配置凭证

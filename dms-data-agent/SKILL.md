@@ -204,7 +204,9 @@ export OPENCLAW_SESSION="your-session-id"
 ## 安装
 
 ```bash
-# 1. 安装依赖
+# 1. 创建虚拟环境并安装依赖
+python3 -m venv venv
+source venv/bin/activate  # Windows 用户请使用: venv\Scripts\activate
 pip install -r requirements.txt
 
 # 2. 配置凭证和地域（复制示例文件并填入真实值）
