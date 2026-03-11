@@ -24,25 +24,6 @@
 - **Agent 友好的输出格式**：重构了终端输出格式，采用标准 Markdown，消除了复杂 ASCII 边框对 AI 解析带来的干扰，方便大模型精准提取关键结论。
 - **独立报告下载**：新增 `reports` 子命令，支持一键查看与自动下载生成的报告和图表文件。
 
-### 作为 Skill 使用
-
-当 AI Agent 加载本 Skill 后，用户只需用自然语言描述分析需求：
-
-```
-用户: 分析一下 employees 数据库中各部门的平均工资
-
-Agent: 我来帮您分析。首先检查 Data Center 中的数据库...
-       [自动执行 ls --search employees]
-       
-       已找到 employees 数据库，包含 departments、employees、salaries 等表。
-       现在发起深度分析...
-       [自动执行 db 子命令，填充所有必要参数]
-       
-       分析完成！以下是各部门平均工资排名：
-       1. Engineering: $85,000
-       2. Sales: $78,000
-       3. Marketing: $65,000
-```
 
 ### Skill 信息
 
@@ -244,7 +225,7 @@ data-agent-skill/
 
 * 分析出报告
 
-<img width="1500" height="2076" alt="image" src="https://github.com/user-attachments/assets/763f459a-ad07-4d9a-8611-06a49318f5d7" />
+<img width="2360" height="2034" alt="image" src="https://github.com/user-attachments/assets/335476d1-a766-4457-8b43-a904decbcdc2" />
 
 
 
