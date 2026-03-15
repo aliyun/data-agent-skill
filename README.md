@@ -18,11 +18,12 @@
 ### 新版特性 (v1.4.1)
 
 - **原生异步执行模式**：重构了底层执行架构，`db` 和 `file` 命令现已默认采用异步模式运行。发起任务后立刻返回 `Session ID` 并将进程置于后台执行。
-- **状态机与会话隔离**：每个 Session 独享隔离的工作目录（`sessions/<id>/`），内置独立的状态记录（`status.txt`）和进度流（`progress.log`）。
+- **状态机与会话隔离**：每个 Session 独享隔离的工作目录（`sessions/<id>/`），内置独立的状态记录（`status.txt`）、进度流（`progress.log`）以及专供 Agent 读取的结构化数据流（`progress.jsonl`）。
 - **完善的进度保护与并发锁**：支持 `worker.pid` 进程锁机制，避免同一会话产生数据冲突；支持精确的 SSE `checkpoint.txt` 位点记录以实现断点续传。
 - **原生后台通知集成**：支持 OpenClaw / Clawdbot 的原生挂起通知事件（`tools.exec.notifyOnExit`），分析结束后立刻唤醒前端大模型。
 - **Agent 友好的输出格式**：重构了终端输出格式，采用标准 Markdown，消除了复杂 ASCII 边框对 AI 解析带来的干扰，方便大模型精准提取关键结论。
 - **独立报告下载**：新增 `reports` 子命令，支持一键查看与自动下载生成的报告和图表文件。
+- **实时进度监控**：worker 进程强制 flush 输出，确保 `progress.log` 和 `progress.jsonl` 实时同步更新，Agent 可通过 `tail -f sessions/{session_id}/progress.jsonl` 实时监控分析进展。
 
 
 ### Skill 信息
@@ -173,9 +174,26 @@ python3 dms-data-agent/data_agent_cli.py db \
 # 查看会话的当前状态（running, waiting_input, completed, failed）
 cat sessions/<SESSION_ID>/status.txt
 
-# 查看最新的输出日志
+# 查看最新的输出日志（纯文本格式）
 cat sessions/<SESSION_ID>/progress.log
+
+# 实时监控结构化进度（推荐，JSONL 格式）
+tail -f sessions/<SESSION_ID>/progress.jsonl | jq '.data.content'
 ```
+
+## 会话目录结构
+
+每个 Session 在 `sessions/<session_id>/` 目录下维护独立的状态和日志：
+
+| 文件 | 内容 | 用途 |
+|------|------|------|
+| `status.txt` | `running` / `waiting_input` / `completed` / `failed` | 快速判断任务状态 |
+| `progress.log` | 完整执行日志（纯文本） | 人工阅读进度与结果 |
+| `progress.jsonl` | 结构化执行日志（每行一个 JSON） | **Agent 实时监控进展（推荐）** |
+| `checkpoint.txt` | SSE 流位点值 | 断点续传依据 |
+| `result.json` | 结构化状态 | 程序化检查 |
+| `input.json` | 输入参数 | 追溯任务配置 |
+| `worker.pid` | Worker 进程 PID | 并发防护锁 |
 
 ## 项目结构
 

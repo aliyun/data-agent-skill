@@ -11,13 +11,59 @@ Output modes:
   "raw"               -- every SSE event printed verbatim.
 
 Author: Tinker
-Created: 2026-03-04
+Created: 2026-03-03
 """
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
+import sys
+import threading
+
+from cli.log_handler import StructuredLogHandler
+
+# ---------------------------------------------------------------------------
+# StreamState — shared mutable state across events within one stream
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StreamState:
+    """Mutable state shared across events within a single SSE stream."""
+
+    # Output mode: "summary" (minimal) | "detail" (full) | "raw"
+    output_mode: str = "summary"
+
+    # Accumulated textual output for capturing the final result
+    full_output: list[str] = field(default_factory=list)
+
+    # Output directory for saving extracted images etc.
+    output_dir: Optional[Path] = None
+
+    # Log handler for process logs (if provided)
+    process_log_handler: Optional[StructuredLogHandler] = None
+
+    # Session metadata for structured logging
+    session_id: Optional[str] = None
+    session_status: Optional[str] = None
+
+    # Last received checkpoint (for checkpoint.txt generation)
+    last_checkpoint: Optional[int] = None
+
+    # Cross-event accumulators for content groups
+    content_category: Optional[str] = None
+    pending_step_label: Optional[str] = None
+    output_conclusion_chunks: Optional[list[str]] = None
+    tool_call_response_content: Optional[str] = None
+    ask_report_render_payload: Optional[dict] = None
+
+    # Stream completion state
+    got_content: bool = False
+    need_user_confirm: bool = False
+    is_attach: bool = False  # True when called from attach command
+
 
 from cli.formatters import (
     _SKIP_DATA_CATEGORIES,
@@ -32,6 +78,162 @@ from cli.formatters import (
     _fmt_ask_report_render,
 )
 from data_agent import SSEEvent, MessageHandler, DataSource
+
+
+# Global variables for structured logging
+_progress_jsonl_file = None
+_progress_log_file = None  # New variable for plain text log
+_jsonl_lock = threading.Lock()
+
+
+def init_structured_logging(output_dir: Optional[Path] = None):
+    """Initialize structured logging to both JSONL and plain text formats.
+
+    Args:
+        output_dir: Directory where progress.jsonl and progress.log should be created
+    """
+    global _progress_jsonl_file, _progress_log_file
+
+    if output_dir:
+        if not _progress_jsonl_file:
+            jsonl_path = output_dir / "progress.jsonl"
+            _progress_jsonl_file = open(jsonl_path, "w", encoding="utf-8")
+
+        # Only open progress.log if not already set
+        if not _progress_log_file:
+            log_path = output_dir / "progress.log"
+            # In worker processes, stdout is redirected to progress.log,
+            # so check if that's the case and reuse that fd
+            if hasattr(sys.stdout, 'name') and sys.stdout.name == str(log_path):
+                # stdout is already redirected to progress.log, reuse that fd
+                _progress_log_file = sys.stdout
+            else:
+                # In sync mode, open the log file directly
+                _progress_log_file = open(log_path, "w", encoding="utf-8")
+
+
+def close_structured_logging():
+    """Close the structured logging files."""
+    global _progress_jsonl_file, _progress_log_file
+
+    if _progress_jsonl_file:
+        _progress_jsonl_file.close()
+        _progress_jsonl_file = None
+
+    # Only close _progress_log_file if it's not sys.stdout (which happens
+    # when stdout is redirected to progress.log in worker processes)
+    if _progress_log_file and _progress_log_file is not sys.stdout:
+        _progress_log_file.close()
+        _progress_log_file = None
+
+
+def write_to_jsonl(data: dict):
+    """Write structured data to JSONL file.
+
+    Args:
+        data: Dictionary containing structured log data
+    """
+    global _progress_jsonl_file
+
+    if _progress_jsonl_file:
+        with _jsonl_lock:  # Thread-safe writing
+            # Add timestamp if not present
+            if 'timestamp' not in data:
+                data['timestamp'] = datetime.now().isoformat()
+            json_line = json.dumps(data, ensure_ascii=False)
+            _progress_jsonl_file.write(json_line + '\n')
+            _progress_jsonl_file.flush()
+
+
+def write_to_progress_log(text: str):
+    """Write text to progress log file.
+
+    Args:
+        text: Text to write to the plain text log
+    """
+    global _progress_log_file
+
+    # Skip writing if in worker process where stdout is redirected to progress.log
+    # This prevents duplication since print() calls already go to the same file
+    import os
+    if os.environ.get("DATA_AGENT_ASYNC_WORKER") == "1":
+        return
+
+    if _progress_log_file:
+        _progress_log_file.write(text)
+        _progress_log_file.flush()
+    else:
+        # Debug: log to file if _progress_log_file is None
+        debug_file = Path("/tmp/data_agent_debug.log")
+        with open(debug_file, "a") as f:
+            f.write(f"DEBUG: _progress_log_file is None, cannot write: {text[:50]}...\n")
+
+
+def _out(state: StreamState, text: str = "", **kwargs) -> None:
+    """Print text to console and record it as result output.
+
+    Use for actual Data Agent results that should appear in output.md:
+    conclusions, plans, SQL, reports, insights, recommendations, etc.
+    """
+    # In worker process, force flush after each print for real-time logging
+    import os
+    if os.environ.get("DATA_AGENT_ASYNC_WORKER") == "1":
+        kwargs['flush'] = True
+
+    print(text, **kwargs)
+    state.full_output.append(text)
+
+    # Write to progress.log (for both sync and async modes)
+    # Skip if in worker process where stdout is redirected to progress.log
+    # to prevent duplication
+    if os.environ.get("DATA_AGENT_ASYNC_WORKER") != "1" and text.strip():
+        progress_text = text + ("\n" if kwargs.get('end', '\n') == '\n' else "")
+        write_to_progress_log(progress_text)
+
+    # Write structured log entry to JSONL
+    if text.strip():  # Only log non-empty text
+        write_to_jsonl({
+            'type': 'output',
+            'content': text,
+            'category': 'result'
+        })
+
+    # Also write to process logs if handler is available
+    if state.process_log_handler and text.strip():
+        state.process_log_handler.write_both(text + ("\n" if kwargs.get('end', '\n') == '\n' else ""))
+
+
+def _log(state: StreamState, text: str = "", **kwargs) -> None:
+    """Print text to console only (progress.log) without recording to output.md.
+
+    Use for diagnostic / process information: user query echo, plan step
+    progress, status changes, intermediate code execution results, etc.
+    """
+    # In worker process, force flush after each print for real-time logging
+    import os
+    if os.environ.get("DATA_AGENT_ASYNC_WORKER") == "1":
+        kwargs['flush'] = True
+
+    print(text, **kwargs)
+
+    # Write to progress.log (for both sync and async modes)
+    # Skip if in worker process where stdout is redirected to progress.log
+    # to prevent duplication
+    if os.environ.get("DATA_AGENT_ASYNC_WORKER") != "1" and text.strip():
+        progress_text = text + ("\n" if kwargs.get('end', '\n') == '\n' else "")
+        write_to_progress_log(progress_text)
+
+    # Write structured log entry to JSONL
+    if text.strip():  # Only log non-empty text
+        write_to_jsonl({
+            'type': 'log',
+            'content': text,
+            'category': 'diagnostic'
+        })
+
+    # Also write to process logs if handler is available
+    if state.process_log_handler and text.strip():
+        state.process_log_handler.write_both(text + ("\n" if kwargs.get('end', '\n') == '\n' else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +252,9 @@ class StreamState:
 
     # Output directory for saving extracted images etc.
     output_dir: Optional[Path] = None
+
+    # Log handler for process logs (if provided)
+    process_log_handler: Optional[StructuredLogHandler] = None
 
     # Session ID for user prompts
     session_id: Optional[str] = None
@@ -91,23 +296,6 @@ class StreamState:
 # Public API
 # ---------------------------------------------------------------------------
 
-def _out(state: StreamState, text: str = "", **kwargs) -> None:
-    """Print text to console and record it as result output.
-
-    Use for actual Data Agent results that should appear in output.md:
-    conclusions, plans, SQL, reports, insights, recommendations, etc.
-    """
-    print(text, **kwargs)
-    state.full_output.append(text)
-
-
-def _log(state: StreamState, text: str = "", **kwargs) -> None:
-    """Print text to console only (progress.log) without recording to output.md.
-
-    Use for diagnostic / process information: user query echo, plan step
-    progress, status changes, intermediate code execution results, etc.
-    """
-    print(text, **kwargs)
 
 
 def _print_event(
@@ -170,6 +358,8 @@ def _stream_response(
     data_source: Optional[DataSource] = None,
     output_mode: str = "summary",
     output_dir: Optional[Path] = None,
+    process_log_handler: Optional[StructuredLogHandler] = None,
+    is_attach: bool = False,
 ) -> tuple[bool, bool, str]:
     """Stream response tokens to stdout in real-time.
 
@@ -180,15 +370,35 @@ def _stream_response(
     """
     state = StreamState(output_mode=output_mode)
     state.output_dir = output_dir
+    state.process_log_handler = process_log_handler  # Set the process log handler
     state.session_id = getattr(session, 'session_id', None)
     state.session_status = getattr(session, 'status', None)
     if hasattr(state.session_status, 'value'):
         state.session_status = state.session_status.value
+    # IMPORTANT: Set is_attach to True for attach mode
+    state.is_attach = is_attach
 
-    for event in message_handler.stream_events(session, query, data_source=data_source):
-        if event.event_type == "SSE_FINISH":
-            break
-        _print_event(event, output_mode, state=state)
+    # Initialize structured logging if output directory provided
+    init_structured_logging(output_dir)
+
+    try:
+        for event in message_handler.stream_events(session, query, data_source=data_source):
+            # Log SSE event to JSONL
+            write_to_jsonl({
+                'type': 'sse_event',
+                'event_type': event.event_type,
+                'category': event.category,
+                'content': event.content,
+                'data': event.data,
+                'raw_event': asdict(event)
+            })
+
+            if event.event_type == "SSE_FINISH":
+                break
+            _print_event(event, output_mode, state=state)
+    finally:
+        # Close structured logging
+        close_structured_logging()
 
     _finalize_stream(state)
 
@@ -561,10 +771,14 @@ def _flush_tool_call_response(state: StreamState) -> None:
             if not state.is_attach:
                 _out(state, f"\n> ⚠️  Please review the execution plan above. To confirm, DO NOT create a new session, use the existing session:")
                 session_id = state.session_id or "<SESSION_ID>"
-                _out(state, f">    python3 skill/data_agent_cli.py attach --session-id {session_id} -q '确认执行'")
-                _out(state, f">    python3 skill/data_agent_cli.py attach --session-id {session_id} -q 'confirm'")
+                _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '确认执行'")
+                _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q 'confirm'")
                 state.got_content = True
                 state.need_user_confirm = True
+            else:
+                # When in attach mode (plan confirmed), continue processing without setting need_user_confirm
+                _out(state, f"\n> ⚠️  Plan confirmed, continuing analysis...")
+                state.got_content = True
     elif result_type == "empty":
         pass  # ignore
     # Other result types: silent (no useful CLI output)
@@ -624,16 +838,27 @@ def _handle_chat_finish(state: StreamState, event: SSEEvent) -> None:
 
     if cat == "ask_plan" and content:
         _handle_ask_plan(state, content)
+        # If in attach mode, ensure need_user_confirm is set to False after plan confirmation
+        if state.is_attach:
+            state.need_user_confirm = False
         return
 
     if cat == "ask_human" and content:
         if state.is_attach:
+            # When in attach mode, we should continue processing further events
+            _out(state, f"\n[Processing human input response]")
+            _out(state, f"{content}")
+            _out(state, f"\n\u26a0\ufe0f  Continuing analysis after user input...")
+            state.got_content = True
+            # Do not set need_user_confirm to True as user has responded
+            # Explicitly reset need_user_confirm since user has responded
+            state.need_user_confirm = False
             return
         _out(state, f"\n[Human Input Required]")
         _out(state, f"{content}")
         _out(state, f"\n\u26a0\ufe0f  Please respond using the existing session (DO NOT create a new session):")
         session_id = state.session_id or "<SESSION_ID>"
-        _out(state, f"   python3 skill/data_agent_cli.py attach --session-id {session_id} -q '<your response>'")
+        _out(state, f"   python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '<your response>'")
         state.got_content = True
         state.need_user_confirm = True
         return
@@ -641,6 +866,15 @@ def _handle_chat_finish(state: StreamState, event: SSEEvent) -> None:
     if cat == "ask_report_render" and content:
         # Avoid printing ask_report_render again if session status is already WAIT_INPUT, which is handled in attach code
         if state.is_attach:
+            # When in attach mode, process the report render request
+            out = _fmt_ask_report_render(content, getattr(state, "session_id", None))
+            if out:
+                _out(state, out)
+            _out(state, f"\n\u26a0\ufe0f  Report render confirmed, continuing...")
+            state.got_content = True
+            # Do not set need_user_confirm to True as user has already responded
+            # Explicitly reset need_user_confirm since user has responded
+            state.need_user_confirm = False
             return
         out = _fmt_ask_report_render(content, getattr(state, "session_id", None))
         if out:
@@ -670,9 +904,9 @@ def _handle_ask_sql(state: StreamState, content: str) -> None:
                     session_id = state.session_id or "<SESSION_ID>"
                     _out(state, f"\n> ⚠️  Please review the SQL above.")
                     _out(state, f"> To confirm and execute ONLY this SQL, DO NOT create a new session, use the existing session:")
-                    _out(state, f">    python3 skill/data_agent_cli.py attach --session-id {session_id} -q '确认执行当前SQL'")
+                    _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '确认执行当前SQL'")
                     _out(state, f"> To agree to execute all subsequent SQL automatically:")
-                    _out(state, f">    python3 skill/data_agent_cli.py attach --session-id {session_id} -q '同意后续所有SQL执行'")
+                    _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '同意后续所有SQL执行'")
                     state.got_content = True
                     state.need_user_confirm = True
                 return
@@ -685,9 +919,9 @@ def _handle_ask_sql(state: StreamState, content: str) -> None:
         session_id = state.session_id or "<SESSION_ID>"
         _out(state, f"\n> ⚠️  Please review the SQL above.")
         _out(state, f"> To confirm and execute ONLY this SQL, DO NOT create a new session, use the existing session:")
-        _out(state, f">    python3 skill/data_agent_cli.py attach --session-id {session_id} -q '确认执行当前SQL'")
+        _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '确认执行当前SQL'")
         _out(state, f"> To agree to execute all subsequent SQL automatically:")
-        _out(state, f">    python3 skill/data_agent_cli.py attach --session-id {session_id} -q '同意后续所有SQL执行'")
+        _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '同意后续所有SQL执行'")
         state.got_content = True
         state.need_user_confirm = True
 
@@ -729,10 +963,17 @@ def _handle_ask_plan(state: StreamState, content: str) -> None:
             if not state.is_attach:
                 _out(state, f"\n> \u26a0\ufe0f  Please review the execution plan above. To confirm, DO NOT create a new session, use the existing session:")
                 session_id = state.session_id or "<SESSION_ID>"
-                _out(state, f">    python3 skill/data_agent_cli.py attach --session-id {session_id} -q '\u786e\u8ba4\u6267\u884c'")
-                _out(state, f">    python3 skill/data_agent_cli.py attach --session-id {session_id} -q 'confirm'")
+                _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '\u786e\u8ba4\u6267\u884c'")
+                _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q 'confirm'")
                 state.got_content = True
                 state.need_user_confirm = True
+            else:
+                # When in attach mode (plan confirmed), reset the need_user_confirm flag
+                # so subsequent steps and results are processed normally
+                _out(state, f"\n> \u26a0\ufe0f  Plan confirmed, continuing analysis...")
+                state.got_content = True
+                # In attach mode, explicitly reset need_user_confirm since user has confirmed
+                state.need_user_confirm = False
             return
     except (json.JSONDecodeError, TypeError):
         pass
@@ -742,9 +983,15 @@ def _handle_ask_plan(state: StreamState, content: str) -> None:
     if not state.is_attach:
         _out(state, f"\n> \u26a0\ufe0f  Please review the plan above. To confirm, DO NOT create a new session, use the existing session:")
         session_id = state.session_id or "<SESSION_ID>"
-        _out(state, f">    python3 skill/data_agent_cli.py attach --session-id {session_id} -q '\u786e\u8ba4\u6267\u884c'")
+        _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '\u786e\u8ba4\u6267\u884c'")
         state.got_content = True
         state.need_user_confirm = True
+    else:
+        # In attach mode, indicate that plan was confirmed and continue
+        _out(state, f"\n> \u26a0\ufe0f  Plan confirmed, continuing...")
+        state.got_content = True
+        # In attach mode, explicitly reset need_user_confirm since user has confirmed
+        state.need_user_confirm = False
 
 
 def _handle_sse_failure(state: StreamState, event: SSEEvent) -> None:

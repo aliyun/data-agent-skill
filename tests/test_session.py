@@ -73,7 +73,7 @@ class TestSessionManager:
         ]
 
         with patch("time.sleep"):  # Skip actual sleep
-            session = session_manager.wait_until_running("agent-1", "session-1")
+            session = session_manager.wait_until_running("session-1", "agent-1")
 
         assert session.status == SessionStatus.RUNNING
         assert mock_client.describe_session.call_count == 3
@@ -94,7 +94,7 @@ class TestSessionManager:
                 mock_time.side_effect = [0, 0, 150, 150]  # Start, check, elapsed > max_wait
 
                 with pytest.raises(SessionTimeoutError) as exc_info:
-                    session_manager.wait_until_running("agent-1", "session-1", max_wait=120)
+                    session_manager.wait_until_running("session-1", "agent-1", max_wait=120)
 
         assert "session-1" in str(exc_info.value)
 
@@ -111,7 +111,7 @@ class TestSessionManager:
         with patch("time.sleep"):
             with patch("time.time", return_value=0):
                 with pytest.raises(SessionTimeoutError) as exc_info:
-                    session_manager.wait_until_running("agent-1", "session-1")
+                    session_manager.wait_until_running("session-1", "agent-1")
 
         assert "failed" in str(exc_info.value).lower()
 

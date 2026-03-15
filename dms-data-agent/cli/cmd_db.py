@@ -14,7 +14,9 @@ from typing import Optional
 
 # from cli.notify import push_notification
 from cli.worker_lock import check_worker_lock, write_worker_pid, acquire_worker_lock, release_worker_lock
-from cli.streaming import StreamState, _print_event, _stream_response, _finalize_stream
+from cli.worker_utils import is_worker_process, setup_async_worker, handle_worker_completion
+from cli.streaming_utils import run_worker_with_handler, execute_single_query, execute_query_batch
+from cli.streaming import _stream_response, _finalize_stream, StreamState, _print_event
 from data_agent import (
     DataAgentConfig,
     DataAgentClient,
@@ -75,7 +77,7 @@ def _db_attach(
 
     print(f"\nAttaching to session {session_id} ({label})...")
     print(f"Session status: {session.status.value}")
-    
+
     # Special reminder for WAIT_INPUT status
     if session.status.value == "WAIT_INPUT":
         print("\n⚠️  Session is in WAIT_INPUT state.")
@@ -92,7 +94,7 @@ def _db_attach(
         print()
         print("   To modify the query:")
         print(f"     python3 skill/data_agent_cli.py attach --session-id {session_id} -q 'your new question'")
-    
+
     print(f"Output directory: {session_dir.resolve()}")
     print("Press Ctrl+C to detach.")
     print("\n---\n")
@@ -111,6 +113,10 @@ def _db_attach(
         state.session_status = state.session_status.value
 
     try:
+        # Initialize structured logging for attach mode
+        from cli.streaming import init_structured_logging, close_structured_logging
+        init_structured_logging(session_dir)
+
         for event in sse_client.stream_chat_content(
             agent_id=session.agent_id,
             session_id=session_id,
@@ -144,6 +150,9 @@ def _db_attach(
         rid_str = f" (Request-Id: {request_id})" if request_id else ""
         print(f"\nError: {e}{rid_str}", file=sys.stderr)
         return
+    finally:
+        # Close structured logging
+        close_structured_logging()
 
     _finalize_stream(state)
     if state.got_content:
@@ -259,7 +268,7 @@ def cmd_db(args: argparse.Namespace) -> None:
     # Create new session
     session_mode = args.session_mode.upper()
     data_source = _build_data_source(args)
-    is_worker = os.environ.get("DATA_AGENT_ASYNC_WORKER") == "1"
+    is_worker = is_worker_process()
 
     if getattr(args, "async_run", False) and not is_worker:
         # PARENT PROCESS LOGIC
@@ -267,83 +276,17 @@ def cmd_db(args: argparse.Namespace) -> None:
         print(f"Creating session for async execution...")
         session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id), enable_search=enable_search)
 
-        session_id = session.session_id
-        session_dir = Path(f"sessions/{session_id}")
-        session_dir.mkdir(parents=True, exist_ok=True)
-
-        # Check for existing worker
-        existing_pid = check_worker_lock(session_dir)
-        if existing_pid:
-            print(f"⚠️  A worker process (PID {existing_pid}) is already running for session {session_id}.", file=sys.stderr)
-            print(f"   Check progress: cat sessions/{session_id}/progress.log", file=sys.stderr)
-            print(f"   Current status: {(session_dir / 'status.txt').read_text().strip() if (session_dir / 'status.txt').exists() else 'unknown'}", file=sys.stderr)
-            sys.exit(1)
-
-        # Save input.json
-        input_data = vars(args).copy()
-        input_data.pop("func", None)
-        with open(session_dir / "input.json", "w", encoding="utf-8") as f:
-            json.dump(input_data, f, ensure_ascii=False, indent=2)
-
-        # Write status.txt
-        with open(session_dir / "status.txt", "w", encoding="utf-8") as f:
-            f.write("running")
-
-        # Construct worker command
-        cmd = [sys.executable] + [arg for arg in sys.argv if arg != "--async-run"]
-        env = os.environ.copy()
-        env["DATA_AGENT_ASYNC_WORKER"] = "1"
-        env["DATA_AGENT_SESSION_ID"] = session_id
-        env["DATA_AGENT_AGENT_ID"] = session.agent_id
-
-        # Make sure PYTHONIOENCODING is set so unicode is flushed properly
-        env["PYTHONIOENCODING"] = "utf-8"
-        # Force unbuffered output so logs appear immediately
-        env["PYTHONUNBUFFERED"] = "1"
-
-        # Spawn worker
-        log_file = open(session_dir / "progress.log", "w", encoding="utf-8")
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            env=env
-        )
-        write_worker_pid(session_dir, proc.pid)
-
-        print(f"\n✅ Async task started. Session ID: {session_id}")
-        print(f"Check progress at: sessions/{session_id}/progress.log")
-
-        # 让 OpenClaw 知道后台进程退出
-        # if os.environ.get("OPENCLAW_SHELL") == "exec":
-        #     proc.wait()
-
-        sys.exit(0)
+        # Use common async worker setup
+        setup_async_worker(args, session)
 
     elif is_worker:
-        # WORKER PROCESS LOGIC
-        session_id = os.environ["DATA_AGENT_SESSION_ID"]
-        agent_id = os.environ.get("DATA_AGENT_AGENT_ID", "")
-        session_dir = Path(f"sessions/{session_id}")
-
-        print(f"[Worker] Session ID: {session_id}", flush=True)
-        print(f"[Worker] Agent ID: {agent_id}", flush=True)
-        acquire_worker_lock(session_dir)
-
-        try:
-            print("[Worker] Connecting to session...", flush=True)
-            # Parent already verified the session is ready (AgentStatus=RUNNING),
-            # so skip wait_for_running — DescribeDataAgentSession may report
-            # SessionStatus=CREATING for a long time even when the session is
-            # fully usable.
-            session = session_manager.create_or_reuse(session_id=session_id, agent_id=agent_id, wait_for_running=False)
-            print(f"[Worker] Session connected (status={session.status.value})", flush=True)
+        # WORKER PROCESS LOGIC - using common utility
+        def db_query_executor(message_handler, session, args):
             output_mode = getattr(args, "output", "summary")
-            output_text = ""
+            data_source = _build_data_source(args)
 
             if args.query:
-                _, need_confirm, output_text = _db_single(message_handler, session, data_source, args.query, output_mode=output_mode, output_dir=session_dir)
+                _, need_confirm, _ = _db_single(message_handler, session, data_source, args.query, output_mode=output_mode, output_dir=Path(f"sessions/{session.session_id}"))
             else:
                 if session_mode == "ANALYSIS":
                     default_queries = [
@@ -355,47 +298,10 @@ def cmd_db(args: argparse.Namespace) -> None:
                         f"What tables exist in {data_source.db_name} database?",
                         "Who has the highest sales?",
                     ]
-                _, need_confirm, output_text = _db_batch(message_handler, session, data_source, default_queries, output_mode=output_mode, output_dir=session_dir)
+                _, need_confirm, _ = _db_batch(message_handler, session, data_source, default_queries, output_mode=output_mode, output_dir=Path(f"sessions/{session.session_id}"))
+            return True, need_confirm  # got_content=True, need_confirm
 
-            # Do not write output.md anymore
-            # if output_text:
-            #     with open(session_dir / "output.md", "w", encoding="utf-8") as f:
-            #         f.write(output_text)
-
-            if need_confirm:
-                with open(session_dir / "status.txt", "w", encoding="utf-8") as f:
-                    f.write("waiting_input")
-                with open(session_dir / "result.json", "w", encoding="utf-8") as f:
-                    json.dump({
-                        "status": "waiting_input",
-                        # "output_file": "output.md"
-                    }, f)
-                # push_notification(session_id, ...)
-                sys.exit(0)
-
-            # Success
-            with open(session_dir / "status.txt", "w", encoding="utf-8") as f:
-                f.write("completed")
-            with open(session_dir / "result.json", "w", encoding="utf-8") as f:
-                json.dump({
-                    "status": "completed",
-                    # "output_file": "output.md"
-                }, f)
-
-            # push_notification(session_id, f"✅ Data Agent task completed for session {session_id}. Please use `attach` to view details or check `sessions/{session_id}/progress.log`.")
-
-        except Exception as e:
-            # Error
-            with open(session_dir / "status.txt", "w", encoding="utf-8") as f:
-                f.write("failed")
-            with open(session_dir / "result.json", "w", encoding="utf-8") as f:
-                json.dump({"status": "failed", "error": str(e)}, f)
-
-            # push_notification(session_id, f"❌ Data Agent task failed for session {session_id}: {str(e)}")
-        finally:
-            release_worker_lock(session_dir)
-
-        sys.exit(0)
+        run_worker_with_handler(args, data_source=_build_data_source(args), query_execution_func=db_query_executor)
 
     # NORMAL SYNCHRONOUS LOGIC
     mode_desc = {
@@ -409,31 +315,38 @@ def cmd_db(args: argparse.Namespace) -> None:
     enable_search = getattr(args, 'enable_search', False)
     session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id), enable_search=enable_search)
     print(f"Session ready: {session.session_id}")
-    print(f"\n\U0001f4a1 Tip: To continue this session later, use: python3 skill/data_agent_cli.py attach --session-id {session.session_id}")
+    print(f"\n💡 Tip: To continue this session later, use: python3 dms-data-agent/data_agent_cli.py attach --session-id {session.session_id}")
 
     # Execute query
     output_mode = getattr(args, "output", "summary")
     session_dir = Path(f"sessions/{session.session_id}")
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.query:
-        _, _, output_text = _db_single(message_handler, session, data_source, args.query, output_mode=output_mode, output_dir=session_dir)
-    else:
-        # Default batch preset queries
-        if session_mode == "ANALYSIS":
-            default_queries = [
-                f"Analyze the overall data structure and table relationships of {data_source.db_name} database",
-                "Identify key metrics and distribution characteristics in the data",
-            ]
-        else:
-            default_queries = [
-                f"What tables exist in {data_source.db_name} database?",
-                "Who has the highest sales?",
-            ]
-        print(f"\nNo query specified, running preset queries ({len(default_queries)} total)...")
-        _, _, output_text = _db_batch(message_handler, session, data_source, default_queries, output_mode=output_mode, output_dir=session_dir)
+    # Initialize structured logging for sync mode
+    from cli.streaming import init_structured_logging, close_structured_logging
+    init_structured_logging(session_dir)
 
-    # Write output to output.md is disabled
+    try:
+        if args.query:
+            _, _, output_text = _db_single(message_handler, session, data_source, args.query, output_mode=output_mode, output_dir=session_dir)
+        else:
+            # Default batch preset queries
+            if session_mode == "ANALYSIS":
+                default_queries = [
+                    f"Analyze the overall data structure and table relationships of {data_source.db_name} database",
+                    "Identify key metrics and distribution characteristics in the data",
+                ]
+            else:
+                default_queries = [
+                    f"What tables exist in {data_source.db_name} database?",
+                    "Who has the highest sales?",
+                ]
+            print(f"\nNo query specified, running preset queries ({len(default_queries)} total)...")
+            _, _, output_text = _db_batch(message_handler, session, data_source, default_queries, output_mode=output_mode, output_dir=session_dir)
+    finally:
+        close_structured_logging()
+
+    # Write result status
     # if output_text:
     #     with open(session_dir / "output.md", "w", encoding="utf-8") as f:
     #         f.write(output_text)
