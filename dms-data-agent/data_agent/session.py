@@ -71,15 +71,15 @@ class SessionManager:
             # Validate session with API
             try:
                 session = self._client.describe_session(
-                    agent_id=agent_id or "",
                     session_id=session_id,
+                    agent_id=agent_id or "",
                 )
 
-                # If wait_for_running is True and session is not running, wait for it
-                if wait_for_running and not session.is_running():
+                # If the session is still in CREATING state, wait for it to become ready
+                if session.status == SessionStatus.CREATING and wait_for_running:
                     session = self.wait_until_running(
-                        agent_id=session.agent_id,
                         session_id=session.session_id,
+                        agent_id=session.agent_id,
                         max_wait=600,  # Increase max_wait to 10 minutes (600 seconds) since backend can be slow
                     )
 
@@ -103,8 +103,8 @@ class SessionManager:
         # Only wait if session is not already running
         if wait_for_running and not session.is_running():
             session = self.wait_until_running(
-                agent_id=session.agent_id,
                 session_id=session.session_id,
+                agent_id=session.agent_id,
                 max_wait=600,  # Increase max_wait to 10 minutes (600 seconds) since backend can be slow
             )
 
@@ -113,15 +113,15 @@ class SessionManager:
 
     def wait_until_running(
         self,
-        agent_id: str,
         session_id: str,
+        agent_id: str = "",
         max_wait: int = 120,
     ) -> SessionInfo:
         """Wait for session to reach RUNNING state.
 
         Args:
-            agent_id: The agent ID.
             session_id: The session ID.
+            agent_id: The agent ID (optional).
             max_wait: Maximum wait time in seconds.
 
         Returns:
@@ -143,7 +143,7 @@ class SessionManager:
                     waited_seconds=int(elapsed),
                 )
 
-            session = self._client.describe_session(agent_id, session_id)
+            session = self._client.describe_session(session_id=session_id, agent_id=agent_id)
 
             if session.is_running():
                 return session
@@ -181,7 +181,7 @@ class SessionManager:
             return False
 
         try:
-            current = self._client.describe_session(session.agent_id, session_id)
+            current = self._client.describe_session(session_id=session_id, agent_id=session.agent_id)
             return current.is_running()
         except Exception:
             return False
@@ -213,7 +213,7 @@ class SessionManager:
             raise SessionNotFoundError(f"Session {session_id} not found in cache")
 
         session = self._active_sessions[session_id]
-        updated = self._client.describe_session(session.agent_id, session_id)
+        updated = self._client.describe_session(session_id=session_id, agent_id=session.agent_id)
         self._active_sessions[session_id] = updated
         return updated
 
@@ -295,8 +295,8 @@ class AsyncSessionManager:
 
             try:
                 session = await self._client.describe_session(
-                    agent_id="",
                     session_id=session_id,
+                    agent_id="",
                 )
                 if session.is_running():
                     self._active_sessions[session_id] = session
@@ -310,8 +310,8 @@ class AsyncSessionManager:
         # Only wait if session is not already running
         if wait_for_running and not session.is_running():
             session = await self.wait_until_running(
-                agent_id=session.agent_id,
                 session_id=session.session_id,
+                agent_id=session.agent_id,
             )
 
         self._active_sessions[session.session_id] = session
@@ -319,15 +319,15 @@ class AsyncSessionManager:
 
     async def wait_until_running(
         self,
-        agent_id: str,
         session_id: str,
+        agent_id: str = "",
         max_wait: int = 120,
     ) -> SessionInfo:
         """Wait for session to reach RUNNING state asynchronously.
 
         Args:
-            agent_id: The agent ID.
             session_id: The session ID.
+            agent_id: The agent ID (optional).
             max_wait: Maximum wait time in seconds.
 
         Returns:
@@ -349,7 +349,7 @@ class AsyncSessionManager:
                     waited_seconds=int(elapsed),
                 )
 
-            session = await self._client.describe_session(agent_id, session_id)
+            session = await self._client.describe_session(session_id=session_id, agent_id=agent_id)
 
             if session.is_running():
                 return session
@@ -380,7 +380,7 @@ class AsyncSessionManager:
             return False
 
         try:
-            current = await self._client.describe_session(session.agent_id, session_id)
+            current = await self._client.describe_session(session_id=session_id, agent_id=session.agent_id)
             return current.is_running()
         except Exception:
             return False
@@ -412,7 +412,7 @@ class AsyncSessionManager:
             raise SessionNotFoundError(f"Session {session_id} not found in cache")
 
         session = self._active_sessions[session_id]
-        updated = await self._client.describe_session(session.agent_id, session_id)
+        updated = await self._client.describe_session(session_id=session_id, agent_id=session.agent_id)
         self._active_sessions[session_id] = updated
         return updated
 

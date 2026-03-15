@@ -236,21 +236,24 @@ class DataAgentClient:
             raise SessionCreationError(f"Failed to create session: {e.message}", request_id=e.request_id)
 
     @retry_on_error(max_retries=3)
-    def describe_session(self, agent_id: str, session_id: str) -> SessionInfo:
+    def describe_session(self, session_id: str, agent_id: str = "") -> SessionInfo:
         """Get the status of a session.
 
         Args:
-            agent_id: The agent ID.
             session_id: The session ID.
+            agent_id: The agent ID (optional, but used to construct the request properly).
 
         Returns:
             SessionInfo with current status.
         """
         params = {
-            "AgentId": agent_id,
             "SessionId": session_id,
             "DMSUnit": self._config.region,
         }
+        # Only include AgentId in the request if it's provided
+        # According to API spec, DescribeDataAgentSession doesn't require AgentId
+        if agent_id:
+            params["AgentId"] = agent_id
 
         response = self._call_api(
             action="DescribeDataAgentSession",
@@ -266,8 +269,12 @@ class DataAgentClient:
         except ValueError:
             status = SessionStatus.CREATING
 
+        # Capture the real AgentId from response if available
+        # The agent_id in the response should take precedence over the one passed in
+        real_agent_id = data.get("AgentId") or data.get("agentId") or agent_id
+
         return SessionInfo(
-            agent_id=data.get("AgentId", agent_id),
+            agent_id=real_agent_id,
             session_id=session_id,
             status=status,
             database_id=data.get("DatabaseId"),
@@ -610,20 +617,20 @@ class AsyncDataAgentClient:
             database_id=database_id,
         )
 
-    async def describe_session(self, agent_id: str, session_id: str) -> SessionInfo:
+    async def describe_session(self, session_id: str, agent_id: str = "") -> SessionInfo:
         """Get the status of a session asynchronously.
 
         Args:
-            agent_id: The agent ID.
             session_id: The session ID.
+            agent_id: The agent ID (optional).
 
         Returns:
             SessionInfo with current status.
         """
         return await self._run_in_executor(
             self._sync_client.describe_session,
-            agent_id=agent_id,
             session_id=session_id,
+            agent_id=agent_id,
         )
 
     async def send_message(

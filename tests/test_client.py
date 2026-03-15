@@ -71,7 +71,7 @@ class TestDataAgentClient:
         }
 
         with patch.object(client, "_call_api", return_value=mock_response):
-            session = client.describe_session("agent-id", "session-id")
+            session = client.describe_session("session-id", "agent-id")
 
         assert session.status == SessionStatus.RUNNING
         assert session.database_id == "db-123"
@@ -81,7 +81,7 @@ class TestDataAgentClient:
         mock_response = {"Status": "CREATING"}
 
         with patch.object(client, "_call_api", return_value=mock_response):
-            session = client.describe_session("agent-id", "session-id")
+            session = client.describe_session("session-id", "agent-id")
 
         assert session.status == SessionStatus.CREATING
 

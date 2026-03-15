@@ -502,9 +502,9 @@ def _fmt_ask_report_render(content: str, session_id: Optional[str] = None) -> Op
     sid = session_id or "<SESSION_ID>"
     lines.append(f"\n> ⚠️  Please review the report rendering request.")
     lines.append(f"> To confirm you want to render the report, DO NOT create a new session, use the existing session and explicitly say yes:")
-    lines.append(f">    python3 skill/data_agent_cli.py attach --session-id {sid} -q '确认绘制网页报告'")
-    lines.append(f">    python3 skill/data_agent_cli.py attach --session-id {sid} -q 'yes, render the report'")
+    lines.append(f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {sid} -q '确认绘制网页报告'")
+    lines.append(f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {sid} -q 'yes, render the report'")
     lines.append(f"> To decline, simply respond with no:")
-    lines.append(f">    python3 skill/data_agent_cli.py attach --session-id {sid} -q '不绘制'")
+    lines.append(f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {sid} -q '不绘制'")
 
     return "\n".join(lines)
