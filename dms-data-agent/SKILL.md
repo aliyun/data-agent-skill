@@ -8,9 +8,12 @@ compatibility: |
   需要有效的阿里云 AccessKey（AK/SK）或 STS 临时凭证（AK/SK/Token）；
   需要安装 requirements.txt 中的依赖；
   数据源需已托管在阿里云瑶池数据库或 DMS。
+version: "1.6.6"
+categories: ["数据分析", "数据库", "AI助手"]
+---
 metadata:
   author: DataAgent 研发
-  version: "1.4.1"
+  version: "1.6.6"
 ---
 
 ---
@@ -33,11 +36,6 @@ cp dms-data-agent/.env.example dms-data-agent/.env
 #   - ALIBABA_CLOUD_ACCESS_KEY_SECRET
 #   - DATA_AGENT_REGION（如 cn-hangzhou, cn-beijing 等）
 ```
-
-## 3. 配置 HEARTBEAT 自动监控
-* 打开所在的workspace的HEARTBEAT文件 (默认路径为：~/.openclaw/workspace/HEARTBEAT.md），追加 dms-data-agent/assets/HEARTBEAT.md 的内容
-* HEARTBEAT 会自动扫描 sessions 目录，读取 progress.jsonl 监控进展，并在里程碑到达时推送通知。
-
 
 
 # Data Agent CLI — 统一命令行数据分析工具
