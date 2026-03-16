@@ -55,7 +55,7 @@ cp dms-data-agent/.env.example dms-data-agent/.env
 #   DATA_AGENT_REGION（如 cn-hangzhou）
 ```
 
-### 配置Proactive Agent 能力
+### 配置OpenClaw的Proactive Agent 能力
 
 可以把 assets/HEARTBEAT.md 复制或者更新到OpenClaw工作目录下的HEARTBEAT.md文件中，OpenClaw会自动检测HEARTBEAT.md文件，并自动将技能信息同步到OpenClaw中。
 
