@@ -8,8 +8,6 @@ compatibility: |
   需要有效的阿里云 AccessKey（AK/SK）或 STS 临时凭证（AK/SK/Token）；
   需要安装 requirements.txt 中的依赖；
   数据源需已托管在阿里云瑶池数据库或 DMS。
-version: "1.6.6"
-categories: ["数据分析", "数据库", "AI助手"]
 ---
 metadata:
   author: DataAgent 研发
@@ -49,6 +47,7 @@ cp dms-data-agent/.env.example dms-data-agent/.env
 > 3. **阶段性结论输出**：每当 `progress.log` 有新内容，可以读取并向用户展示当前阶段的结论，而非等到全部完成才一次性输出
 > 4. **等待确认时必须中断**：当 `status.txt` 变为 `waiting_input` 时，**必须立即暂停**，向用户展示 `progress.log` 中最新的执行计划或 SQL，等待用户确认后再继续
 > 5. **失败快速通知**：当 `status.txt` 变为 `failed` 时，立即读取 `result.json` 中的 error 信息并告知用户
+> 6. **报告查看**：可以引导用户到Data Agent 控制台上查看报告，地址为 https://agent.dms.aliyun.com/<地域信息>/session/<会话ID>
 >
 > **⚠️ 特别注意：`waiting_input` 状态意味着 Worker 进程已退出**
 >
