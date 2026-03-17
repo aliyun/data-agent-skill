@@ -87,17 +87,16 @@ _jsonl_lock = threading.Lock()
 
 
 def init_structured_logging(output_dir: Optional[Path] = None):
-    """Initialize structured logging to both JSONL and plain text formats.
+    """Initialize structured logging to plain text format only (progress.jsonl disabled).
 
     Args:
-        output_dir: Directory where progress.jsonl and progress.log should be created
+        output_dir: Directory where progress.log should be created
     """
     global _progress_jsonl_file, _progress_log_file
 
     if output_dir:
-        if not _progress_jsonl_file:
-            jsonl_path = output_dir / "progress.jsonl"
-            _progress_jsonl_file = open(jsonl_path, "w", encoding="utf-8")
+        # Disabled JSONL logging - progress.jsonl creation is skipped
+        _progress_jsonl_file = None
 
         # Only open progress.log if not already set
         if not _progress_log_file:
@@ -133,16 +132,8 @@ def write_to_jsonl(data: dict):
     Args:
         data: Dictionary containing structured log data
     """
-    global _progress_jsonl_file
-
-    if _progress_jsonl_file:
-        with _jsonl_lock:  # Thread-safe writing
-            # Add timestamp if not present
-            if 'timestamp' not in data:
-                data['timestamp'] = datetime.now().isoformat()
-            json_line = json.dumps(data, ensure_ascii=False)
-            _progress_jsonl_file.write(json_line + '\n')
-            _progress_jsonl_file.flush()
+    # JSONL logging is disabled - do nothing
+    pass
 
 
 def write_to_progress_log(text: str):
@@ -383,15 +374,15 @@ def _stream_response(
 
     try:
         for event in message_handler.stream_events(session, query, data_source=data_source):
-            # Log SSE event to JSONL
-            write_to_jsonl({
-                'type': 'sse_event',
-                'event_type': event.event_type,
-                'category': event.category,
-                'content': event.content,
-                'data': event.data,
-                'raw_event': asdict(event)
-            })
+            # Log SSE event to JSONL (disabled per user request to disable progress.jsonl)
+            # write_to_jsonl({
+            #     'type': 'sse_event',
+            #     'event_type': event.event_type,
+            #     'category': event.category,
+            #     'content': event.content,
+            #     'data': event.data,
+            #     'raw_event': asdict(event)
+            # })
 
             if event.event_type == "SSE_FINISH":
                 break
