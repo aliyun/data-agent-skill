@@ -36,9 +36,9 @@ def run_with_dual_logging(cmd, session_dir: Path, env=None):
 
 
 def process_output_to_dual_logs(temp_output_path: Path, session_dir: Path):
-    """Process the temporary output file and create both log formats."""
+    """Process the temporary output file and create log format only (progress.jsonl disabled)."""
     progress_log_path = session_dir / "progress.log"
-    progress_jsonl_path = session_dir / "progress.jsonl"
+    # progress_jsonl_path = session_dir / "progress.jsonl"  # Disabled per user request
 
     with open(temp_output_path, 'r', encoding='utf-8') as temp_file:
         content = temp_file.read()
@@ -47,14 +47,5 @@ def process_output_to_dual_logs(temp_output_path: Path, session_dir: Path):
     with open(progress_log_path, 'w', encoding='utf-8') as log_file:
         log_file.write(content)
 
-    # Process content for progress.jsonl
-    lines = content.split('\n')
-    with open(progress_jsonl_path, 'w', encoding='utf-8') as jsonl_file:
-        for line in lines:
-            if line.strip():  # Only log non-empty lines
-                log_entry = {
-                    'timestamp': datetime.now().isoformat(),
-                    'type': 'log_entry',
-                    'content': line.strip()
-                }
-                jsonl_file.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+    # JSONL logging disabled - progress.jsonl creation is skipped
+    # Process content for progress.jsonl (skipped)
