@@ -21,6 +21,7 @@ from Tea.exceptions import TeaException
 
 from data_agent.config import DataAgentConfig
 from data_agent.models import SessionInfo, SessionStatus, DataSource
+from data_agent.api_adapter import APIAdapter
 from data_agent.exceptions import (
     ApiError,
     AuthenticationError,
@@ -108,6 +109,10 @@ class DataAgentClient:
             ApiError: If the API call fails.
             AuthenticationError: If authentication fails.
         """
+        # Prepare request with PascalCase parameters
+        prepared_params = APIAdapter.prepare_request_params(params, api_action=action)
+        prepared_body = APIAdapter.prepare_request_body(body) if body else None
+
         api_params = open_api_models.Params(
             action=action,
             version=version,
@@ -121,8 +126,8 @@ class DataAgentClient:
         )
 
         request = open_api_models.OpenApiRequest(
-            query=OpenApiUtilClient.query(params),
-            body=body,
+            query=OpenApiUtilClient.query(prepared_params),
+            body=prepared_body,
         )
 
         runtime = util_models.RuntimeOptions(
@@ -135,18 +140,21 @@ class DataAgentClient:
             import pprint
             print(f"[DEBUG] API Call: {action}")
             print(f"[DEBUG] Method: {method}")
-            print(f"[DEBUG] Params: {pprint.pformat(params)}")
-            if body:
-                print(f"[DEBUG] Body: {pprint.pformat(body)}")
+            print(f"[DEBUG] Params: {pprint.pformat(prepared_params)}")
+            if prepared_body:
+                print(f"[DEBUG] Body: {pprint.pformat(prepared_body)}")
 
         try:
             response = self._sdk_client.call_api(api_params, request, runtime)
 
+            # Process response to convert keys to camelCase
+            processed_response = APIAdapter.process_response(response.get("body", {}), api_action=action)
+
             # Add debug logging for response if enabled
             if os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ('true', '1', 'yes'):
-                print(f"[DEBUG] Response for {action}: {pprint.pformat(response)}")
+                print(f"[DEBUG] Response for {action}: {pprint.pformat(processed_response)}")
 
-            return response.get("body", {})
+            return processed_response
         except TeaException as e:
             self._handle_tea_exception(e)
 
@@ -179,18 +187,20 @@ class DataAgentClient:
         title: str = "data-agent-session",
         mode: Optional[str] = None,
         enable_search: bool = False,
+        file_id: Optional[str] = None,  # 添加文件ID参数
     ) -> SessionInfo:
         """Create a new Data Agent session.
-    
+
         Args:
             database_id: Optional database ID to bind to the session.
             title: Session title (required by API).
             mode: Optional session mode, such as "ASK_DATA", "ANALYSIS", "INSIGHT".
             enable_search: Whether to enable search capability in the session.
-    
+            file_id: Optional file ID for file-based analysis session.
+
         Returns:
             SessionInfo with agent_id and session_id.
-    
+
         Raises:
             SessionCreationError: If session creation fails.
         """
@@ -202,6 +212,9 @@ class DataAgentClient:
             params["DatabaseId"] = database_id
         if mode:
             params["Mode"] = mode
+        if file_id:
+            # 当指定了文件ID时，会话将是基于文件的分析
+            params["FileId"] = file_id
 
         # Ensure session configuration (language/mode/search) is persisted on server
         session_config = {"Language": "CHINESE", "EnableSearch": enable_search}
@@ -217,10 +230,11 @@ class DataAgentClient:
             )
 
             # Response data is nested under 'Data' field
-            data = response.get("Data", response)
-            agent_id = data.get("AgentId", "")
-            session_id = data.get("SessionId", "")
-            agent_status = data.get("AgentStatus", "").upper()
+            # After API adapter processing, the keys are in camelCase
+            data = response.get("data", response)  # Changed from "Data" to "data"
+            agent_id = data.get("agentId", "")  # Changed from "AgentId" to "agentId"
+            session_id = data.get("sessionId", "")  # Changed from "SessionId" to "sessionId"
+            agent_status = data.get("agentStatus", "").upper()  # Changed from "AgentStatus" to "agentStatus"
 
             if not agent_id or not session_id:
                 raise SessionCreationError(
@@ -276,9 +290,9 @@ class DataAgentClient:
             params=params,
         )
 
-        request_id = response.get("RequestId", "")
-        data = response.get("Data", response)
-        status_str = data.get("SessionStatus", data.get("Status", "CREATING"))
+        request_id = response.get("requestId", "")  # Changed from "RequestId" to "requestId"
+        data = response.get("data", response)  # Changed from "Data" to "data"
+        status_str = data.get("sessionStatus", data.get("status", "CREATING"))  # Changed from "SessionStatus"/"Status" to "sessionStatus"/"status"
         try:
             status = SessionStatus(status_str)
         except ValueError:
@@ -286,13 +300,13 @@ class DataAgentClient:
 
         # Capture the real AgentId from response if available
         # The agent_id in the response should take precedence over the one passed in
-        real_agent_id = data.get("AgentId") or data.get("agentId") or agent_id
+        real_agent_id = data.get("agentId") or data.get("AgentId") or agent_id  # Try both transformed and original
 
         return SessionInfo(
             agent_id=real_agent_id,
             session_id=session_id,
             status=status,
-            database_id=data.get("DatabaseId"),
+            database_id=data.get("databaseId"),  # Changed from "DatabaseId" to "databaseId"
             request_id=request_id,
         )
 
@@ -618,11 +632,22 @@ class AsyncDataAgentClient:
             functools.partial(func, *args, **kwargs),
         )
 
-    async def create_session(self, database_id: Optional[str] = None) -> SessionInfo:
+    async def create_session(
+        self,
+        database_id: Optional[str] = None,
+        title: str = "data-agent-session",
+        mode: Optional[str] = None,
+        enable_search: bool = False,
+        file_id: Optional[str] = None,  # 添加文件ID参数
+    ) -> SessionInfo:
         """Create a new Data Agent session asynchronously.
 
         Args:
             database_id: Optional database ID to bind to the session.
+            title: Session title (required by API).
+            mode: Optional session mode, such as "ASK_DATA", "ANALYSIS", "INSIGHT".
+            enable_search: Whether to enable search capability in the session.
+            file_id: Optional file ID for file-based analysis session.
 
         Returns:
             SessionInfo with agent_id and session_id.
@@ -630,6 +655,10 @@ class AsyncDataAgentClient:
         return await self._run_in_executor(
             self._sync_client.create_session,
             database_id=database_id,
+            title=title,
+            mode=mode,
+            enable_search=enable_search,
+            file_id=file_id,
         )
 
     async def describe_session(self, session_id: str, agent_id: str = "") -> SessionInfo:

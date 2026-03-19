@@ -140,8 +140,10 @@ class FileManager:
         # Confirm upload and get the correct FileId from response
         try:
             callback_resp = self._client.file_upload_callback(file_id, filename, upload_location)
-            # Extract FileId from callback response
-            data_center_file_id = callback_resp.get("Data", {}).get("FileId")
+            # Extract FileId from callback response - after API adapter transformation,
+            # response fields become camelCase
+            data_field = callback_resp.get("data", callback_resp.get("Data", {}))
+            data_center_file_id = data_field.get("fileId", data_field.get("FileId"))
             final_file_id = data_center_file_id if data_center_file_id else file_id
         except Exception as e:
             raise FileUploadError(f"Failed to confirm upload: {e}", file_path=file_path)
@@ -413,8 +415,10 @@ class AsyncFileManager:
         # Confirm upload and get the correct FileId from response
         try:
             callback_resp = await self._client.file_upload_callback(file_id, filename, upload_location)
-            # Extract FileId from callback response
-            data_center_file_id = callback_resp.get("Data", {}).get("FileId")
+            # Extract FileId from callback response - after API adapter transformation,
+            # response fields become camelCase
+            data_field = callback_resp.get("data", callback_resp.get("Data", {}))
+            data_center_file_id = data_field.get("fileId", data_field.get("FileId"))
             final_file_id = data_center_file_id if data_center_file_id else file_id
         except Exception as e:
             raise FileUploadError(f"Failed to confirm upload: {e}", file_path=file_path)

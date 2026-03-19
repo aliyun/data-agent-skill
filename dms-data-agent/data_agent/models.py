@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 from enum import Enum
+from .api_adapter import APIAdapter
 
 
 class SessionStatus(str, Enum):
@@ -81,7 +82,7 @@ class FileInfo:
 @dataclass
 class DatabaseSource:
     """Database source configuration for analysis.
-    
+
     This is the legacy model. Use DataSource for SendChatMessage API.
     """
 
@@ -95,9 +96,9 @@ class DatabaseSource:
 @dataclass
 class DataSource:
     """Data source configuration for SendChatMessage API.
-    
+
     Contains complete database metadata required by Data Agent.
-    
+
     Attributes:
         dms_instance_id: DMS instance ID (e.g., 1234567)
         dms_database_id: DMS database ID (e.g., 12345678)
@@ -127,7 +128,7 @@ class DataSource:
         result = {
             "DataSourceType": self.data_source_type,
         }
-        
+
         if self.data_source_type == "FILE":
             # File-based analysis uses remote_data_center type with FileId
             # Extract filename from file_id path for Database field
@@ -152,8 +153,9 @@ class DataSource:
                 "Engine": self.engine,
                 "RegionId": self.region_id,
             })
-        
-        return result
+
+        # Apply API parameter formatting with PascalCase
+        return APIAdapter.prepare_request_params(result)
 
 
 @dataclass
