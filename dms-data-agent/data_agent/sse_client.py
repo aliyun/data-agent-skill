@@ -209,7 +209,7 @@ class SSEClient:
         # Build query string for URL
         query_params = {"Action": "GetChatContent", "Version": "2025-04-14", **params}
         query_string = "&".join(
-            f"{quote(k, safe='')}={quote(str(v), safe='')}" 
+            f"{quote(k, safe='')}={quote(str(v), safe='')}"
             for k, v in sorted(query_params.items())
         )
         url = f"{self._base_url}/?{query_string}"
@@ -424,7 +424,7 @@ class AsyncSSEClient:
         # Build query string for URL
         query_params = {"Action": "GetChatContent", "Version": "2025-04-14", **params}
         query_string = "&".join(
-            f"{quote(k, safe='')}={quote(str(v), safe='')}" 
+            f"{quote(k, safe='')}={quote(str(v), safe='')}"
             for k, v in sorted(query_params.items())
         )
         url = f"{self._base_url}/?{query_string}"
