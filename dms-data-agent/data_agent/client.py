@@ -10,6 +10,7 @@ import asyncio
 import time
 import functools
 import json
+import os
 from typing import Optional, Any, Callable, TypeVar
 
 from alibabacloud_tea_openapi import models as open_api_models
@@ -129,8 +130,22 @@ class DataAgentClient:
             connect_timeout=30000,
         )
 
+        # Add debug logging if enabled via environment variable
+        if os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ('true', '1', 'yes'):
+            import pprint
+            print(f"[DEBUG] API Call: {action}")
+            print(f"[DEBUG] Method: {method}")
+            print(f"[DEBUG] Params: {pprint.pformat(params)}")
+            if body:
+                print(f"[DEBUG] Body: {pprint.pformat(body)}")
+
         try:
             response = self._sdk_client.call_api(api_params, request, runtime)
+
+            # Add debug logging for response if enabled
+            if os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ('true', '1', 'yes'):
+                print(f"[DEBUG] Response for {action}: {pprint.pformat(response)}")
+
             return response.get("body", {})
         except TeaException as e:
             self._handle_tea_exception(e)

@@ -56,6 +56,18 @@ cp dms-data-agent/.env.example dms-data-agent/.env
 #   DATA_AGENT_REGION（如 cn-hangzhou）
 ```
 
+### 调试功能
+
+启用详细的API请求和响应日志：
+```bash
+# 启用调试模式
+DATA_AGENT_DEBUG_API=1 python3 dms-data-agent/data_agent_cli.py file dms-data-agent/assets/example_game_data.csv -q '分析一下'
+
+# 可用的环境变量值：'true', '1', 'yes' (不区分大小写)
+```
+
+这将输出所有API调用的详细信息，包括请求参数和响应内容，有助于排查问题和理解与阿里云服务的交互过程。
+
 ### 配置OpenClaw的Proactive Agent 能力
 
 可以把 assets/HEARTBEAT.md 复制或者更新到OpenClaw工作目录下的HEARTBEAT.md文件中，OpenClaw会自动检测HEARTBEAT.md文件，并自动将技能信息同步到OpenClaw中。
