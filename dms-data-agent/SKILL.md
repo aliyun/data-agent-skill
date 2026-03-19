@@ -14,6 +14,12 @@ metadata:
   version: "1.6.6"
 ---
 
+# 更新日志
+- **v1.6.6**: 原生异步执行模式、会话隔离、增强的attach模式、优化的日志输出
+- **新增功能**: API请求调试功能，通过环境变量控制
+
+---
+
 ---
 
 # 安装
@@ -31,6 +37,12 @@ metadata:
 ```
 - DATA_AGENT_REGION（如 cn-hangzhou, cn-beijing 等）
 - **权限要求**：确保 RAM 用户具有 DMS 管理权限（AliyunDMSFullAccess 或 AliyunDMSDataAgentFullAccess）
+
+## 调试功能
+- **API请求调试**: 通过设置环境变量 `DATA_AGENT_DEBUG_API` 可以启用详细的API请求和响应日志
+  - 可用值: `'true'`, `'1'`, `'yes'` (不区分大小写)
+  - 启用后将输出所有API调用的详细信息，包括请求参数和响应内容
+  - 示例: `DATA_AGENT_DEBUG_API=1 python3 data_agent_cli.py file ...`
 
 ## 💡 使用建议
 

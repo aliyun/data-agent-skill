@@ -104,6 +104,9 @@ def cmd_file(args: argparse.Namespace) -> None:
         # Store file_data_source as a dict for async worker to use (avoid serialization issues)
         args.file_data_source = file_data_source.to_api_dict()
 
+        # Store file_data_source as a dict for async worker to use (avoid serialization issues)
+        args.file_data_source = file_data_source.to_api_dict()
+
         # Use common async worker setup
         setup_async_worker(args, session)
 
@@ -115,13 +118,14 @@ def cmd_file(args: argparse.Namespace) -> None:
     elif is_worker:
         # WORKER PROCESS LOGIC - using common utility
         def file_query_executor(message_handler, session, args):
-            # Get the file data source that was prepared in parent process
             if hasattr(args, 'file_data_source'):
                 # If file_data_source is a dict (async mode), reconstruct DataSource
                 if isinstance(args.file_data_source, dict):
                     # Create a new DataSource from the dict representation
+                    # For file analysis, we need to use data_source_type="FILE" and the correct file_id
+                    # The DataSource.to_api_dict() method expects data_source_type="FILE" to trigger FileId inclusion
                     file_data_source = DataSource(
-                        data_source_type=args.file_data_source.get('DataSourceType', 'FILE'),
+                        data_source_type="FILE",  # Use "FILE" type for file analysis
                         file_id=args.file_data_source.get('FileId', ''),
                         region_id=args.file_data_source.get('RegionId', config.region)
                     )
@@ -129,6 +133,30 @@ def cmd_file(args: argparse.Namespace) -> None:
                     # If file_data_source is already a DataSource object (sync mode)
                     file_data_source = args.file_data_source
             else:
+                # Try to load from input.json if not available in args
+                # In worker process, we can determine the session dir and load input.json
+                import json
+                from pathlib import Path
+                session_dir = Path(f"sessions/{session.session_id}")
+                input_file = session_dir / "input.json"
+
+                if input_file.exists():
+                    try:
+                        with open(input_file, 'r', encoding='utf-8') as f:
+                            saved_args = json.load(f)
+
+                        if 'file_data_source' in saved_args:
+                            file_data_source_dict = saved_args['file_data_source']
+                            # Create DataSource for file analysis using data_source_type="FILE"
+                            file_data_source = DataSource(
+                                data_source_type="FILE",  # Use "FILE" type for file analysis
+                                file_id=file_data_source_dict.get('FileId', ''),
+                                region_id=file_data_source_dict.get('RegionId', config.region)
+                            )
+                    except Exception as e:
+                        print(f"Warning: Could not load file_data_source from input.json: {e}", file=sys.stderr)
+
+            if file_data_source is None:
                 # Fallback: reconstruct based on available info
                 if hasattr(args, 'file_id') and args.file_id:
                     file_data_source = DataSource(
