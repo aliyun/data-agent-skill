@@ -19,21 +19,19 @@ metadata:
 # 安装
 
 
-## 1. 创建虚拟环境并安装依赖
-```bash
-python3 -m venv venv
-source venv/bin/activate  # Windows 用户请使用: venv\Scripts\activate
-pip install -r requirements.txt
+## 配置凭证和地域（复制示例文件并填入真实值）
+- 检查在 `~/.openclaw/openclaw.json` 中是否存在下述变量，如果不存在则需要首先配置：
+```json
+{
+  "env": {
+    "ALIBABA_CLOUD_ACCESS_KEY_ID": "your-access-key-id",
+    "ALIBABA_CLOUD_ACCESS_KEY_SECRET": "your-access-key-secret"
+  }
+}
 ```
+- DATA_AGENT_REGION（如 cn-hangzhou, cn-beijing 等）
+- **权限要求**：确保 RAM 用户具有 DMS 管理权限（AliyunDMSFullAccess 或 AliyunDMSDataAgentFullAccess）
 
-## 2. 配置凭证和地域（复制示例文件并填入真实值）
-```bash
-cp dms-data-agent/.env.example dms-data-agent/.env
-# 然后编辑 dms-data-agent/.env，填入以下必填项：
-#   - ALIBABA_CLOUD_ACCESS_KEY_ID
-#   - ALIBABA_CLOUD_ACCESS_KEY_SECRET
-#   - DATA_AGENT_REGION（如 cn-hangzhou, cn-beijing 等）
-```
 ## 💡 使用建议
 
 提示用户使用内置的数据集 `assets/example_game_data.csv` 完成一次分析体验。
