@@ -23,6 +23,7 @@ class DataAgentConfig:
         access_key_id: Alibaba Cloud Access Key ID
         access_key_secret: Alibaba Cloud Access Key Secret
         security_token: Alibaba Cloud Security Token (STS Token, optional)
+        api_key: API Key for alternative authentication (optional)
         region: Region for DMS endpoint (default: cn-hangzhou)
         endpoint: Custom endpoint (auto-generated if not set)
         timeout: API timeout in seconds (default: 300)
@@ -31,9 +32,10 @@ class DataAgentConfig:
         max_poll_count: Maximum poll attempts (default: 60)
     """
 
-    access_key_id: str
-    access_key_secret: str
+    access_key_id: str = ""
+    access_key_secret: str = ""
     security_token: Optional[str] = None
+    api_key: Optional[str] = None
     region: str = "cn-hangzhou"
     endpoint: Optional[str] = None
     timeout: int = 300
@@ -43,8 +45,16 @@ class DataAgentConfig:
 
     def __post_init__(self) -> None:
         """Generate endpoint if not provided and validate config."""
+        # If using API_KEY authentication and no endpoint is provided,
+        # use the apikey format which is different from the standard DMS endpoint
         if not self.endpoint:
-            self.endpoint = f"dms.{self.region}.aliyuncs.com"
+            if self.api_key and not (self.access_key_id and self.access_key_secret):
+                # For API key auth, use the dataagent domain format with /apikey suffix
+                # Using correct hyphen format: dataagent-{region}.aliyuncs.com/apikey
+                self.endpoint = f"dataagent-{self.region}.aliyuncs.com/apikey"
+            else:
+                # Standard DMS endpoint for AK/SK auth
+                self.endpoint = f"dms.{self.region}.aliyuncs.com"
         self.validate()
 
     def validate(self) -> None:
@@ -53,16 +63,27 @@ class DataAgentConfig:
         Raises:
             ConfigurationError: If required configuration is missing or invalid.
         """
-        if not self.access_key_id:
-            raise ConfigurationError(
-                "Missing ALIBABA_CLOUD_ACCESS_KEY_ID. "
-                "Set it via environment variable or pass it explicitly."
-            )
-        if not self.access_key_secret:
-            raise ConfigurationError(
-                "Missing ALIBABA_CLOUD_ACCESS_KEY_SECRET. "
-                "Set it via environment variable or pass it explicitly."
-            )
+        # Validate that either AK/SK pair is provided OR API key is provided
+        if not self.access_key_id and not self.access_key_secret and not self.api_key:
+            # If no AK/SK pair is provided, API key must be provided
+            if not self.api_key:
+                raise ConfigurationError(
+                    "Either AccessKey pair (ALIBABA_CLOUD_ACCESS_KEY_ID and ALIBABA_CLOUD_ACCESS_KEY_SECRET) "
+                    "or API_KEY must be provided."
+                )
+        # If AK/SK pair is provided, both key id and secret must be present
+        elif self.access_key_id or self.access_key_secret:
+            if not self.access_key_id:
+                raise ConfigurationError(
+                    "Missing ALIBABA_CLOUD_ACCESS_KEY_ID. "
+                    "Set it via environment variable or pass it explicitly."
+                )
+            if not self.access_key_secret:
+                raise ConfigurationError(
+                    "Missing ALIBABA_CLOUD_ACCESS_KEY_SECRET. "
+                    "Set it via environment variable or pass it explicitly."
+                )
+
         if self.timeout <= 0:
             raise ConfigurationError(f"Invalid timeout value: {self.timeout}. Must be positive.")
         if self.max_retry < 0:
@@ -94,6 +115,7 @@ class DataAgentConfig:
             access_key_id=os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID", ""),
             access_key_secret=os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET", ""),
             security_token=os.environ.get("ALIBABA_CLOUD_SECURITY_TOKEN") or os.environ.get("SECURITY_TOKEN"),
+            api_key=os.environ.get("DATA_AGENT_API_KEY", ""),
             region=os.environ.get("DATA_AGENT_REGION", "cn-hangzhou"),
             endpoint=os.environ.get("DATA_AGENT_ENDPOINT"),
             timeout=int(os.environ.get("DATA_AGENT_TIMEOUT", "300")),
@@ -116,6 +138,7 @@ class DataAgentConfig:
             access_key_id=config_dict.get("access_key_id", ""),
             access_key_secret=config_dict.get("access_key_secret", ""),
             security_token=config_dict.get("security_token"),
+            api_key=config_dict.get("api_key", ""),
             region=config_dict.get("region", "cn-hangzhou"),
             endpoint=config_dict.get("endpoint"),
             timeout=config_dict.get("timeout", 300),
@@ -130,7 +153,7 @@ class DataAgentConfig:
         Returns:
             Dictionary with non-sensitive configuration values.
         """
-        return {
+        result = {
             "region": self.region,
             "endpoint": self.endpoint,
             "timeout": self.timeout,
@@ -138,6 +161,14 @@ class DataAgentConfig:
             "poll_interval": self.poll_interval,
             "max_poll_count": self.max_poll_count,
         }
+        # Only include indicators if specific auth methods are used
+        if not (self.access_key_id and self.access_key_secret) and self.api_key:
+            result["auth_type"] = "api_key"
+        elif self.access_key_id and self.access_key_secret:
+            result["auth_type"] = "access_key"
+        else:
+            result["auth_type"] = "unknown"
+        return result
 
     def __repr__(self) -> str:
         """String representation (hides secrets)."""

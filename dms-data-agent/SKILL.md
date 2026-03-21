@@ -5,7 +5,7 @@ description: |
   Data Agent for Analytics 是阿里云瑶池数据库团队推出的面向企业用户的数据分析智能体，可根据自然语言描述自动完成需求分析、数据理解、分析洞察及报告生成。
   本工具支持：发现已托管在 DMS 的数据资源（实例/库/表）、发起问数或深度分析会话、实时跟踪执行进度、获取分析结论及生成的报告文件。
 compatibility: |
-  需要有效的阿里云 AccessKey（AK/SK）或 STS 临时凭证（AK/SK/Token）；
+  需要有效的阿里云凭证（AK/SK 或 STS 临时凭证，或者 API_KEY）；
   需要安装 requirements.txt 中的依赖；
   数据源需已托管在阿里云瑶池数据库或 DMS。
 ---
@@ -35,6 +35,15 @@ metadata:
   }
 }
 ```
+- 或者使用 API_KEY 进行认证（仅适用于文件分析场景）：
+```json
+{
+  "env": {
+    "DATA_AGENT_API_KEY": "your-api-key"
+  }
+}
+```
+- **注意**：如果同时配置了 AK/SK 和 API_KEY，系统将优先使用 AK/SK 认证
 - DATA_AGENT_REGION（如 cn-hangzhou, cn-beijing 等）
 - **权限要求**：确保 RAM 用户具有 DMS 管理权限（AliyunDMSFullAccess 或 AliyunDMSDataAgentFullAccess）
 
@@ -58,7 +67,7 @@ metadata:
 > 1. **即时反馈**：发起异步任务后，立即告知用户已启动，并给出 Session ID 和查看进度的方式
 > 2. **主动轮询**：定期检查 `status.txt`（建议每 30-60 秒），并将状态变化（running → waiting_input → completed）及时告知用户
 > 3. **阶段性结论输出**：每当 `progress.log` 有新内容，可以读取并向用户展示当前阶段的结论，而非等到全部完成才一次性输出
-> 4. **等待确认时必须中断**：当 `status.txt` 变为 `waiting_input` 时，**必须立即暂停**，向用户展示 `progress.log` 中最新的执行计划或 SQL，等待用户确认后再继续
+> 4. **等待确认时必须中断**：当 `status.txt` 变为 `waiting_input` 时，**必须立即暂停**，向用户展示 `progress.log` 中最新的执行计划或 SQL，等待用户确认或者反馈修改后再继续
 > 5. **失败快速通知**：当 `status.txt` 变为 `failed` 时，立即读取 `result.json` 中的 error 信息并告知用户
 > 6. **报告查看**：可以引导用户到Data Agent 控制台上查看报告，地址为 https://agent.dms.aliyun.com/<地域信息>/session/<会话ID>
 >

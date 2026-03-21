@@ -12,6 +12,7 @@ import functools
 import json
 import os
 from typing import Optional, Any, Callable, TypeVar
+import requests
 
 from alibabacloud_tea_openapi import models as open_api_models
 from alibabacloud_tea_openapi.client import Client as OpenApiClient
@@ -74,16 +75,24 @@ class DataAgentClient:
         self._initialize_client()
 
     def _initialize_client(self) -> None:
-        """Initialize the underlying SDK client."""
-        sdk_config = open_api_models.Config(
-            access_key_id=self._config.access_key_id,
-            access_key_secret=self._config.access_key_secret,
-        )
-        sdk_config.endpoint = self._config.endpoint
-        # Set STS token if provided
-        if self._config.security_token:
-            sdk_config.security_token = self._config.security_token
-        self._sdk_client = OpenApiClient(sdk_config)
+        """Initialize the underlying SDK client based on authentication type."""
+        # Determine authentication type
+        if self._config.api_key and not (self._config.access_key_id and self._config.access_key_secret):
+            # API_KEY authentication - don't initialize the Tea SDK client
+            self._sdk_client = None
+            self._auth_type = "api_key"
+        else:
+            # AK/SK authentication - initialize Tea SDK client
+            sdk_config = open_api_models.Config(
+                access_key_id=self._config.access_key_id,
+                access_key_secret=self._config.access_key_secret,
+            )
+            sdk_config.endpoint = self._config.endpoint
+            # Set STS token if provided
+            if self._config.security_token:
+                sdk_config.security_token = self._config.security_token
+            self._sdk_client = OpenApiClient(sdk_config)
+            self._auth_type = "ak_sk"
 
     def _call_api(
         self,
@@ -109,6 +118,138 @@ class DataAgentClient:
             ApiError: If the API call fails.
             AuthenticationError: If authentication fails.
         """
+        if self._auth_type == "api_key":
+            # Handle API_KEY authentication using direct HTTP requests
+            return self._call_api_with_api_key(action, version, params, method, body)
+        else:
+            # Handle traditional AK/SK authentication using Tea SDK
+            return self._call_api_with_ak_sk(action, version, params, method, body)
+
+    def _call_api_with_api_key(
+        self,
+        action: str,
+        version: str,
+        params: dict,
+        method: str = "POST",
+        body: dict = None,
+    ) -> dict:
+        """Make an API call using API_KEY authentication."""
+        # Determine if this is a control plane or data plane API based on action
+        control_plane_actions = [
+            'ListDataAgentSession', 'CreateDataAgentSession', 'DescribeDataAgentSession',
+            'DescribeFileUploadSignature', 'FileUploadCallback'
+        ]
+
+        data_plane_actions = [
+            'SendChatMessage', 'GetChatContent', 'DescribeDataAgentUsage',
+            'UpdateDataAgentSession', 'ListFileUpload', 'CreateDataAgentFeedback'
+        ]
+
+        # Choose the correct endpoint based on the action type
+        if action in control_plane_actions:
+            # Use control plane endpoint format - FIX: hyphen instead of dot
+            base_endpoint = f"dataagent-{self._config.region}.aliyuncs.com/apikey"
+        elif action in data_plane_actions:
+            # Use data plane endpoint format - FIX: hyphen instead of dot
+            base_endpoint = f"dataagent-stream-{self._config.region}.aliyuncs.com/apikey"
+        else:
+            # Default to control plane if action is not recognized - FIX: hyphen instead of dot
+            base_endpoint = f"dataagent-{self._config.region}.aliyuncs.com/apikey"
+
+        # Add the required RegionId parameter to params
+        params['RegionId'] = self._config.region
+
+        # Prepare request with PascalCase parameters
+        prepared_params = APIAdapter.prepare_request_params(params, api_action=action)
+
+        # For API_KEY authentication, we should put Action and Version in the body
+        # according to standard OpenAPI practices
+        if body is None:
+            body = {}
+
+        # Add action and version to the body instead of query params
+        body.update({
+            'Action': action,
+            'Version': version
+        })
+
+        # Update body with prepared parameters
+        body.update(prepared_params)
+
+        prepared_body = APIAdapter.prepare_request_body(body)
+
+        # Build the URL for the API call (without Action and Version in query)
+        base_url = f"https://{base_endpoint}"
+
+        # Construct the URL without action/version in query string since they're in body
+        full_url = base_url
+
+        # Set up headers with API_KEY
+        headers = {
+            'x-api-key': self._config.api_key,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        }
+
+        # Add debug logging if enabled via environment variable
+        if os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ('true', '1', 'yes'):
+            import pprint
+            auth_type_display = "API_KEY" if self._auth_type == "api_key" else "AK/SK"
+            print(f"[DEBUG] API Call: {action}")
+            print(f"[DEBUG] Authentication Type: {auth_type_display}")
+            print(f"[DEBUG] Method: {method}")
+            print(f"[DEBUG] URL: {full_url}")
+            print(f"[DEBUG] Headers: {pprint.pformat(headers)}")
+            if prepared_body:
+                print(f"[DEBUG] Body: {pprint.pformat(prepared_body)}")
+
+        try:
+            # Make the API call - Action and Version are now in the body
+            if method.upper() == "GET":
+                # For GET requests, we might still need to put action/version in query
+                query_params = {'Action': action, 'Version': version}
+                import urllib.parse
+                query_string = urllib.parse.urlencode(query_params)
+                full_url_with_params = f"{full_url}?{query_string}"
+                response = requests.get(full_url_with_params, headers=headers, timeout=self._config.timeout)
+            elif method.upper() == "POST":
+                # For POST requests, Action and Version are in the body
+                response = requests.post(full_url, headers=headers, json=prepared_body, timeout=self._config.timeout)
+            else:
+                # For other methods, default to POST with body
+                response = requests.request(method, full_url, headers=headers, json=prepared_body, timeout=self._config.timeout)
+
+            # Check response status
+            response.raise_for_status()
+
+            # Parse response JSON
+            response_data = response.json()
+
+            # Process response to convert keys to camelCase
+            processed_response = APIAdapter.process_response(response_data, api_action=action)
+
+            # Add debug logging for response if enabled
+            if os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ('true', '1', 'yes'):
+                import pprint
+                print(f"[DEBUG] Response for {action}: {pprint.pformat(processed_response)}")
+
+            return processed_response
+        except requests.exceptions.RequestException as e:
+            # Handle HTTP request errors
+            error_msg = f"API call failed: {str(e)}"
+            if hasattr(e, 'response') and e.response is not None:
+                error_msg += f", Status: {e.response.status_code}, Body: {e.response.text[:500]}"
+            raise ApiError(error_msg, code="HTTPRequestError", request_id=None)
+
+    def _call_api_with_ak_sk(
+        self,
+        action: str,
+        version: str,
+        params: dict,
+        method: str = "POST",
+        body: dict = None,
+    ) -> dict:
+        """Make an API call using AK/SK authentication."""
         # Prepare request with PascalCase parameters
         prepared_params = APIAdapter.prepare_request_params(params, api_action=action)
         prepared_body = APIAdapter.prepare_request_body(body) if body else None
@@ -138,7 +279,9 @@ class DataAgentClient:
         # Add debug logging if enabled via environment variable
         if os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ('true', '1', 'yes'):
             import pprint
+            auth_type_display = "API_KEY" if self._auth_type == "api_key" else "AK/SK"
             print(f"[DEBUG] API Call: {action}")
+            print(f"[DEBUG] Authentication Type: {auth_type_display}")
             print(f"[DEBUG] Method: {method}")
             print(f"[DEBUG] Params: {pprint.pformat(prepared_params)}")
             if prepared_body:
@@ -152,6 +295,7 @@ class DataAgentClient:
 
             # Add debug logging for response if enabled
             if os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ('true', '1', 'yes'):
+                import pprint
                 print(f"[DEBUG] Response for {action}: {pprint.pformat(processed_response)}")
 
             return processed_response
@@ -214,13 +358,19 @@ class DataAgentClient:
             params["Mode"] = mode
         if file_id:
             # 当指定了文件ID时，会话将是基于文件的分析
-            params["FileId"] = file_id
+            params["File"] = file_id
 
         # Ensure session configuration (language/mode/search) is persisted on server
         session_config = {"Language": "CHINESE", "EnableSearch": enable_search}
         if mode:
             session_config["Mode"] = mode
-        params["SessionConfig"] = json.dumps(session_config)
+
+        # For API_KEY auth, SessionConfig should be a JSON object, not string
+        # For AK/SK auth, SessionConfig should be a JSON string
+        if self._auth_type == "api_key":
+            params["SessionConfig"] = session_config
+        else:
+            params["SessionConfig"] = json.dumps(session_config)
 
         try:
             response = self._call_api(
@@ -342,13 +492,23 @@ class DataAgentClient:
             "DMSUnit": self._config.region,
         }
 
-        # SessionConfig as JSON string
+        # SessionConfig format depends on auth type
+        # For API_KEY auth: JSON object
+        # For AK/SK auth: JSON string
         session_config = {"Language": language}
-        params["SessionConfig"] = json.dumps(session_config)
+        if self._auth_type == "api_key":
+            params["SessionConfig"] = session_config
+        else:
+            params["SessionConfig"] = json.dumps(session_config)
 
-        # DataSource as JSON string (like official SDK)
+        # DataSource format depends on auth type
+        # For API_KEY auth: JSON object
+        # For AK/SK auth: JSON string
         if data_source:
-            params["DataSource"] = json.dumps(data_source.to_api_dict())
+            if self._auth_type == "api_key":
+                params["DataSource"] = data_source.to_api_dict()
+            else:
+                params["DataSource"] = json.dumps(data_source.to_api_dict())
 
         return self._call_api(
             action="SendChatMessage",
@@ -413,22 +573,25 @@ class DataAgentClient:
         )
 
     @retry_on_error(max_retries=3)
-    def file_upload_callback(self, file_id: str, filename: str, upload_location: str) -> dict:
+    def file_upload_callback(self, file_id: str, filename: str, upload_location: str, file_size: int = None) -> dict:
         """Notify the service that file upload is complete.
 
         Args:
-            file_id: The file ID from upload signature.
+            file_id: The file ID from upload signature (uploadDir).
             filename: The original filename.
             upload_location: The full OSS path (UploadHost/UploadDir/Filename).
+            file_size: The file size in bytes (required for API_KEY auth).
 
         Returns:
             Response confirming the upload.
         """
         params = {
-            "FileId": file_id,
             "Filename": filename,
             "UploadLocation": upload_location,
+            "FileFrom": "DingDing",
         }
+        if file_size:
+            params["FileSize"] = file_size
 
         return self._call_api(
             action="FileUploadCallback",
@@ -594,6 +757,53 @@ class DataAgentClient:
             params=params,
         )
 
+    @retry_on_error(max_retries=3)
+    def list_sessions(
+        self,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        page_number: int = 1,
+        page_size: int = 10,
+    ) -> dict:
+        """List Data Agent sessions.
+
+        For API_KEY authentication, uses startTime/endTime parameters.
+        For AK/SK authentication, uses createStartTime/createEndTime parameters.
+
+        Args:
+            start_time: Start time for filtering sessions (ISO format).
+            end_time: End time for filtering sessions (ISO format).
+            page_number: Page number (1-based).
+            page_size: Number of results per page.
+
+        Returns:
+            Response containing list of sessions.
+        """
+        params = {
+            "PageNumber": page_number,
+            "PageSize": page_size,
+        }
+
+        # Add time parameters based on authentication type
+        if self._auth_type == "api_key":
+            # For API_KEY auth, use the new parameter names
+            if start_time:
+                params["StartTime"] = start_time
+            if end_time:
+                params["EndTime"] = end_time
+        else:
+            # For AK/SK auth, use the original parameter names
+            if start_time:
+                params["CreateStartTime"] = start_time
+            if end_time:
+                params["CreateEndTime"] = end_time
+
+        return self._call_api(
+            action="ListDataAgentSession",
+            version="2025-04-14",
+            params=params,
+        )
+
     @property
     def config(self) -> DataAgentConfig:
         """Get the client configuration."""
@@ -752,11 +962,14 @@ class AsyncDataAgentClient:
             file_size=file_size,
         )
 
-    async def file_upload_callback(self, file_id: str) -> dict:
+    async def file_upload_callback(self, file_id: str, filename: str, upload_location: str, file_size: int = None) -> dict:
         """Notify file upload completion asynchronously.
 
         Args:
             file_id: The file ID from upload signature.
+            filename: The original filename.
+            upload_location: The full OSS path.
+            file_size: The file size in bytes (required for API_KEY auth).
 
         Returns:
             Response confirming the upload.
@@ -764,6 +977,9 @@ class AsyncDataAgentClient:
         return await self._run_in_executor(
             self._sync_client.file_upload_callback,
             file_id=file_id,
+            filename=filename,
+            upload_location=upload_location,
+            file_size=file_size,
         )
 
     async def list_files(self, session_id: str, file_category: Optional[str] = None) -> dict:

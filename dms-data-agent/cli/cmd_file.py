@@ -67,7 +67,7 @@ def cmd_file(args: argparse.Namespace) -> None:
             )
 
             # Create regular session without binding to specific data source initially
-            session = session_manager.create_or_reuse(mode=session_mode, enable_search=enable_search)
+            session = session_manager.create_or_reuse(mode=session_mode, enable_search=enable_search, file_id=file_id)
         else:
             # Local file workflow: upload first
             if not Path(file_path).exists():
@@ -99,10 +99,7 @@ def cmd_file(args: argparse.Namespace) -> None:
                 sys.exit(1)
 
             # Create session
-            session = session_manager.create_or_reuse(mode=session_mode, enable_search=enable_search)
-
-        # Store file_data_source as a dict for async worker to use (avoid serialization issues)
-        args.file_data_source = file_data_source.to_api_dict()
+            session = session_manager.create_or_reuse(mode=session_mode, enable_search=enable_search, file_id=file_info.file_id)
 
         # Store file_data_source as a dict for async worker to use (avoid serialization issues)
         args.file_data_source = file_data_source.to_api_dict()
@@ -260,7 +257,8 @@ def cmd_file(args: argparse.Namespace) -> None:
     print(f"\nCreating session: {mode_desc}...")
     print(f"  Region: {config.region}")
     enable_search = getattr(args, 'enable_search', False)
-    session = session_manager.create_or_reuse(mode=session_mode, enable_search=enable_search)
+    # For file analysis, pass file_id to create_or_reuse so the session is bound to the file
+    session = session_manager.create_or_reuse(mode=session_mode, enable_search=enable_search, file_id=file_data_source.file_id if 'file_data_source' in locals() else None)
     print(f"Session ready: {session.session_id}")
     print(f"\n💡 Tip: To continue this session later, use: python3 dms-data-agent/data_agent_cli.py attach --session-id {session.session_id}")
 
