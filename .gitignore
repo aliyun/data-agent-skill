@@ -10,3 +10,4 @@ sessions/
 *.zip
 .qoder/
 .DS_Store
+.claude/
