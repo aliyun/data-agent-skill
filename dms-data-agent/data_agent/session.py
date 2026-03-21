@@ -40,6 +40,7 @@ class SessionManager:
         wait_for_running: bool = True,
         mode: Optional[str] = "ASK_DATA",
         enable_search: bool = False,
+        file_id: Optional[str] = None,
     ) -> SessionInfo:
         """Create a new session or reuse an existing one.
 
@@ -52,6 +53,7 @@ class SessionManager:
             mode: Session mode to use when creating a new session.
                   One of "ASK_DATA" (default), "ANALYSIS", "INSIGHT".
             enable_search: Whether to enable search capability in the session.
+            file_id: Optional file ID for file-based analysis session.
 
         Returns:
             SessionInfo for the active session.
@@ -98,7 +100,7 @@ class SessionManager:
                 ) from e
 
         # Create new session
-        session = self._client.create_session(database_id=database_id, mode=mode, enable_search=enable_search)
+        session = self._client.create_session(database_id=database_id, mode=mode, enable_search=enable_search, file_id=file_id)
 
         # Only wait if session is not already running
         if wait_for_running and not session.is_running():

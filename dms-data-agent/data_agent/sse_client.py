@@ -195,6 +195,109 @@ class SSEClient:
         if checkpoint is not None:
             params["Checkpoint"] = str(checkpoint)
 
+        # Check authentication type
+        if hasattr(self._config, 'api_key') and self._config.api_key and not (self._config.access_key_id and self._config.access_key_secret):
+            # API_KEY authentication
+            return self._do_stream_with_api_key(agent_id, session_id, timeout, checkpoint)
+        else:
+            # AK/SK authentication
+            return self._do_stream_with_ak_sk(agent_id, session_id, timeout, checkpoint)
+
+    def _do_stream_with_api_key(
+        self,
+        agent_id: str,
+        session_id: str,
+        timeout: int,
+        checkpoint: Optional[int] = None,
+    ) -> Iterator[SSEEvent]:
+        """Stream with API_KEY authentication."""
+        # Determine endpoint based on action type (GetChatContent is a data plane API)
+        base_endpoint = f"dataagent-stream-{self._config.region}.aliyuncs.com/apikey"
+        url = f"https://{base_endpoint}"
+
+        # Build request body
+        body = {
+            'Action': 'GetChatContent',
+            'Version': '2025-04-14',
+            'RegionId': self._config.region,
+            'AgentId': agent_id,
+            'SessionId': session_id,
+        }
+        if checkpoint is not None:
+            body['Checkpoint'] = str(checkpoint)
+
+        # Set up headers with API_KEY
+        headers = {
+            'x-api-key': self._config.api_key,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        }
+
+        with requests.post(
+            url,
+            stream=True,
+            timeout=timeout,
+            headers=headers,
+            json=body,
+        ) as response:
+            if not response.ok:
+                request_id = response.headers.get("x-acs-request-id", "")
+                body_preview = ""
+                try:
+                    body_preview = response.text[:500]
+                except Exception:
+                    pass
+                raise requests.exceptions.HTTPError(
+                    f"{response.status_code} {response.reason} for {response.url}"
+                    f"\n  Request-Id: {request_id}"
+                    + (f"\n  Body: {body_preview}" if body_preview else ""),
+                    response=response,
+                )
+
+            buffer = ""
+            event_type = ""
+            for chunk in response.iter_content(chunk_size=1024, decode_unicode=True):
+                if not chunk:
+                    continue
+                buffer += chunk
+
+                # Process complete lines from buffer
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+
+                    if not line:
+                        continue
+
+                    if line.startswith("event:"):
+                        event_part = line[6:].strip()
+                        if " at " in event_part:
+                            event_type = event_part.split(" at ")[0]
+                        else:
+                            event_type = event_part.split()[0] if event_part else ""
+                    elif line.startswith("data:"):
+                        data_str = line[5:].strip()
+                        if data_str and event_type:
+                            event = self._parse_event(event_type, data_str)
+                            yield event
+                            if event.event_type == "SSE_FINISH":
+                                return
+
+    def _do_stream_with_ak_sk(
+        self,
+        agent_id: str,
+        session_id: str,
+        timeout: int,
+        checkpoint: Optional[int] = None,
+    ) -> Iterator[SSEEvent]:
+        """Stream with AK/SK authentication."""
+        params = {
+            "AgentId": agent_id,
+            "SessionId": session_id,
+        }
+        if checkpoint is not None:
+            params["Checkpoint"] = str(checkpoint)
+
         host = self._config.endpoint
         headers = AliyunSignerV3.sign(
             self._config.access_key_id,
@@ -403,6 +506,93 @@ class AsyncSSEClient:
         checkpoint: Optional[int] = None,
     ) -> AsyncIterator[SSEEvent]:
         """Single-connection async streaming attempt."""
+        # Check authentication type
+        if hasattr(self._config, 'api_key') and self._config.api_key and not (self._config.access_key_id and self._config.access_key_secret):
+            # API_KEY authentication
+            async for event in self._async_do_stream_with_api_key(agent_id, session_id, timeout, checkpoint):
+                yield event
+        else:
+            # AK/SK authentication
+            async for event in self._async_do_stream_with_ak_sk(agent_id, session_id, timeout, checkpoint):
+                yield event
+
+    async def _async_do_stream_with_api_key(
+        self,
+        agent_id: str,
+        session_id: str,
+        timeout: int,
+        checkpoint: Optional[int] = None,
+    ) -> AsyncIterator[SSEEvent]:
+        """Async stream with API_KEY authentication."""
+        # Determine endpoint based on action type (GetChatContent is a data plane API)
+        base_endpoint = f"dataagent-stream-{self._config.region}.aliyuncs.com/apikey"
+        url = f"https://{base_endpoint}"
+
+        # Build request body
+        body = {
+            'Action': 'GetChatContent',
+            'Version': '2025-04-14',
+            'RegionId': self._config.region,
+            'AgentId': agent_id,
+            'SessionId': session_id,
+        }
+        if checkpoint is not None:
+            body['Checkpoint'] = str(checkpoint)
+
+        # Set up headers with API_KEY
+        headers = {
+            'x-api-key': self._config.api_key,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                headers=headers,
+                json=body,
+            ) as response:
+                response.raise_for_status()
+
+                buffer = ""
+                event_type = ""
+
+                async for chunk in response.content.iter_chunked(1024):
+                    if not chunk:
+                        continue
+                    buffer += chunk.decode("utf-8")
+
+                    # Process complete lines from buffer
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
+
+                        if not line:
+                            continue
+
+                        if line.startswith("event:"):
+                            event_part = line[6:].strip()
+                            if " at " in event_part:
+                                event_type = event_part.split(" at ")[0]
+                            else:
+                                event_type = event_part.split()[0] if event_part else ""
+                        elif line.startswith("data:"):
+                            data_str = line[5:].strip()
+                            if data_str and event_type:
+                                event = self._parse_event(event_type, data_str)
+                                yield event
+                                if event.event_type == "SSE_FINISH":
+                                    return
+
+    async def _async_do_stream_with_ak_sk(
+        self,
+        agent_id: str,
+        session_id: str,
+        timeout: int,
+        checkpoint: Optional[int] = None,
+    ) -> AsyncIterator[SSEEvent]:
+        """Async stream with AK/SK authentication."""
         params = {
             "AgentId": agent_id,
             "SessionId": session_id,

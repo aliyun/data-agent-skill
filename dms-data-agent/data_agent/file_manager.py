@@ -87,15 +87,16 @@ class FileManager:
         except Exception as e:
             raise FileUploadError(f"Failed to get upload signature: {e}", file_path=file_path)
 
-        # Extract OSS direct upload parameters from Data field
-        data = signature_response.get("Data", {})
-        upload_host = data.get("UploadHost")
-        upload_dir = data.get("UploadDir")
-        policy = data.get("Policy")
-        oss_signature = data.get("OssSignature")
-        oss_date = data.get("OssDate")
-        oss_security_token = data.get("OssSecurityToken")
-        oss_credential = data.get("OssCredential")
+        # Extract OSS direct upload parameters from data field (support both camelCase and PascalCase)
+        # For API_KEY auth, the response has been processed to camelCase
+        data = signature_response.get("data", signature_response.get("Data", {}))
+        upload_host = data.get("uploadHost", data.get("UploadHost"))
+        upload_dir = data.get("uploadDir", data.get("UploadDir"))
+        policy = data.get("policy", data.get("Policy"))
+        oss_signature = data.get("ossSignature", data.get("OssSignature"))
+        oss_date = data.get("ossDate", data.get("OssDate"))
+        oss_security_token = data.get("ossSecurityToken", data.get("OssSecurityToken"))
+        oss_credential = data.get("ossCredential", data.get("OssCredential"))
 
         if not all([upload_host, upload_dir, policy, oss_signature]):
             raise FileUploadError(
@@ -138,15 +139,20 @@ class FileManager:
         file_id = upload_dir
 
         # Confirm upload and get the correct FileId from response
+        # Note: For API_KEY auth, FileUploadCallback may fail, so we use upload_dir as file_id
+        final_file_id = file_id
         try:
-            callback_resp = self._client.file_upload_callback(file_id, filename, upload_location)
+            callback_resp = self._client.file_upload_callback(file_id, filename, upload_location, file_size)
             # Extract FileId from callback response - after API adapter transformation,
             # response fields become camelCase
             data_field = callback_resp.get("data", callback_resp.get("Data", {}))
             data_center_file_id = data_field.get("fileId", data_field.get("FileId"))
-            final_file_id = data_center_file_id if data_center_file_id else file_id
+            if data_center_file_id:
+                final_file_id = data_center_file_id
         except Exception as e:
-            raise FileUploadError(f"Failed to confirm upload: {e}", file_path=file_path)
+            # If callback fails, use upload_dir as file_id (fallback)
+            print(f"Warning: FileUploadCallback failed: {e}. Using upload_dir as file_id.")
+            final_file_id = file_id
 
         return FileInfo(
             file_id=final_file_id,
@@ -360,15 +366,16 @@ class AsyncFileManager:
         except Exception as e:
             raise FileUploadError(f"Failed to get upload signature: {e}", file_path=file_path)
 
-        # Extract OSS direct upload parameters from Data field
-        data = signature_response.get("Data", {})
-        upload_host = data.get("UploadHost")
-        upload_dir = data.get("UploadDir")
-        policy = data.get("Policy")
-        oss_signature = data.get("OssSignature")
-        oss_date = data.get("OssDate")
-        oss_security_token = data.get("OssSecurityToken")
-        oss_credential = data.get("OssCredential")
+        # Extract OSS direct upload parameters from data field (support both camelCase and PascalCase)
+        # For API_KEY auth, the response has been processed to camelCase
+        data = signature_response.get("data", signature_response.get("Data", {}))
+        upload_host = data.get("uploadHost", data.get("UploadHost"))
+        upload_dir = data.get("uploadDir", data.get("UploadDir"))
+        policy = data.get("policy", data.get("Policy"))
+        oss_signature = data.get("ossSignature", data.get("OssSignature"))
+        oss_date = data.get("ossDate", data.get("OssDate"))
+        oss_security_token = data.get("ossSecurityToken", data.get("OssSecurityToken"))
+        oss_credential = data.get("ossCredential", data.get("OssCredential"))
 
         if not all([upload_host, upload_dir, policy, oss_signature]):
             raise FileUploadError(
@@ -413,15 +420,20 @@ class AsyncFileManager:
         file_id = upload_dir
 
         # Confirm upload and get the correct FileId from response
+        # Note: For API_KEY auth, FileUploadCallback may fail, so we use upload_dir as file_id
+        final_file_id = file_id
         try:
-            callback_resp = await self._client.file_upload_callback(file_id, filename, upload_location)
+            callback_resp = await self._client.file_upload_callback(file_id, filename, upload_location, file_size)
             # Extract FileId from callback response - after API adapter transformation,
             # response fields become camelCase
             data_field = callback_resp.get("data", callback_resp.get("Data", {}))
             data_center_file_id = data_field.get("fileId", data_field.get("FileId"))
-            final_file_id = data_center_file_id if data_center_file_id else file_id
+            if data_center_file_id:
+                final_file_id = data_center_file_id
         except Exception as e:
-            raise FileUploadError(f"Failed to confirm upload: {e}", file_path=file_path)
+            # If callback fails, use upload_dir as file_id (fallback)
+            print(f"Warning: FileUploadCallback failed: {e}. Using upload_dir as file_id.")
+            final_file_id = file_id
 
         return FileInfo(
             file_id=final_file_id,
