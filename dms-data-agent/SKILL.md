@@ -11,11 +11,11 @@ compatibility: |
 ---
 metadata:
   author: DataAgent 研发
-  version: "1.6.6"
+  version: "1.7.0"
 ---
 
 # 更新日志
-- **v1.6.6**: 原生异步执行模式、会话隔离、增强的attach模式、优化的日志输出
+- **v1.7.0**: API_KEY 认证支持、原生异步执行模式、会话隔离、增强的attach模式、优化的日志输出
 - **新增功能**: API请求调试功能，通过环境变量控制
 
 ---
@@ -26,6 +26,7 @@ metadata:
 
 
 ## 配置凭证和地域（复制示例文件并填入真实值）
+### OpenClaw 配置方法
 - 检查在 `~/.openclaw/openclaw.json` 中是否存在下述变量，如果不存在则需要首先配置：
 ```json
 {
@@ -43,6 +44,12 @@ metadata:
   }
 }
 ```
+
+### 其他配置（QoderWork,Claude Code等）
+- 在Skill目录复制创建.env 文件
+- 或者使用环境变量
+
+
 - **注意**：如果同时配置了 AK/SK 和 API_KEY，系统将优先使用 AK/SK 认证
 - DATA_AGENT_REGION（如 cn-hangzhou, cn-beijing 等）
 - **权限要求**：确保 RAM 用户具有 DMS 管理权限（AliyunDMSFullAccess 或 AliyunDMSDataAgentFullAccess）
@@ -62,7 +69,7 @@ metadata:
 
 > **IMPORTANT — 用户体验要求**
 >
-> Data Agent 的分析任务（尤其是 ANALYSIS/INSIGHT 模式）可能需要 **5-40 分钟**才能完成。为避免用户长时间等待而无感知，调用方（Agent）**必须**遵守以下规则：
+> Data Agent 的分析任务（尤其是 ANALYSIS 模式）可能需要 **5-40 分钟**才能完成。为避免用户长时间等待而无感知，调用方（Agent）**必须**遵守以下规则：
 >
 > 1. **即时反馈**：发起异步任务后，立即告知用户已启动，并给出 Session ID 和查看进度的方式
 > 2. **主动轮询**：定期检查 `status.txt`（建议每 30-60 秒），并将状态变化（running → waiting_input → completed）及时告知用户
