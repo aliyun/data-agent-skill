@@ -149,3 +149,5 @@ python3 data_agent_cli.py reports --session-id abc123xyz
 - 避免重复的数据理解阶段
 - 保留上下文历史
 - 减少 API 调用次数
+
+> 详细子 Agent 实现规范见 [ANALYSIS_MODE.md](ANALYSIS_MODE.md)
