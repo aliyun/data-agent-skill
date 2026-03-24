@@ -14,13 +14,29 @@ def _extract_list(resp: dict) -> list:
     """Extract a list from an API response regardless of nesting style.
 
     Handles ``{Data: [...]}`` and ``{Data: {List/DataList/Content: [...]}}``.
+    Also handles lowercase ``{data: {...}}`` format from some API responses.
     """
-    data = resp.get("Data", [])
+    # Try uppercase "Data" first, then lowercase "data"
+    data = resp.get("Data") or resp.get("data", [])
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
         return data.get("List") or data.get("DataList") or data.get("Content") or []
     return []
+
+
+def _get_field(obj: dict, *names: str, default=""):
+    """Get a field value trying multiple possible key names (case-insensitive).
+
+    Args:
+        obj: The dictionary to search
+        *names: Possible field names to try (e.g., "DatabaseName", "databaseName")
+        default: Default value if none found
+    """
+    for name in names:
+        if name in obj:
+            return obj[name]
+    return default
 
 
 def cmd_ls(args: argparse.Namespace) -> None:
@@ -49,8 +65,12 @@ def cmd_ls(args: argparse.Namespace) -> None:
             return
 
         # Separate real DB connections from file-based data sources
-        real_dbs  = [d for d in items if d.get("ImportType", "") in ("RDS", "DMS")]
-        file_dbs  = [d for d in items if d.get("ImportType", "") == "FILE"]
+        # Handle both PascalCase and camelCase keys from API response
+        def _get_import_type(d):
+            return d.get("ImportType") or d.get("importType", "")
+
+        real_dbs  = [d for d in items if _get_import_type(d) in ("RDS", "DMS")]
+        file_dbs  = [d for d in items if _get_import_type(d) == "FILE"]
 
         # -- Real databases (RDS / DMS) --
         print(f"\n{'=' * 60}")
@@ -58,14 +78,14 @@ def cmd_ls(args: argparse.Namespace) -> None:
         print(f"{'=' * 60}")
         if real_dbs:
             for db in real_dbs:
-                db_name         = db.get("DatabaseName", "")
-                db_type         = db.get("DbType", "").lower()
-                import_type     = db.get("ImportType", "")
-                dms_db_id       = db.get("DmsDbId", "")
-                dms_instance_id = db.get("DmsInstanceId", "")
-                instance_name   = db.get("InstanceName", "")
-                db_desc         = db.get("DatabaseDesc", "")
-                agent_db_id     = db.get("DbId", "")
+                db_name         = _get_field(db, "DatabaseName", "databaseName")
+                db_type         = _get_field(db, "DbType", "dbType", default="").lower()
+                import_type     = _get_field(db, "ImportType", "importType")
+                dms_db_id       = _get_field(db, "DmsDbId", "dmsDbId")
+                dms_instance_id = _get_field(db, "DmsInstanceId", "dmsInstanceId")
+                instance_name   = _get_field(db, "InstanceName", "instanceName")
+                db_desc         = _get_field(db, "DatabaseDesc", "databaseDesc")
+                agent_db_id     = _get_field(db, "DbId", "dbId")
 
                 print(f"\n  {db_name}  [{db_type}]  ({import_type})")
                 if db_desc:
@@ -83,11 +103,11 @@ def cmd_ls(args: argparse.Namespace) -> None:
         print(f"{'=' * 60}")
         if file_dbs:
             for db in file_dbs:
-                db_name     = db.get("DatabaseName", "")
-                db_type     = db.get("DbType", "").lower()
-                agent_db_id = db.get("DbId", "")
-                db_desc     = db.get("DatabaseDesc", "")
-                internal    = db.get("IsInternal", "N")
+                db_name     = _get_field(db, "DatabaseName", "databaseName")
+                db_type     = _get_field(db, "DbType", "dbType", default="").lower()
+                agent_db_id = _get_field(db, "DbId", "dbId")
+                db_desc     = _get_field(db, "DatabaseDesc", "databaseDesc")
+                internal    = _get_field(db, "IsInternal", "isInternal", default="N")
                 label       = "[sample]" if internal == "Y" else ""
                 print(f"  {db_name:<45}  [{db_type}]  {label}  DbId={agent_db_id}")
         else:
