@@ -76,11 +76,6 @@ DATA_AGENT_DEBUG_API=1 python3 dms-data-agent/data_agent_cli.py file dms-data-ag
 
 这将输出所有 API 调用的详细信息，包括请求参数和响应内容，有助于排查问题和理解与阿里云服务的交互过程。
 
-### 配置 OpenClaw 的 Proactive Agent 能力
-
-可以把 assets/HEARTBEAT.md 复制或者更新到 OpenClaw 工作目录下的 HEARTBEAT.md 文件中，OpenClaw 会自动检测 HEARTBEAT.md 文件，并自动将技能信息同步到 OpenClaw 中。
-
-
 ### 基本使用
 
 ```bash
