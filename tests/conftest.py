@@ -14,10 +14,9 @@ from data_agent.models import SessionInfo, SessionStatus, ContentBlock, ContentT
 
 @pytest.fixture
 def mock_config():
-    """Create a mock configuration."""
+    """Create a mock configuration using API_KEY auth (no credential chain needed)."""
     return DataAgentConfig(
-        access_key_id="test_access_key_id",
-        access_key_secret="test_access_key_secret",
+        api_key="test_api_key_for_testing",
         region="cn-hangzhou",
         timeout=300,
         max_retry=3,

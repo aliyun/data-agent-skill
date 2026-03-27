@@ -17,20 +17,36 @@ class TestDataAgentClient:
     """Test cases for DataAgentClient."""
 
     @pytest.fixture
-    def client(self, mock_config, mock_sdk_client):
-        """Create a client with mocked SDK."""
+    def client(self, mock_config):
+        """Create a client with API_KEY auth (no SDK client needed)."""
         return DataAgentClient(mock_config)
 
-    def test_init_creates_sdk_client(self, mock_config, mock_sdk_client):
-        """Test that initialization creates SDK client."""
+    def test_init_api_key_auth(self, mock_config):
+        """Test that API_KEY initialization sets correct auth type."""
         client = DataAgentClient(mock_config)
+        assert client._auth_type == "api_key"
+        assert client._sdk_client is None
+
+    @patch("data_agent.client.OpenApiClient")
+    @patch("alibabacloud_credentials.client.Client")
+    def test_init_default_credential_chain(self, mock_cred_cls, mock_sdk_cls):
+        """Test that non-API-KEY initialization uses credential chain."""
+        mock_cred_instance = MagicMock()
+        mock_cred_instance.get_credential.return_value = MagicMock()
+        mock_cred_cls.return_value = mock_cred_instance
+
+        config = DataAgentConfig(region="cn-hangzhou")
+        client = DataAgentClient(config)
+        assert client._auth_type == "default_credential_chain"
         assert client._sdk_client is not None
 
     def test_create_session_success(self, client):
         """Test successful session creation."""
         mock_response = {
-            "AgentId": "agent-123",
-            "SessionId": "session-456",
+            "data": {
+                "agentId": "agent-123",
+                "sessionId": "session-456",
+            }
         }
 
         with patch.object(client, "_call_api", return_value=mock_response):
@@ -43,8 +59,10 @@ class TestDataAgentClient:
     def test_create_session_with_database_id(self, client):
         """Test session creation with database ID."""
         mock_response = {
-            "AgentId": "agent-123",
-            "SessionId": "session-456",
+            "data": {
+                "agentId": "agent-123",
+                "sessionId": "session-456",
+            }
         }
 
         with patch.object(client, "_call_api", return_value=mock_response) as mock_call:
@@ -66,8 +84,10 @@ class TestDataAgentClient:
     def test_describe_session_running(self, client):
         """Test describing a running session."""
         mock_response = {
-            "Status": "RUNNING",
-            "DatabaseId": "db-123",
+            "data": {
+                "sessionStatus": "RUNNING",
+                "databaseId": "db-123",
+            }
         }
 
         with patch.object(client, "_call_api", return_value=mock_response):
@@ -78,7 +98,11 @@ class TestDataAgentClient:
 
     def test_describe_session_creating(self, client):
         """Test describing a creating session."""
-        mock_response = {"Status": "CREATING"}
+        mock_response = {
+            "data": {
+                "sessionStatus": "CREATING",
+            }
+        }
 
         with patch.object(client, "_call_api", return_value=mock_response):
             session = client.describe_session("session-id", "agent-id")
@@ -155,8 +179,8 @@ class TestAsyncDataAgentClient:
     """Test cases for AsyncDataAgentClient."""
 
     @pytest.fixture
-    def async_client(self, mock_config, mock_sdk_client):
-        """Create an async client."""
+    def async_client(self, mock_config):
+        """Create an async client with API_KEY auth."""
         return AsyncDataAgentClient(mock_config)
 
     @pytest.mark.asyncio

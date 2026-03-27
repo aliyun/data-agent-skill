@@ -77,22 +77,32 @@ class DataAgentClient:
     def _initialize_client(self) -> None:
         """Initialize the underlying SDK client based on authentication type."""
         # Determine authentication type
-        if self._config.api_key and not (self._config.access_key_id and self._config.access_key_secret):
+        if self._config.api_key:
             # API_KEY authentication - don't initialize the Tea SDK client
             self._sdk_client = None
             self._auth_type = "api_key"
         else:
-            # AK/SK authentication - initialize Tea SDK client
-            sdk_config = open_api_models.Config(
-                access_key_id=self._config.access_key_id,
-                access_key_secret=self._config.access_key_secret,
-            )
-            sdk_config.endpoint = self._config.endpoint
-            # Set STS token if provided
-            if self._config.security_token:
-                sdk_config.security_token = self._config.security_token
-            self._sdk_client = OpenApiClient(sdk_config)
-            self._auth_type = "ak_sk"
+            # Use Alibaba Cloud default credential chain
+            # Supports: env vars, ~/.aliyun/config.json, ECS role, OIDC role, etc.
+            from alibabacloud_credentials.client import Client as CredentialClient
+            
+            try:
+                self._credential_client = CredentialClient()
+                credential = self._credential_client.get_credential()
+                
+                sdk_config = open_api_models.Config()
+                sdk_config.endpoint = self._config.endpoint
+                sdk_config.user_agent = "AlibabaCloud-Agent-Skills"
+                sdk_config.credential = self._credential_client
+                    
+                self._sdk_client = OpenApiClient(sdk_config)
+                self._auth_type = "default_credential_chain"
+            except Exception as e:
+                raise AuthenticationError(
+                    f"Failed to get credentials from default credential chain: {e}. "
+                    "Please configure credentials via ~/.aliyun/config.json, "
+                    "environment variables, or instance role."
+                )
 
     def _call_api(
         self,
@@ -189,6 +199,7 @@ class DataAgentClient:
             'x-api-key': self._config.api_key,
             'Content-Type': 'application/json',
             'Accept': 'application/json',
+            'User-Agent': 'AlibabaCloud-Agent-Skills',
         }
 
         # Add debug logging if enabled via environment variable
@@ -588,7 +599,7 @@ class DataAgentClient:
         params = {
             "Filename": filename,
             "UploadLocation": upload_location,
-            "FileFrom": "DingDing",
+            "FileFrom": "Skill",
         }
         if file_size:
             params["FileSize"] = file_size
