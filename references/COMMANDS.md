@@ -13,7 +13,7 @@
 ### 列出所有数据库
 
 ```bash
-python3 dms-data-agent/data_agent_cli.py ls
+python3 scripts/data_agent_cli.py ls
 ```
 
 输出分两组：
@@ -22,23 +22,25 @@ python3 dms-data-agent/data_agent_cli.py ls
 
 每条数据库记录显示：
 ```
-  chinook  [mysql]  (RDS)
+  internal_data_employees  [mysql]  (RDS)
     AgentDbId     : <AGENT_DB_ID>
     DmsDbId       : <DMS_DB_ID>
     DmsInstanceId : <DMS_INSTANCE_ID>
     InstanceName  : <INSTANCE_NAME>
 ```
 
+> **提示**：`internal_data_employees` 是 DataAgent 内置的体验库，包含员工、部门、薪资等测试数据，适合首次体验使用。
+
 ### 按关键词过滤
 
 ```bash
-python3 dms-data-agent/data_agent_cli.py ls --search chinook
+python3 scripts/data_agent_cli.py ls --search internal_data_employees
 ```
 
 ### 列出指定库的表 + 生成可用命令
 
 ```bash
-python3 dms-data-agent/data_agent_cli.py ls --db-id <AgentDbId>
+python3 scripts/data_agent_cli.py ls --db-id <AgentDbId>
 ```
 
 输出包含可直接复制使用的 `db` 命令模板。

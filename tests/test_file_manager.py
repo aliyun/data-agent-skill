@@ -81,7 +81,9 @@ class TestFileManager:
         assert result.file_type == "csv"
         # Extract filename from temp_csv_file
         filename = os.path.basename(temp_csv_file)
-        mock_client.file_upload_callback.assert_called_once_with("upload/dir", filename, f"upload/dir/{filename}")
+        # file_upload_callback now receives file_size as 4th argument
+        file_size = os.path.getsize(temp_csv_file)
+        mock_client.file_upload_callback.assert_called_once_with("upload/dir", filename, f"upload/dir/{filename}", file_size)
 
     def test_upload_file_not_found(self, file_manager):
         """Test upload with non-existent file."""

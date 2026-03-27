@@ -11,3 +11,7 @@ sessions/
 .qoder/
 .DS_Store
 .claude/
+tests/
+venv/
+docs/
+CLAUDE.md

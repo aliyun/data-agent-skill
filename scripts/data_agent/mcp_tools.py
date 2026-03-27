@@ -109,18 +109,18 @@ class DmsMcpTools:
         self._init_dms_client()
 
     def _init_dms_client(self) -> None:
-        """Initialize DMS Enterprise client."""
-        sdk_config = open_api_models.Config(
-            access_key_id=self._config.access_key_id,
-            access_key_secret=self._config.access_key_secret,
-        )
-        if self._config.security_token:
-            sdk_config.security_token = self._config.security_token
+        """Initialize DMS Enterprise client using default credential chain."""
+        from alibabacloud_credentials.client import Client as CredentialClient
+        
+        credential_client = CredentialClient()
+        
+        sdk_config = open_api_models.Config()
+        sdk_config.credential = credential_client
         
         # Use DMS Enterprise endpoint
         region = self._config.region
         sdk_config.endpoint = f"dms-enterprise.{region}.aliyuncs.com"
-        sdk_config.user_agent = "data-agent-mcp-tools"
+        sdk_config.user_agent = "AlibabaCloud-Agent-Skills"
         
         self._dms_client = DmsClient(sdk_config)
 
@@ -384,17 +384,17 @@ class AsyncDmsMcpTools:
         self._dms_client: Optional[DmsClient] = None
 
     async def _init_dms_client(self) -> None:
-        """Initialize async DMS Enterprise client."""
-        sdk_config = open_api_models.Config(
-            access_key_id=self._config.access_key_id,
-            access_key_secret=self._config.access_key_secret,
-        )
-        if self._config.security_token:
-            sdk_config.security_token = self._config.security_token
+        """Initialize async DMS Enterprise client using default credential chain."""
+        from alibabacloud_credentials.client import Client as CredentialClient
+        
+        credential_client = CredentialClient()
+        
+        sdk_config = open_api_models.Config()
+        sdk_config.credential = credential_client
         
         region = self._config.region
         sdk_config.endpoint = f"dms-enterprise.{region}.aliyuncs.com"
-        sdk_config.user_agent = "data-agent-mcp-tools"
+        sdk_config.user_agent = "AlibabaCloud-Agent-Skills"
         
         self._dms_client = DmsClient(sdk_config)
 

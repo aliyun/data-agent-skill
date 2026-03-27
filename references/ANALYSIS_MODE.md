@@ -37,7 +37,7 @@ ANALYSIS 模式任务耗时长（5-40 分钟），**必须 spawn 一个子 Agent
 
 ```bash
 # 下载报告到本地
-python3 dms-data-agent/data_agent_cli.py reports --session-id <SESSION_ID>
+python3 scripts/data_agent_cli.py reports --session-id <SESSION_ID>
 
 # 或引导用户到 Data Agent 控制台查看（推荐）
 # https://agent.dms.aliyun.com/<地域>/session/<SESSION_ID>

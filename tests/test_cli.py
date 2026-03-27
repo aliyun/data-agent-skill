@@ -190,6 +190,7 @@ class TestCmdFile:
                    session_mode="ANALYSIS", list_generated_files=False):
         ns = MagicMock()
         ns.file_path = file_path
+        ns.file_id = None
         ns.query = query
         ns.session_mode = session_mode
         ns.list_generated_files = list_generated_files
@@ -241,7 +242,7 @@ class TestCmdFile:
             cmd_file(args)
 
         mock_fm.upload_file.assert_called_once_with(temp_csv)
-        mock_sm.create_or_reuse.assert_called_once_with(mode="ANALYSIS", enable_search=False)
+        mock_sm.create_or_reuse.assert_called_once_with(mode="ANALYSIS", enable_search=False, file_id='file-001')
         mock_mh.stream_events.assert_called_once()
         captured = capsys.readouterr()
         assert "File uploaded" in captured.out

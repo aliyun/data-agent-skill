@@ -20,9 +20,6 @@ class DataAgentConfig:
     """Configuration for Data Agent client.
 
     Attributes:
-        access_key_id: Alibaba Cloud Access Key ID
-        access_key_secret: Alibaba Cloud Access Key Secret
-        security_token: Alibaba Cloud Security Token (STS Token, optional)
         api_key: API Key for alternative authentication (optional)
         region: Region for DMS endpoint (default: cn-hangzhou)
         endpoint: Custom endpoint (auto-generated if not set)
@@ -30,11 +27,13 @@ class DataAgentConfig:
         max_retry: Maximum retry attempts (default: 3)
         poll_interval: Interval between polls in seconds (default: 2)
         max_poll_count: Maximum poll attempts (default: 60)
+    
+    Note:
+        For AK/SK authentication, the SDK uses Alibaba Cloud default credential chain
+        (environment variables, ~/.aliyun/config.json, instance role, etc.)
+        Do NOT pass AK/SK explicitly to this config.
     """
 
-    access_key_id: str = ""
-    access_key_secret: str = ""
-    security_token: Optional[str] = None
     api_key: Optional[str] = None
     region: str = "cn-hangzhou"
     endpoint: Optional[str] = None
@@ -45,15 +44,12 @@ class DataAgentConfig:
 
     def __post_init__(self) -> None:
         """Generate endpoint if not provided and validate config."""
-        # If using API_KEY authentication and no endpoint is provided,
-        # use the apikey format which is different from the standard DMS endpoint
         if not self.endpoint:
-            if self.api_key and not (self.access_key_id and self.access_key_secret):
+            if self.api_key:
                 # For API key auth, use the dataagent domain format with /apikey suffix
-                # Using correct hyphen format: dataagent-{region}.aliyuncs.com/apikey
                 self.endpoint = f"dataagent-{self.region}.aliyuncs.com/apikey"
             else:
-                # Standard DMS endpoint for AK/SK auth
+                # Standard DMS endpoint for AK/SK auth (uses default credential chain)
                 self.endpoint = f"dms.{self.region}.aliyuncs.com"
         self.validate()
 
@@ -63,26 +59,8 @@ class DataAgentConfig:
         Raises:
             ConfigurationError: If required configuration is missing or invalid.
         """
-        # Validate that either AK/SK pair is provided OR API key is provided
-        if not self.access_key_id and not self.access_key_secret and not self.api_key:
-            # If no AK/SK pair is provided, API key must be provided
-            if not self.api_key:
-                raise ConfigurationError(
-                    "Either AccessKey pair (ALIBABA_CLOUD_ACCESS_KEY_ID and ALIBABA_CLOUD_ACCESS_KEY_SECRET) "
-                    "or API_KEY must be provided."
-                )
-        # If AK/SK pair is provided, both key id and secret must be present
-        elif self.access_key_id or self.access_key_secret:
-            if not self.access_key_id:
-                raise ConfigurationError(
-                    "Missing ALIBABA_CLOUD_ACCESS_KEY_ID. "
-                    "Set it via environment variable or pass it explicitly."
-                )
-            if not self.access_key_secret:
-                raise ConfigurationError(
-                    "Missing ALIBABA_CLOUD_ACCESS_KEY_SECRET. "
-                    "Set it via environment variable or pass it explicitly."
-                )
+        # API key is optional - if not provided, SDK will use default credential chain
+        pass
 
         if self.timeout <= 0:
             raise ConfigurationError(f"Invalid timeout value: {self.timeout}. Must be positive.")
@@ -103,8 +81,9 @@ class DataAgentConfig:
         Returns:
             DataAgentConfig instance.
 
-        Raises:
-            ConfigurationError: If required environment variables are missing.
+        Note:
+            AK/SK credentials are NOT read from environment variables here.
+            The Alibaba Cloud SDK uses its default credential chain.
         """
         if dotenv_path:
             load_dotenv(dotenv_path)
@@ -112,10 +91,7 @@ class DataAgentConfig:
             load_dotenv()
 
         return cls(
-            access_key_id=os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID", ""),
-            access_key_secret=os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET", ""),
-            security_token=os.environ.get("ALIBABA_CLOUD_SECURITY_TOKEN") or os.environ.get("SECURITY_TOKEN"),
-            api_key=os.environ.get("DATA_AGENT_API_KEY", ""),
+            api_key=os.environ.get("DATA_AGENT_API_KEY") or None,
             region=os.environ.get("DATA_AGENT_REGION", "cn-hangzhou"),
             endpoint=os.environ.get("DATA_AGENT_ENDPOINT"),
             timeout=int(os.environ.get("DATA_AGENT_TIMEOUT", "300")),
@@ -133,12 +109,13 @@ class DataAgentConfig:
 
         Returns:
             DataAgentConfig instance.
+        
+        Note:
+            Do NOT pass AK/SK credentials in config_dict.
+            Use Alibaba Cloud default credential chain instead.
         """
         return cls(
-            access_key_id=config_dict.get("access_key_id", ""),
-            access_key_secret=config_dict.get("access_key_secret", ""),
-            security_token=config_dict.get("security_token"),
-            api_key=config_dict.get("api_key", ""),
+            api_key=config_dict.get("api_key"),
             region=config_dict.get("region", "cn-hangzhou"),
             endpoint=config_dict.get("endpoint"),
             timeout=config_dict.get("timeout", 300),
@@ -161,13 +138,11 @@ class DataAgentConfig:
             "poll_interval": self.poll_interval,
             "max_poll_count": self.max_poll_count,
         }
-        # Only include indicators if specific auth methods are used
-        if not (self.access_key_id and self.access_key_secret) and self.api_key:
+        # Only indicate auth type
+        if self.api_key:
             result["auth_type"] = "api_key"
-        elif self.access_key_id and self.access_key_secret:
-            result["auth_type"] = "access_key"
         else:
-            result["auth_type"] = "unknown"
+            result["auth_type"] = "default_credential_chain"
         return result
 
     def __repr__(self) -> str:

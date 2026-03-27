@@ -260,7 +260,7 @@ def cmd_file(args: argparse.Namespace) -> None:
     # For file analysis, pass file_id to create_or_reuse so the session is bound to the file
     session = session_manager.create_or_reuse(mode=session_mode, enable_search=enable_search, file_id=file_data_source.file_id if 'file_data_source' in locals() else None)
     print(f"Session ready: {session.session_id}")
-    print(f"\n💡 Tip: To continue this session later, use: python3 dms-data-agent/data_agent_cli.py attach --session-id {session.session_id}")
+    print(f"\n💡 Tip: To continue this session later, use: python3 data_agent_cli.py attach --session-id {session.session_id}")
 
     # Get output mode
     output_mode = getattr(args, "output", "summary")

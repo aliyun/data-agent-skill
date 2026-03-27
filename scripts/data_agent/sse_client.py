@@ -188,19 +188,12 @@ class SSEClient:
         checkpoint: Optional[int] = None,
     ) -> Iterator[SSEEvent]:
         """Single-connection streaming attempt."""
-        params = {
-            "AgentId": agent_id,
-            "SessionId": session_id,
-        }
-        if checkpoint is not None:
-            params["Checkpoint"] = str(checkpoint)
-
         # Check authentication type
-        if hasattr(self._config, 'api_key') and self._config.api_key and not (self._config.access_key_id and self._config.access_key_secret):
+        if hasattr(self._config, 'api_key') and self._config.api_key:
             # API_KEY authentication
             return self._do_stream_with_api_key(agent_id, session_id, timeout, checkpoint)
         else:
-            # AK/SK authentication
+            # AK/SK authentication via default credential chain
             return self._do_stream_with_ak_sk(agent_id, session_id, timeout, checkpoint)
 
     def _do_stream_with_api_key(
@@ -231,6 +224,7 @@ class SSEClient:
             'x-api-key': self._config.api_key,
             'Content-Type': 'application/json',
             'Accept': 'application/json',
+            'User-Agent': 'AlibabaCloud-Agent-Skills',
         }
 
         with requests.post(
@@ -290,7 +284,15 @@ class SSEClient:
         timeout: int,
         checkpoint: Optional[int] = None,
     ) -> Iterator[SSEEvent]:
-        """Stream with AK/SK authentication."""
+        """Stream with AK/SK authentication via default credential chain."""
+        from alibabacloud_credentials.client import Client as CredentialClient
+        
+        credential_client = CredentialClient()
+        credential = credential_client.get_credential()
+        access_key_id = credential.access_key_id
+        access_key_secret = credential.access_key_secret
+        security_token = credential.security_token
+        
         params = {
             "AgentId": agent_id,
             "SessionId": session_id,
@@ -300,14 +302,15 @@ class SSEClient:
 
         host = self._config.endpoint
         headers = AliyunSignerV3.sign(
-            self._config.access_key_id,
-            self._config.access_key_secret,
+            access_key_id,
+            access_key_secret,
             "POST",
             host,
             "GetChatContent",
             params,
-            security_token=self._config.security_token,
+            security_token=security_token if security_token else None,
         )
+        headers["User-Agent"] = "AlibabaCloud-Agent-Skills"
 
         # Build query string for URL
         query_params = {"Action": "GetChatContent", "Version": "2025-04-14", **params}
@@ -507,12 +510,12 @@ class AsyncSSEClient:
     ) -> AsyncIterator[SSEEvent]:
         """Single-connection async streaming attempt."""
         # Check authentication type
-        if hasattr(self._config, 'api_key') and self._config.api_key and not (self._config.access_key_id and self._config.access_key_secret):
+        if hasattr(self._config, 'api_key') and self._config.api_key:
             # API_KEY authentication
             async for event in self._async_do_stream_with_api_key(agent_id, session_id, timeout, checkpoint):
                 yield event
         else:
-            # AK/SK authentication
+            # AK/SK authentication via default credential chain
             async for event in self._async_do_stream_with_ak_sk(agent_id, session_id, timeout, checkpoint):
                 yield event
 
@@ -544,6 +547,7 @@ class AsyncSSEClient:
             'x-api-key': self._config.api_key,
             'Content-Type': 'application/json',
             'Accept': 'application/json',
+            'User-Agent': 'AlibabaCloud-Agent-Skills',
         }
 
         async with aiohttp.ClientSession() as session:
@@ -592,7 +596,15 @@ class AsyncSSEClient:
         timeout: int,
         checkpoint: Optional[int] = None,
     ) -> AsyncIterator[SSEEvent]:
-        """Async stream with AK/SK authentication."""
+        """Async stream with AK/SK authentication via default credential chain."""
+        from alibabacloud_credentials.client import Client as CredentialClient
+        
+        credential_client = CredentialClient()
+        credential = credential_client.get_credential()
+        access_key_id = credential.access_key_id
+        access_key_secret = credential.access_key_secret
+        security_token = credential.security_token
+        
         params = {
             "AgentId": agent_id,
             "SessionId": session_id,
@@ -602,14 +614,15 @@ class AsyncSSEClient:
 
         host = self._config.endpoint
         headers = AliyunSignerV3.sign(
-            self._config.access_key_id,
-            self._config.access_key_secret,
+            access_key_id,
+            access_key_secret,
             "POST",
             host,
             "GetChatContent",
             params,
-            security_token=self._config.security_token,
+            security_token=security_token if security_token else None,
         )
+        headers["User-Agent"] = "AlibabaCloud-Agent-Skills"
 
         # Build query string for URL
         query_params = {"Action": "GetChatContent", "Version": "2025-04-14", **params}

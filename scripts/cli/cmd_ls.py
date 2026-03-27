@@ -174,7 +174,7 @@ def cmd_ls(args: argparse.Namespace) -> None:
     print(sep)
     print("  Ready-to-use db command:")
     print(sep)
-    print(f"  python3 dms-data-agent/data_agent_cli.py db \\")
+    print(f"  python3 data_agent_cli.py db \\")
     print(f"    --dms-instance-id {dms_instance_id} \\")
     print(f"    --dms-db-id {dms_db_id} \\")
     print(f"    --instance-name {instance_name} \\")
