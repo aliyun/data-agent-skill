@@ -305,7 +305,7 @@ def cmd_file(args: argparse.Namespace) -> None:
                     print("(No response received, please retry)")
                 elif need_confirm:
                     print("\n⚠️  Agent has created an execution plan. User confirmation required.")
-                    print(f"   To continue: python3 dms-data-agent/data_agent_cli.py attach --session-id {session.session_id} -q 'User Input' ")
+                    print(f"   To continue: python3 scripts/data_agent_cli.py attach --session-id {session.session_id} -q 'User Input' ")
                     if output_text:
                         with open(session_dir / "output.md", "w", encoding="utf-8") as f:
                             f.write(output_text)

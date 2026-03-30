@@ -264,7 +264,7 @@ def cmd_attach(args: argparse.Namespace) -> None:
                         print("(No response received, please retry)")
                     elif need_confirm:
                         print("\n⚠️  Agent has created an execution plan. User confirmation required.")
-                        print(f"   To continue: python3 dms-data-agent/data_agent_cli.py attach --session-id {session.session_id} -q 'your input'")
+                        print(f"   To continue: python3 scripts/data_agent_cli.py attach --session-id {session.session_id} -q 'your input'")
                     elif is_confirmation_query:
                         # After confirmation, continue monitoring for additional steps
                         print(f"\n[Sync mode] Post-confirmation: Monitoring for additional steps...")
@@ -287,8 +287,8 @@ def cmd_attach(args: argparse.Namespace) -> None:
                             if updated_session.status.value == "WAIT_INPUT":
                                 print("\n⚠️  Agent has created an execution plan and is waiting for confirmation.")
                                 print("   Use -q option to confirm the plan or provide feedback:")
-                                print(f"     python3 dms-data-agent/data_agent_cli.py attach --session-id {session.session_id} -q 'confirm'")
-                                print(f"     python3 dms-data-agent/data_agent_cli.py attach --session-id {session.session_id} -q 'modify the plan'")
+                                print(f"     python3 scripts/data_agent_cli.py attach --session-id {session.session_id} -q 'confirm'")
+                                print(f"     python3 scripts/data_agent_cli.py attach --session-id {session.session_id} -q 'modify the plan'")
                         except Exception:
                             pass
                 except Exception as e:
