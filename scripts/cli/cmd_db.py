@@ -315,7 +315,7 @@ def cmd_db(args: argparse.Namespace) -> None:
     enable_search = getattr(args, 'enable_search', False)
     session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id), enable_search=enable_search)
     print(f"Session ready: {session.session_id}")
-    print(f"\n💡 Tip: To continue this session later, use: python3 dms-data-agent/data_agent_cli.py attach --session-id {session.session_id}")
+    print(f"\n💡 Tip: To continue this session later, use: python3 scripts/data_agent_cli.py attach --session-id {session.session_id}")
 
     # Execute query
     output_mode = getattr(args, "output", "summary")

@@ -224,8 +224,8 @@ Mode Description:
             "  - Confirm an execution plan after WAIT_INPUT\n"
             "  - Ask follow-up questions in an existing session\n\n"
             "Examples:\n"
-            "  python3 dms-data-agent/data_agent_cli.py attach --session-id <ID> -q '\u786e\u8ba4\u6267\u884c\u8ba1\u5212'\n"
-            "  python3 dms-data-agent/data_agent_cli.py attach --session-id <ID>"
+            "  python3 scripts/data_agent_cli.py attach --session-id <ID> -q '\u786e\u8ba4\u6267\u884c\u8ba1\u5212'\n"
+            "  python3 scripts/data_agent_cli.py attach --session-id <ID>"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -274,9 +274,9 @@ Mode Description:
             "List databases registered in DMS Data Center and print the\n"
             "key IDs and parameters needed for the db subcommand.\n\n"
             "Examples:\n"
-            "  python3 dms-data-agent/data_agent_cli.py ls                  # all databases\n"
-            "  python3 dms-data-agent/data_agent_cli.py ls --search chinook # filter by name\n"
-            "  python3 dms-data-agent/data_agent_cli.py ls --db-id <DB_ID> # tables in DB"
+            "  python3 scripts/data_agent_cli.py ls                  # all databases\n"
+            "  python3 scripts/data_agent_cli.py ls --search chinook # filter by name\n"
+            "  python3 scripts/data_agent_cli.py ls --db-id <DB_ID> # tables in DB"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -304,10 +304,10 @@ Tools:
   list-tables       List tables in a database
 
 Examples:
-  python3 dms-data-agent/data_agent_cli.py dms list-instances
-  python3 dms-data-agent/data_agent_cli.py dms list-instances --search mysql --db-type mysql
-  python3 dms-data-agent/data_agent_cli.py dms search-database --search-key mydb
-  python3 dms-data-agent/data_agent_cli.py dms list-tables --database-id <DATABASE_ID>
+  python3 scripts/data_agent_cli.py dms list-instances
+  python3 scripts/data_agent_cli.py dms list-instances --search mysql --db-type mysql
+  python3 scripts/data_agent_cli.py dms search-database --search-key mydb
+  python3 scripts/data_agent_cli.py dms list-tables --database-id <DATABASE_ID>
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -375,7 +375,7 @@ This command imports tables from DMS into Data Agent's Data Center,
 making them available for analysis via the 'db' subcommand.
 
 Examples:
-  python3 dms-data-agent/data_agent_cli.py import \\
+  python3 scripts/data_agent_cli.py import \\
     --dms-instance-id <DMS_INSTANCE_ID> \\
     --dms-db-id <DMS_DB_ID> \\
     --instance-name <INSTANCE_NAME> \\
@@ -437,7 +437,7 @@ Examples:
         description="""List and download files generated during an ANALYSIS or INSIGHT session.
 
 Examples:
-  python3 dms-data-agent/data_agent_cli.py reports --session-id <ID>
+  python3 scripts/data_agent_cli.py reports --session-id <ID>
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

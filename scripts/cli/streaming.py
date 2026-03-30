@@ -762,8 +762,8 @@ def _flush_tool_call_response(state: StreamState) -> None:
             if not state.is_attach:
                 _out(state, f"\n> ⚠️  Please review the execution plan above. To confirm, DO NOT create a new session, use the existing session:")
                 session_id = state.session_id or "<SESSION_ID>"
-                _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '确认执行'")
-                _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q 'confirm'")
+                _out(state, f">    python3 scripts/data_agent_cli.py attach --session-id {session_id} -q '确认执行'")
+                _out(state, f">    python3 scripts/data_agent_cli.py attach --session-id {session_id} -q 'confirm'")
                 state.got_content = True
                 state.need_user_confirm = True
             else:
@@ -849,7 +849,7 @@ def _handle_chat_finish(state: StreamState, event: SSEEvent) -> None:
         _out(state, f"{content}")
         _out(state, f"\n\u26a0\ufe0f  Please respond using the existing session (DO NOT create a new session):")
         session_id = state.session_id or "<SESSION_ID>"
-        _out(state, f"   python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '<your response>'")
+        _out(state, f"   python3 scripts/data_agent_cli.py attach --session-id {session_id} -q '<your response>'")
         state.got_content = True
         state.need_user_confirm = True
         return
@@ -895,9 +895,9 @@ def _handle_ask_sql(state: StreamState, content: str) -> None:
                     session_id = state.session_id or "<SESSION_ID>"
                     _out(state, f"\n> ⚠️  Please review the SQL above.")
                     _out(state, f"> To confirm and execute ONLY this SQL, DO NOT create a new session, use the existing session:")
-                    _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '确认执行当前SQL'")
+                    _out(state, f">    python3 scripts/data_agent_cli.py attach --session-id {session_id} -q '确认执行当前SQL'")
                     _out(state, f"> To agree to execute all subsequent SQL automatically:")
-                    _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '同意后续所有SQL执行'")
+                    _out(state, f">    python3 scripts/data_agent_cli.py attach --session-id {session_id} -q '同意后续所有SQL执行'")
                     state.got_content = True
                     state.need_user_confirm = True
                 return
@@ -910,9 +910,9 @@ def _handle_ask_sql(state: StreamState, content: str) -> None:
         session_id = state.session_id or "<SESSION_ID>"
         _out(state, f"\n> ⚠️  Please review the SQL above.")
         _out(state, f"> To confirm and execute ONLY this SQL, DO NOT create a new session, use the existing session:")
-        _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '确认执行当前SQL'")
+        _out(state, f">    python3 scripts/data_agent_cli.py attach --session-id {session_id} -q '确认执行当前SQL'")
         _out(state, f"> To agree to execute all subsequent SQL automatically:")
-        _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '同意后续所有SQL执行'")
+        _out(state, f">    python3 scripts/data_agent_cli.py attach --session-id {session_id} -q '同意后续所有SQL执行'")
         state.got_content = True
         state.need_user_confirm = True
 
@@ -954,8 +954,8 @@ def _handle_ask_plan(state: StreamState, content: str) -> None:
             if not state.is_attach:
                 _out(state, f"\n> \u26a0\ufe0f  Please review the execution plan above. To confirm, DO NOT create a new session, use the existing session:")
                 session_id = state.session_id or "<SESSION_ID>"
-                _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '\u786e\u8ba4\u6267\u884c'")
-                _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q 'confirm'")
+                _out(state, f">    python3 scripts/data_agent_cli.py attach --session-id {session_id} -q '\u786e\u8ba4\u6267\u884c'")
+                _out(state, f">    python3 scripts/data_agent_cli.py attach --session-id {session_id} -q 'confirm'")
                 state.got_content = True
                 state.need_user_confirm = True
             else:
@@ -974,7 +974,7 @@ def _handle_ask_plan(state: StreamState, content: str) -> None:
     if not state.is_attach:
         _out(state, f"\n> \u26a0\ufe0f  Please review the plan above. To confirm, DO NOT create a new session, use the existing session:")
         session_id = state.session_id or "<SESSION_ID>"
-        _out(state, f">    python3 dms-data-agent/data_agent_cli.py attach --session-id {session_id} -q '\u786e\u8ba4\u6267\u884c'")
+        _out(state, f">    python3 scripts/data_agent_cli.py attach --session-id {session_id} -q '\u786e\u8ba4\u6267\u884c'")
         state.got_content = True
         state.need_user_confirm = True
     else:
