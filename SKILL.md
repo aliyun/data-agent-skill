@@ -1,137 +1,178 @@
 ---
 name: alibabacloud-data-agent-skill
 description: |
-  通过命令行调用阿里云瑶池 Data Agent for Analytics，帮助用户对企业数据库进行自然语言驱动的数据分析。
-  Data Agent for Analytics 是阿里云瑶池数据库团队推出的面向企业用户的数据分析智能体，可根据自然语言描述自动完成需求分析、数据理解、分析洞察及报告生成。
-  本工具支持：发现已托管在 DMS 的数据资源（实例/库/表）、发起问数或深度分析会话、实时跟踪执行进度、获取分析结论及生成的报告文件。
-  当用户需要查询数据库、分析数据趋势、生成数据报告、用自然语言问数，或提到"Data Agent"、"数据分析"、"数据库查询"、"SQL分析"、"数据洞察"时使用本 Skill。
+  Invoke Alibaba Cloud Apsara Data Agent for Analytics via CLI to perform natural language-driven data analysis on enterprise databases.
+  Data Agent for Analytics is an intelligent data analysis agent developed by Alibaba Cloud Database team for enterprise users. It automatically completes requirement analysis, data understanding, analysis insights, and report generation based on natural language descriptions.
+  This tool supports: discovering data resources (instances/databases/tables) managed in DMS, initiating query or deep analysis sessions, real-time progress tracking, and retrieving analysis conclusions and generated reports.
+  Use this Skill when users need to query databases, analyze data trends, generate data reports, ask questions in natural language, or mention "Data Agent", "data analysis", "database query", "SQL analysis", "data insights".
 compatibility: |
-  需要有效的阿里云凭证（默认凭证链或 API_KEY）；
-  需要安装 requirements.txt 中的依赖；
-  数据源需已托管在阿里云瑶池数据库或 DMS。
+  Requires valid Alibaba Cloud credentials (default credential chain or API_KEY);
+  Requires dependencies in requirements.txt to be installed;
+  Data sources must be managed in Alibaba Cloud Apsara Database or DMS.
 domain: AIOps
 ---
 metadata:
-  author: DataAgent 研发
-  version: "1.7.2"
+  author: DataAgent Team
+  version: "1.8.0"
 ---
 
-# 更新日志
-- **v1.7.2**: 使用阿里云默认凭证链替代显式 AK/SK、添加 User-Agent 头、修复 RAM 权限通配符问题
-- **v1.7.1**: 修复 CLI `ls` 命令 API 响应解析问题（支持大小写字段名）、优化 SKILL 文档结构、ANALYSIS 模式规范独立文档
-- **v1.7.0**: API_KEY 认证支持、原生异步执行模式、会话隔离、增强的attach模式、优化的日志输出
+# Changelog
+- **v1.8.0**: Add custom agent management (`agent` command) and workspace management (`workspace` command), add `WorkspaceInfo` and `CustomAgentInfo` models, expand client API with agent/workspace operations, refactor CLI documentation to bilingual format
+- **v1.7.2**: Use Alibaba Cloud default credential chain instead of explicit AK/SK, add User-Agent header, fix RAM policy wildcard issues
+- **v1.7.1**: Fix CLI `ls` command API response parsing (support case-insensitive field names), optimize SKILL documentation structure, separate ANALYSIS mode specification document
+- **v1.7.0**: API_KEY authentication support, native async execution mode, session isolation, enhanced attach mode, optimized log output
 
 ---
 
 ---
 
-# 安装
+# Installation
 
 
-## 配置凭证
+## Configure Credentials
 
-本 Skill 使用阿里云默认凭证链（推荐）或 API_KEY 认证。
+This Skill uses Alibaba Cloud default credential chain (recommended) or API_KEY authentication.
 
-### 方式一：默认凭证链（推荐）
+### Option 1: Default Credential Chain (Recommended)
 
-Skill 使用阿里云 SDK 的默认凭证链自动获取凭证，支持环境变量、配置文件、实例角色等方式。
+The Skill uses Alibaba Cloud SDK's default credential chain to automatically obtain credentials, supporting environment variables, configuration files, instance roles, etc.
 
-详见 [阿里云凭证链文档](https://help.aliyun.com/document_detail/378659.html)
+See [Alibaba Cloud Credential Chain Documentation](https://help.aliyun.com/document_detail/378659.html)
 
-### 方式二：API_KEY 认证（仅文件分析）
+### Option 2: API_KEY Authentication (File Analysis Only)
 
 ```bash
 export DATA_AGENT_API_KEY=your-api-key
 export DATA_AGENT_REGION=cn-hangzhou
 ```
 
-获取 API_KEY：[Data Agent 控制台](https://agent.dms.aliyun.com/cn-hangzhou/api-key)
+Get API_KEY: [Data Agent Console](https://agent.dms.aliyun.com/cn-hangzhou/api-key)
 
-### 权限要求
+### Permission Requirements
 
-RAM 用户需具有 `AliyunDMSFullAccess` 或 `AliyunDMSDataAgentFullAccess` 权限。
-详细权限说明见 [RAM-POLICIES.md](references/RAM-POLICIES.md)
+RAM users need `AliyunDMSFullAccess` or `AliyunDMSDataAgentFullAccess` permissions.
+See [RAM-POLICIES.md](references/RAM-POLICIES.md) for detailed permission information.
 
-## 调试功能
+## Debug Mode
 
 ```bash
-DATA_AGENT_DEBUG_API=1 python3 scripts/data_agent_cli.py file example.csv -q "分析"
+DATA_AGENT_DEBUG_API=1 python3 scripts/data_agent_cli.py file example.csv -q "analyze"
 ```
 
-## 💡 使用建议
+## 💡 Getting Started Tips
 
-- 使用内置体验库 `internal_data_employees`（DataAgent 内置的测试数据库，包含员工、部门、薪资等数据）进行首次体验
-- 或使用本地文件 `assets/example_game_data.csv` 完成文件分析体验
+- Use the built-in demo database `internal_data_employees` (DataAgent's built-in test database containing employee, department, and salary data) for first-time experience
+- Or use local file `assets/example_game_data.csv` for file analysis experience
 
 
-# Data Agent CLI — 统一命令行数据分析工具
+# Data Agent CLI — Unified Command-Line Data Analysis Tool
 
-## 概述
+## Overview
 
-`scripts/data_agent_cli.py` 帮助用户完成从**发现数据 → 发起分析 → 跟踪进度 → 获取结果**的完整流程。
+`scripts/data_agent_cli.py` helps users complete the full workflow from **discover data → initiate analysis → track progress → get results**.
 
-### 核心概念
+### Core Concepts
 
-> **⚠️ 关键前提**：Data Agent 只能分析**已导入到 Data Agent Data Center** 的数据库。
+> **⚠️ Key Prerequisite**: Data Agent can only analyze databases that have been **imported into Data Agent Data Center**.
 >
-> - **Data Center**：Data Agent 的数据中心，只有这里的数据库才能被分析
-> - **DMS**：阿里云数据管理服务，存储着所有数据库的元数据
-> - **关系**：DMS 中注册的数据库 ≠ Data Center 中的数据库
+> - **Data Center**: Data Agent's data center, only databases here can be analyzed
+> - **DMS**: Alibaba Cloud Data Management Service, stores metadata of all databases
+> - **Relationship**: Databases registered in DMS ≠ Databases in Data Center
 >
-> **使用流程**：
-> 1. 先用 `ls` 查看 Data Center 中是否有目标数据库
-> 2. 如果**没有**，先用 `dms` 子命令搜索数据库信息，再用 `import` 子命令导入
-> 3. 导入成功后，才能使用 `db` 子命令进行分析
+> **Usage Flow**:
+> 1. First use `ls` to check if the target database exists in Data Center
+> 2. If **not found**, use `dms` subcommand to search for database info, then use `import` subcommand to import it
+> 3. After successful import, you can use `db` subcommand for analysis
 
 ---
 
-## 分析模式
+## Analysis Modes
 
-- **ASK_DATA**（默认）：同步执行，秒级响应，适合即问即答
-- **ANALYSIS**：深度分析，耗时 5-40 分钟，需 spawn 子 Agent 异步执行或者使用--async-run参数
+- **ASK_DATA** (default): Synchronous execution, sub-second response, suitable for quick Q&A
+- **ANALYSIS**: Deep analysis, takes 5-40 minutes, requires spawning a sub-agent for async execution or using --async-run parameter
 
-> 详见 [ANALYSIS_MODE.md](references/ANALYSIS_MODE.md)
-
----
-
-## 会话复用
-
-首次分析使用 `db`/`file` 创建会话，后续追问使用 `attach --session-id <ID>` 复用会话。
-
-> 详见 [COMMANDS.md](references/COMMANDS.md) 和 [WORKFLOWS.md](references/WORKFLOWS.md)
+> See [ANALYSIS_MODE.md](references/ANALYSIS_MODE.md) for details
 
 ---
 
-## 快速开始
+## Workspace (Collaborative Space)
+
+Workspaces are collaborative spaces that enable team-based data analysis with shared sessions, data sources, and access control.
+
+- **List workspaces**: Use `workspace` subcommand to discover available workspaces (personal or shared)
+- **Bind session to workspace**: Pass `--workspace-id <ID>` when using `db` or `file` to create a session within a specific workspace context
+- **Workspace types**: `MY` (default, personal spaces), `ALL` (all accessible spaces including shared ones)
+
+> **Note**: When a session is created within a workspace, all subsequent API calls (describe, send message, etc.) automatically carry the workspace context.
+
+---
+
+## Custom Agent (自定义 Agent)
+
+Custom Agents are user-defined AI agents with specialized instructions, knowledge bases, and data scope configurations.
+
+- **List custom agents**: Use `agent` subcommand to discover available custom agents (RELEASED status by default)
+- **View agent details**: Use `agent describe --custom-agent-id <ID>` to see full agent configuration
+- **Bind session to custom agent**: Pass `--custom-agent-id <ID>` when using `db` or `file` to create a session powered by a specific custom agent
+
+> **Note**: Custom Agent sessions automatically use the `prod` stage. The custom agent's instructions, knowledge, and data scope will be applied to the analysis session.
+
+---
+
+## Session Reuse
+
+Use `db`/`file` to create a session for initial analysis, then use `attach --session-id <ID>` to reuse the session for follow-up questions.
+
+> See [COMMANDS.md](references/COMMANDS.md) and [WORKFLOWS.md](references/WORKFLOWS.md) for details
+
+---
+
+## Quick Start
 
 ```bash
-# 1. 查看可用数据库
+# 1. List available databases
 python3 scripts/data_agent_cli.py ls
 
-# 2. 问数分析（同步返回结果）
+# 2. Query analysis (synchronous response)
 python3 scripts/data_agent_cli.py db \
     --dms-instance-id <ID> --dms-db-id <ID> \
     --instance-name <NAME> --db-name <DB> \
-    --tables "employees,departments" -q "哪个部门平均工资最高"
+    --tables "employees,departments" -q "Which department has the highest average salary"
 
-# 3. 追问（复用会话）
-python3 scripts/data_agent_cli.py attach --session-id <ID> -q "按月分解"
+# 3. Follow-up question (reuse session)
+python3 scripts/data_agent_cli.py attach --session-id <ID> -q "Break down by month"
+
+# 4. List workspaces
+python3 scripts/data_agent_cli.py workspace
+
+# 5. Query in a specific workspace
+python3 scripts/data_agent_cli.py db \
+    --workspace-id <WORKSPACE_ID> \
+    --dms-instance-id <ID> --dms-db-id <ID> \
+    --instance-name <NAME> --db-name <DB> \
+    --tables "employees,departments" -q "Which department has the highest average salary"
+
+# Step 6: List available custom agents
+data-agent agent
+
+# Step 7: Use a custom agent for analysis
+data-agent db --custom-agent-id <AGENT_ID> --dms-instance-id ... -q "your question"
 ```
 
-> 📖 完整工作流、命令参考和最佳实践见 [WORKFLOWS.md](references/WORKFLOWS.md) 和 [COMMANDS.md](references/COMMANDS.md)
+> 📖 See [WORKFLOWS.md](references/WORKFLOWS.md) and [COMMANDS.md](references/COMMANDS.md) for complete workflows, command reference, and best practices
 
 ---
 
-## 项目结构
+## Project Structure
 
 ```
-                          # Skill 根目录
-├── SKILL.md              # 本文档
-├── scripts/              # 源代码
-│   ├── data_agent/       # SDK 模块
-│   ├── cli/              # CLI 模块
-│   ├── data_agent_cli.py # CLI 入口
-│   └── requirements.txt  # 依赖
-├── sessions/             # 会话数据
-└── references/           # 参考文档
+                          # Skill root directory
+├── SKILL.md              # This document
+├── scripts/              # Source code
+│   ├── data_agent/       # SDK module
+│   ├── cli/              # CLI module
+│   ├── data_agent_cli.py # CLI entry point
+│   └── requirements.txt  # Dependencies
+├── sessions/             # Session data
+└── references/           # Reference documents
 ```

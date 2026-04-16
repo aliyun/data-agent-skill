@@ -15,6 +15,8 @@ from cli.cmd_attach import cmd_attach
 from cli.cmd_dms import cmd_dms
 from cli.cmd_import import cmd_import
 from cli.cmd_reports import cmd_reports
+from cli.cmd_workspace import cmd_workspace
+from cli.cmd_agent import cmd_agent
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -147,6 +149,17 @@ Mode Description:
         action="store_true",
         help="Enable search capability in the session (default: False)",
     )
+    db_parser.add_argument(
+        "--workspace-id",
+        metavar="WORKSPACE_ID",
+        help="Workspace ID to bind the session to a specific workspace",
+    )
+    db_parser.add_argument(
+        "--custom-agent-id",
+        type=str,
+        default=None,
+        help="Custom Agent ID to use for the analysis session",
+    )
 
     db_parser.set_defaults(func=cmd_db)
 
@@ -210,6 +223,17 @@ Mode Description:
         "--enable-search",
         action="store_true",
         help="Enable search capability in the session (default: False)",
+    )
+    file_parser.add_argument(
+        "--workspace-id",
+        metavar="WORKSPACE_ID",
+        help="Workspace ID to bind the session to a specific workspace",
+    )
+    file_parser.add_argument(
+        "--custom-agent-id",
+        type=str,
+        default=None,
+        help="Custom Agent ID to use for the analysis session",
     )
 
     file_parser.set_defaults(func=cmd_file)
@@ -451,6 +475,89 @@ Examples:
     # reports command now downloads files automatically.
     # We keep the argument parser clean by removing it.
     reports_parser.set_defaults(func=cmd_reports)
+
+    # -- workspace subcommand --
+    workspace_parser = subparsers.add_parser(
+        "workspace",
+        help="List Data Agent workspaces under the current account",
+        description="""List Data Agent collaboration workspaces.
+
+Examples:
+  python3 scripts/data_agent_cli.py workspace
+  python3 scripts/data_agent_cli.py workspace --workspace-type ALL
+  python3 scripts/data_agent_cli.py workspace --search myworkspace
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    workspace_parser.add_argument(
+        "--workspace-type",
+        default="MY",
+        choices=["MY", "ALL"],
+        metavar="TYPE",
+        help="Workspace type: MY (default, my workspaces) | ALL (all accessible)",
+    )
+    workspace_parser.add_argument(
+        "--search", "-s",
+        metavar="KEYWORD",
+        help="Filter workspaces by name",
+    )
+    workspace_parser.add_argument(
+        "--page-number",
+        type=int,
+        default=1,
+        metavar="PAGE",
+        help="Page number (default: 1)",
+    )
+    workspace_parser.add_argument(
+        "--page-size",
+        type=int,
+        default=50,
+        metavar="SIZE",
+        help="Page size (default: 50)",
+    )
+    workspace_parser.set_defaults(func=cmd_workspace)
+
+    # -- agent subcommand --
+    agent_parser = subparsers.add_parser(
+        "agent",
+        help="List and describe custom agents",
+        description="""List and describe custom agents.
+
+Examples:
+  python3 scripts/data_agent_cli.py agent
+  python3 scripts/data_agent_cli.py agent list --search myagent
+  python3 scripts/data_agent_cli.py agent describe --custom-agent-id <ID>
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    agent_parser.add_argument(
+        "action",
+        nargs="?",
+        default="list",
+        choices=["list", "describe"],
+        help="Action to perform (default: list)",
+    )
+    agent_parser.add_argument(
+        "--workspace-id",
+        type=str,
+        default=None,
+        help="Filter agents by workspace ID",
+    )
+    agent_parser.add_argument(
+        "--custom-agent-id",
+        type=str,
+        default=None,
+        help="Custom Agent ID (required for describe)",
+    )
+    agent_parser.add_argument(
+        "--search",
+        type=str,
+        default=None,
+        help="Search keyword to filter agents",
+    )
+    agent_parser.add_argument("--page-number", type=int, default=1)
+    agent_parser.add_argument("--page-size", type=int, default=20)
+    agent_parser.set_defaults(func=cmd_agent)
 
     return parser
 

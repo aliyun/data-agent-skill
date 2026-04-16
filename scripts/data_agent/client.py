@@ -147,7 +147,9 @@ class DataAgentClient:
         # Determine if this is a control plane or data plane API based on action
         control_plane_actions = [
             'ListDataAgentSession', 'CreateDataAgentSession', 'DescribeDataAgentSession',
-            'DescribeFileUploadSignature', 'FileUploadCallback'
+            'DescribeFileUploadSignature', 'FileUploadCallback',
+            'ListDataAgentWorkspace',
+            'ListCustomAgent', 'DescribeCustomAgent'
         ]
 
         data_plane_actions = [
@@ -343,6 +345,8 @@ class DataAgentClient:
         mode: Optional[str] = None,
         enable_search: bool = False,
         file_id: Optional[str] = None,  # 添加文件ID参数
+        workspace_id: Optional[str] = None,
+        custom_agent_id: Optional[str] = None,
     ) -> SessionInfo:
         """Create a new Data Agent session.
 
@@ -352,6 +356,8 @@ class DataAgentClient:
             mode: Optional session mode, such as "ASK_DATA", "ANALYSIS", "INSIGHT".
             enable_search: Whether to enable search capability in the session.
             file_id: Optional file ID for file-based analysis session.
+            workspace_id: Optional workspace ID to bind to the session.
+            custom_agent_id: Optional custom agent ID to use for the session.
 
         Returns:
             SessionInfo with agent_id and session_id.
@@ -370,11 +376,16 @@ class DataAgentClient:
         if file_id:
             # 当指定了文件ID时，会话将是基于文件的分析
             params["File"] = file_id
+        if workspace_id:
+            params["WorkspaceId"] = workspace_id
 
         # Ensure session configuration (language/mode/search) is persisted on server
         session_config = {"Language": "CHINESE", "EnableSearch": enable_search}
         if mode:
             session_config["Mode"] = mode
+        if custom_agent_id:
+            session_config["CustomAgentId"] = custom_agent_id
+            session_config["CustomAgentStage"] = "prod"
 
         # For API_KEY auth, SessionConfig should be a JSON object, not string
         # For AK/SK auth, SessionConfig should be a JSON string
@@ -421,17 +432,19 @@ class DataAgentClient:
                 session_id=session_id,
                 status=status,
                 database_id=database_id,
+                workspace_id=workspace_id,
             )
         except ApiError as e:
             raise SessionCreationError(f"Failed to create session: {e.message}", request_id=e.request_id)
 
     @retry_on_error(max_retries=3)
-    def describe_session(self, session_id: str, agent_id: str = "") -> SessionInfo:
+    def describe_session(self, session_id: str, agent_id: str = "", workspace_id: str = "") -> SessionInfo:
         """Get the status of a session.
 
         Args:
             session_id: The session ID.
             agent_id: The agent ID (optional, but used to construct the request properly).
+            workspace_id: The workspace ID (required for workspace-bound sessions).
 
         Returns:
             SessionInfo with current status.
@@ -444,6 +457,8 @@ class DataAgentClient:
         # According to API spec, DescribeDataAgentSession doesn't require AgentId
         if agent_id:
             params["AgentId"] = agent_id
+        if workspace_id:
+            params["WorkspaceId"] = workspace_id
 
         response = self._call_api(
             action="DescribeDataAgentSession",
@@ -468,6 +483,7 @@ class DataAgentClient:
             session_id=session_id,
             status=status,
             database_id=data.get("databaseId"),  # Changed from "DatabaseId" to "databaseId"
+            workspace_id=workspace_id,
             request_id=request_id,
         )
 
@@ -480,6 +496,7 @@ class DataAgentClient:
         message_type: str = "primary",
         data_source: Optional[DataSource] = None,
         language: str = "CHINESE",
+        workspace_id: str = "",
     ) -> dict:
         """Send a message to the Data Agent.
 
@@ -490,6 +507,7 @@ class DataAgentClient:
             message_type: Message type (default: "primary").
             data_source: Optional DataSource with database metadata.
             language: Response language (default: "CHINESE").
+            workspace_id: The workspace ID (required for workspace-bound sessions).
 
         Returns:
             Response from the API.
@@ -502,6 +520,8 @@ class DataAgentClient:
             "MessageType": message_type,
             "DMSUnit": self._config.region,
         }
+        if workspace_id:
+            params["WorkspaceId"] = workspace_id
 
         # SessionConfig format depends on auth type
         # For API_KEY auth: JSON object
@@ -815,6 +835,117 @@ class DataAgentClient:
             params=params,
         )
 
+    @retry_on_error(max_retries=3)
+    def list_workspaces(
+        self,
+        workspace_type: str = "MY",
+        workspace_name: Optional[str] = None,
+        page_number: int = 1,
+        page_size: int = 50,
+        order: Optional[str] = None,
+        order_by: Optional[str] = None,
+    ) -> dict:
+        """List Data Agent workspaces under the current account.
+
+        Args:
+            workspace_type: Workspace type filter ("MY" or "ALL").
+            workspace_name: Optional workspace name filter.
+            page_number: Page number (1-based).
+            page_size: Number of results per page.
+            order: Optional sort order ("ASC" or "DESC").
+            order_by: Optional sort field (e.g., "CreateTime").
+
+        Returns:
+            Raw API response containing workspace list.
+        """
+        params: dict = {
+            "WorkspaceType": workspace_type,
+            "PageNumber": page_number,
+            "PageSize": page_size,
+            "DMSUnit": self._config.region,
+        }
+        if workspace_name:
+            params["WorkspaceName"] = workspace_name
+        if order:
+            params["Order"] = order
+        if order_by:
+            params["OrderBy"] = order_by
+
+        return self._call_api(
+            action="ListDataAgentWorkspace",
+            version="2025-04-14",
+            params=params,
+            method="GET",
+        )
+
+    @retry_on_error(max_retries=3)
+    def list_custom_agents(
+        self,
+        workspace_id: Optional[str] = None,
+        search_key: Optional[str] = None,
+        status: str = "RELEASED",
+        page_number: int = 1,
+        page_size: int = 20,
+    ) -> dict:
+        """List custom agents, default to RELEASED status only.
+
+        Args:
+            workspace_id: Optional workspace ID to filter agents.
+            search_key: Fuzzy search by name or description.
+            status: Filter by status (default: RELEASED).
+            page_number: Page number (1-based).
+            page_size: Number of results per page.
+
+        Returns:
+            Raw API response containing custom agent list.
+        """
+        params: dict = {
+            "PageNumber": page_number,
+            "PageSize": page_size,
+            "Status": status,
+            "DMSUnit": self._config.region,
+        }
+        if workspace_id:
+            params["WorkspaceId"] = workspace_id
+        if search_key:
+            params["SearchKey"] = search_key
+
+        return self._call_api(
+            action="ListCustomAgent",
+            version="2025-04-14",
+            params=params,
+            method="POST",
+        )
+
+    @retry_on_error(max_retries=3)
+    def describe_custom_agent(
+        self,
+        custom_agent_id: str,
+        workspace_id: Optional[str] = None,
+    ) -> dict:
+        """Get detailed information about a custom agent.
+
+        Args:
+            custom_agent_id: The custom agent ID.
+            workspace_id: Optional workspace ID.
+
+        Returns:
+            Raw API response containing custom agent details.
+        """
+        params: dict = {
+            "CustomAgentId": custom_agent_id,
+            "DMSUnit": self._config.region,
+        }
+        if workspace_id:
+            params["WorkspaceId"] = workspace_id
+
+        return self._call_api(
+            action="DescribeCustomAgent",
+            version="2025-04-14",
+            params=params,
+            method="POST",
+        )
+
     @property
     def config(self) -> DataAgentConfig:
         """Get the client configuration."""
@@ -860,6 +991,8 @@ class AsyncDataAgentClient:
         mode: Optional[str] = None,
         enable_search: bool = False,
         file_id: Optional[str] = None,  # 添加文件ID参数
+        workspace_id: Optional[str] = None,
+        custom_agent_id: Optional[str] = None,
     ) -> SessionInfo:
         """Create a new Data Agent session asynchronously.
 
@@ -869,6 +1002,8 @@ class AsyncDataAgentClient:
             mode: Optional session mode, such as "ASK_DATA", "ANALYSIS", "INSIGHT".
             enable_search: Whether to enable search capability in the session.
             file_id: Optional file ID for file-based analysis session.
+            workspace_id: Optional workspace ID to bind to the session.
+            custom_agent_id: Optional custom agent ID to use for the session.
 
         Returns:
             SessionInfo with agent_id and session_id.
@@ -880,14 +1015,17 @@ class AsyncDataAgentClient:
             mode=mode,
             enable_search=enable_search,
             file_id=file_id,
+            workspace_id=workspace_id,
+            custom_agent_id=custom_agent_id,
         )
 
-    async def describe_session(self, session_id: str, agent_id: str = "") -> SessionInfo:
+    async def describe_session(self, session_id: str, agent_id: str = "", workspace_id: str = "") -> SessionInfo:
         """Get the status of a session asynchronously.
 
         Args:
             session_id: The session ID.
             agent_id: The agent ID (optional).
+            workspace_id: The workspace ID (required for workspace-bound sessions).
 
         Returns:
             SessionInfo with current status.
@@ -896,6 +1034,7 @@ class AsyncDataAgentClient:
             self._sync_client.describe_session,
             session_id=session_id,
             agent_id=agent_id,
+            workspace_id=workspace_id,
         )
 
     async def send_message(
@@ -906,6 +1045,7 @@ class AsyncDataAgentClient:
         message_type: str = "primary",
         data_source: Optional[DataSource] = None,
         language: str = "CHINESE",
+        workspace_id: str = "",
     ) -> dict:
         """Send a message to the Data Agent asynchronously.
 
@@ -916,6 +1056,7 @@ class AsyncDataAgentClient:
             message_type: Message type (default: "primary").
             data_source: Optional DataSource with database metadata.
             language: Response language (default: "CHINESE").
+            workspace_id: The workspace ID (required for workspace-bound sessions).
 
         Returns:
             Response from the API.
@@ -928,6 +1069,7 @@ class AsyncDataAgentClient:
             message_type=message_type,
             data_source=data_source,
             language=language,
+            workspace_id=workspace_id,
         )
 
     async def get_chat_content(
@@ -1021,6 +1163,87 @@ class AsyncDataAgentClient:
         return await self._run_in_executor(
             self._sync_client.delete_file,
             file_id=file_id,
+        )
+
+    async def list_workspaces(
+        self,
+        workspace_type: str = "MY",
+        workspace_name: Optional[str] = None,
+        page_number: int = 1,
+        page_size: int = 50,
+        order: Optional[str] = None,
+        order_by: Optional[str] = None,
+    ) -> dict:
+        """List Data Agent workspaces asynchronously.
+
+        Args:
+            workspace_type: Workspace type filter ("MY" or "ALL").
+            workspace_name: Optional workspace name filter.
+            page_number: Page number (1-based).
+            page_size: Number of results per page.
+            order: Optional sort order ("ASC" or "DESC").
+            order_by: Optional sort field (e.g., "CreateTime").
+
+        Returns:
+            Raw API response containing workspace list.
+        """
+        return await self._run_in_executor(
+            self._sync_client.list_workspaces,
+            workspace_type=workspace_type,
+            workspace_name=workspace_name,
+            page_number=page_number,
+            page_size=page_size,
+            order=order,
+            order_by=order_by,
+        )
+
+    async def list_custom_agents(
+        self,
+        workspace_id: Optional[str] = None,
+        search_key: Optional[str] = None,
+        status: str = "RELEASED",
+        page_number: int = 1,
+        page_size: int = 20,
+    ) -> dict:
+        """List custom agents asynchronously.
+
+        Args:
+            workspace_id: Optional workspace ID to filter agents.
+            search_key: Fuzzy search by name or description.
+            status: Filter by status (default: RELEASED).
+            page_number: Page number (1-based).
+            page_size: Number of results per page.
+
+        Returns:
+            Raw API response containing custom agent list.
+        """
+        return await self._run_in_executor(
+            self._sync_client.list_custom_agents,
+            workspace_id=workspace_id,
+            search_key=search_key,
+            status=status,
+            page_number=page_number,
+            page_size=page_size,
+        )
+
+    async def describe_custom_agent(
+        self,
+        custom_agent_id: str,
+        workspace_id: Optional[str] = None,
+    ) -> dict:
+        """Get detailed information about a custom agent asynchronously.
+
+        Args:
+            custom_agent_id: The custom agent ID.
+            workspace_id: Optional workspace ID.
+
+        Returns:
+            Raw API response containing custom agent details.
+        """
+        return await self._run_in_executor(
+            self._sync_client.describe_custom_agent,
+            custom_agent_id=custom_agent_id,
+            workspace_id=workspace_id,
         )
 
     @property

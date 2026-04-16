@@ -1,75 +1,75 @@
-# 典型工作流
+# Typical Workflows
 
-本文档包含完整的操作工作流示例。
+This document contains complete operational workflow examples.
 
 ---
 
-## 方式一：从 Data Center 已有数据库开始（推荐）
+## Method 1: Start from Existing Database in Data Center (Recommended)
 
-> **前提条件**：数据库必须已存在于 Data Agent Data Center 中。
+> **Prerequisite**: The database must already exist in Data Agent Data Center.
 >
-> **内置体验库**：`internal_data_employees` 是 DataAgent 内置的测试数据库，包含员工、部门、薪资等数据，适合首次体验。
+> **Built-in Demo Database**: `internal_data_employees` is DataAgent's built-in test database, containing employee, department, and salary data, suitable for first-time experience.
 
 ```
-第 1 步  ls          ── 列出可用数据库
-第 2 步  ls --db-id  ── 列出指定库的表清单，并打印可直接复制的 db 命令
-第 3 步  db -q       ── 发起问数/分析会话，实时输出进度和结论
-第 4 步  attach      ── 连接已有会话（确认计划 / 追问 / 查看最新结果）
+Step 1  ls          -- List available databases
+Step 2  ls --db-id  -- List tables for a specific database, and print db command ready to copy
+Step 3  db -q       -- Initiate query/analysis session, output progress and conclusions in real-time
+Step 4  attach      -- Connect to existing session (confirm plan / follow-up / view latest results)
 ```
 
-### 完整示例
+### Complete Example
 
 ```bash
-# Step 1: 发现数据库
+# Step 1: Discover databases
 python3 scripts/data_agent_cli.py ls
 
-# Step 2: 查看内置测试库 internal_data_employees 的表并获取命令模板
+# Step 2: View tables in built-in test database internal_data_employees and get command template
 python3 scripts/data_agent_cli.py ls --db-id <AgentDbId>
 
-# Step 3: 问数（复制上一步生成的命令，替换问题）
+# Step 3: Query (copy command from previous step, replace question)
 python3 scripts/data_agent_cli.py db \
     --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> \
     --instance-name <INSTANCE_NAME> --db-name internal_data_employees \
     --tables "employees,departments,salaries" \
     --session-mode ASK_DATA \
-    -q "哪个岗位工资最高"
+    -q "Which position has the highest salary"
 
-# Step 4: 连接已有会话继续追问
-python3 scripts/data_agent_cli.py attach --session-id <SESSION_ID> -q "按部门统计平均工资"
+# Step 4: Connect to existing session for follow-up questions
+python3 scripts/data_agent_cli.py attach --session-id <SESSION_ID> -q "Calculate average salary by department"
 ```
 
 ---
 
-## 方式二：从 DMS 实例发现并导入到 Data Center
+## Method 2: Discover and Import from DMS Instance to Data Center
 
-> **适用场景**：当 Data Agent Data Center 中没有需要的数据库时。
+> **Use Case**: When Data Agent Data Center doesn't have the database you need.
 
 ```
-第 1 步  dms list-instances    ── 查询 DMS 中的数据库实例
-第 2 步  dms search-database   ── 搜索实例中的数据库
-第 3 步  dms list-tables       ── 列出数据库中的表
-第 4 步  ls                    ── 检查 Data Center 是否已有该数据库
-第 5 步  import                ── 将 DMS 数据库表导入到 Data Center
-第 6 步  db                    ── 发起问数/分析会话
-第 7 步  attach                ── 连接已有会话
+Step 1  dms list-instances    -- Query database instances in DMS
+Step 2  dms search-database   -- Search databases in instance
+Step 3  dms list-tables       -- List tables in database
+Step 4  ls                    -- Check if Data Center already has this database
+Step 5  import                -- Import DMS database tables to Data Center
+Step 6  db                    -- Initiate query/analysis session
+Step 7  attach                -- Connect to existing session
 ```
 
-### 完整示例
+### Complete Example
 
 ```bash
-# 1. 查询 DMS 实例列表
+# 1. Query DMS instance list
 python3 scripts/data_agent_cli.py dms list-instances
 
-# 2. 搜索目标数据库（获取 Database ID）
+# 2. Search for target database (get Database ID)
 python3 scripts/data_agent_cli.py dms search-database --search-key employees
 
-# 3. 查看库中的表
+# 3. View tables in database
 python3 scripts/data_agent_cli.py dms list-tables --database-id <DATABASE_ID>
 
-# 4. 检查 Data Center 是否已有该库
+# 4. Check if Data Center already has this database
 python3 scripts/data_agent_cli.py ls --search employees
 
-# 5. 导入到 Data Center（必须步骤）
+# 5. Import to Data Center (required step)
 python3 scripts/data_agent_cli.py import \
     --dms-instance-id <DMS_INSTANCE_ID> \
     --dms-db-id <DMS_DB_ID> \
@@ -77,79 +77,79 @@ python3 scripts/data_agent_cli.py import \
     --db-name employees \
     --tables "departments,employees,salaries"
 
-# 6. 发起分析
+# 6. Initiate analysis
 python3 scripts/data_agent_cli.py db \
     --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> \
     --instance-name <INSTANCE_NAME> --db-name employees \
     --tables "departments,employees,salaries" \
-    -q "查询平均工资最高的部门"
+    -q "Query the department with highest average salary"
 ```
 
 ---
 
-## 后台运行最佳实践
+## Background Execution Best Practices
 
-对于耗时较长的 `ls` 和 `db` 命令，建议在后台运行：
+For long-running `ls` and `db` commands, running in background is recommended:
 
 ```bash
-# 后台启动 ANALYSIS 任务
+# Start ANALYSIS task in background
 nohup python3 scripts/data_agent_cli.py db \
     --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> \
     --instance-name <INSTANCE_NAME> --db-name internal_data_employees \
     --tables "employees,departments,salaries" \
     --session-mode ANALYSIS \
-    -q "分析薪资分布并生成报告" > analysis.log 2>&1 &
+    -q "Analyze salary distribution and generate report" > analysis.log 2>&1 &
 
-# 从日志中获取会话 ID
+# Get session ID from log
 grep "Session ready" analysis.log
 
-# 随时 attach 查看进度
+# Attach anytime to check progress
 python3 scripts/data_agent_cli.py attach --session-id <SESSION_ID>
 
-# 如果网络中断或者想要恢复到某个特定的状态，可以指定 checkpoint
+# If network is interrupted or you want to resume from a specific state, specify checkpoint
 python3 scripts/data_agent_cli.py attach --session-id <SESSION_ID> --checkpoint <CHECKPOINT_NUM>
 ```
 
-**优势**：
-- 避免网络中断导致任务失败（配合 `--checkpoint` 参数可无缝续传）
-- 可随时通过 `attach` 查看进度
-- 输出日志便于后续查看
+**Benefits**:
+- Avoid task failure due to network interruption (seamless resume with `--checkpoint` parameter)
+- Check progress anytime via `attach`
+- Output logs for later review
 
 ---
 
-## 会话复用工作流
+## Session Reuse Workflow
 
-对于同一数据库的多次分析，建议复用会话以提高效率：
+For multiple analyses on the same database, reusing sessions is recommended for efficiency:
 
 ```bash
-# 第 1 次分析：创建新会话
+# Analysis 1: Create new session
 python3 scripts/data_agent_cli.py db \
     --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> \
     --instance-name <INSTANCE_NAME> --db-name internal_data_employees \
     --tables "employees,departments" \
     --session-mode ANALYSIS \
-    -q "分析 2024 年薪资增长趋势"
-# 输出: ✅ Async task started. Session ID: abc123xyz
+    -q "Analyze 2024 salary growth trends"
+# Output: ✅ Async task started. Session ID: abc123xyz
 
-# 第 2 次分析：复用同一会话，追问细节
-python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "按职级分解薪资结构"
+# Analysis 2: Reuse same session, follow-up with details
+python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "Break down salary structure by job level"
 
-# 第 3 次分析：修改计划
-python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "简化为 3 个步骤"
+# Analysis 3: Modify plan
+python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "Simplify to 3 steps"
 
-# 第 4 次分析：确认执行
-python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "确认执行"
+# Analysis 4: Confirm execution
+python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "Confirm execution"
 
-# 第 5 步：读取最终结果
+# Step 5: Read final results
 cat sessions/abc123xyz/progress.log
 
-# 第 6 步：下载生成的报告
+# Step 6: Download generated reports
 python3 scripts/data_agent_cli.py reports --session-id abc123xyz
 ```
 
-**复用优势**：
-- 避免重复的数据理解阶段
-- 保留上下文历史
-- 减少 API 调用次数
+**Benefits of Reuse**:
+- Avoid repeated data understanding phase
+- Preserve context history
+- Reduce API calls
 
-> 详细子 Agent 实现规范见 [ANALYSIS_MODE.md](ANALYSIS_MODE.md)
+> See [ANALYSIS_MODE.md](ANALYSIS_MODE.md) for detailed sub-agent implementation specifications
