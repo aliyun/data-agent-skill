@@ -274,7 +274,9 @@ def cmd_db(args: argparse.Namespace) -> None:
         # PARENT PROCESS LOGIC
         enable_search = getattr(args, 'enable_search', False)
         print(f"Creating session for async execution...")
-        session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id), enable_search=enable_search)
+        workspace_id = getattr(args, 'workspace_id', None)
+        custom_agent_id = getattr(args, 'custom_agent_id', None)
+        session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id), enable_search=enable_search, workspace_id=workspace_id, custom_agent_id=custom_agent_id)
 
         # Use common async worker setup
         setup_async_worker(args, session)
@@ -313,7 +315,9 @@ def cmd_db(args: argparse.Namespace) -> None:
     print(f"Creating session: {mode_desc}...")
     print(f"  Region: {config.region}")
     enable_search = getattr(args, 'enable_search', False)
-    session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id), enable_search=enable_search)
+    workspace_id = getattr(args, 'workspace_id', None)
+    custom_agent_id = getattr(args, 'custom_agent_id', None)
+    session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id), enable_search=enable_search, workspace_id=workspace_id, custom_agent_id=custom_agent_id)
     print(f"Session ready: {session.session_id}")
     print(f"\n💡 Tip: To continue this session later, use: python3 scripts/data_agent_cli.py attach --session-id {session.session_id}")
 

@@ -40,6 +40,7 @@ class SessionInfo:
     session_id: str
     status: SessionStatus = SessionStatus.CREATING
     database_id: Optional[str] = None
+    workspace_id: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.now)
     last_used_at: datetime = field(default_factory=datetime.now)
     request_id: Optional[str] = None
@@ -178,3 +179,32 @@ class AnalysisResult:
     session_id: Optional[str] = None
     duration_ms: Optional[int] = None
     generated_files: list[FileInfo] = field(default_factory=list)
+
+
+@dataclass
+class WorkspaceInfo:
+    """Information about a Data Agent workspace."""
+
+    workspace_id: str
+    workspace_name: str
+    description: str = ""
+    creator: str = ""
+    role_name: str = ""
+    workspace_status: str = ""
+    total_member: int = 0
+    create_time: Optional[int] = None
+    modify_time: Optional[int] = None
+
+
+@dataclass
+class CustomAgentInfo:
+    """Information about a custom Data Agent."""
+    custom_agent_id: str
+    name: str
+    description: str = ""
+    status: str = ""           # NEW/RELEASED/DRAFT/OFFLINE
+    workspace_id: Optional[str] = None
+    creator_user_name: str = ""
+    modifier_user_name: str = ""
+    gmt_created: Optional[str] = None
+    gmt_modified: Optional[str] = None

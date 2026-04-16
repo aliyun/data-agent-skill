@@ -1,44 +1,44 @@
-# ANALYSIS 模式子 Agent 规范
+# ANALYSIS Mode Sub-Agent Specification
 
-ANALYSIS 模式任务耗时长（5-40 分钟），**必须 spawn 一个子 Agent 在后台执行**，避免阻塞主对话流程。
-
----
-
-## 主 Agent 行为
-
-1. 告知用户已启动深度分析，给出 Session ID
-2. 立即返回，继续响应用户其他问题（不阻塞）
+ANALYSIS mode tasks are long-running (5-40 minutes), **you must spawn a sub-agent to execute in background** to avoid blocking the main conversation flow.
 
 ---
 
-## 子 Agent 行为
+## Main Agent Behavior
 
-1. 后台执行命令，定期轮询 `status.txt`（每 30-60 秒）
-2. 遇到关键节点时向主 Agent / 用户推送进度
-3. 任务完成后返回报告或引导用户到控制台查看
+1. Inform user that deep analysis has started, provide Session ID
+2. Return immediately, continue responding to other user questions (non-blocking)
 
 ---
 
-## 子 Agent 需要上报的关键节点
+## Sub-Agent Behavior
 
-| 节点 | 触发条件 | 上报内容 | 所需操作 |
+1. Execute command in background, periodically poll `status.txt` (every 30-60 seconds)
+2. Push progress updates to main agent/user at key checkpoints
+3. Return report or guide user to console when task completes
+
+---
+
+## Key Checkpoints for Sub-Agent to Report
+
+| Checkpoint | Trigger Condition | Report Content | Required Action |
 |------|----------|----------|----------|
-| 🚀 任务启动 | 命令执行后 | Session ID、预计耗时 | 无需操作 |
-| 📋 执行计划就绪 | `status.txt` = `waiting_input` | 展示分析计划/SQL | **必须等待用户确认，然后 `attach -q '确认执行'`** |
-| 📊 阶段结论 | `progress.log` 有新内容 | 阶段性分析结论摘要 | 无需操作 |
-| ✅ 任务完成 | `status.txt` = `completed` | 报告链接或文件路径 | 引导用户查看报告 |
-| ❌ 任务失败 | `status.txt` = `failed` | 错误信息 | 提示用户重试 |
+| 🚀 Task Started | After command execution | Session ID, estimated duration | No action needed |
+| 📋 Execution Plan Ready | `status.txt` = `waiting_input` | Show analysis plan/SQL | **Must wait for user confirmation, then `attach -q 'confirm execution'`** |
+| 📊 Phase Conclusion | New content in `progress.log` | Phase analysis summary | No action needed |
+| ✅ Task Completed | `status.txt` = `completed` | Report link or file path | Guide user to view report |
+| ❌ Task Failed | `status.txt` = `failed` | Error message | Prompt user to retry |
 
-> ⚠️ **`waiting_input` 是强制等待点**：Worker 已退出，子 Agent 必须将执行计划展示给用户，收到确认后执行 `attach -q '确认执行'`，否则任务将永久暂停。
+> ⚠️ **`waiting_input` is a mandatory wait point**: Worker has exited, sub-agent must present execution plan to user, execute `attach -q 'confirm execution'` after receiving confirmation, otherwise task will be permanently paused.
 
 ---
 
-## 任务完成后引导用户查看报告
+## Guide User to View Report After Task Completion
 
 ```bash
-# 下载报告到本地
+# Download report to local
 python3 scripts/data_agent_cli.py reports --session-id <SESSION_ID>
 
-# 或引导用户到 Data Agent 控制台查看（推荐）
-# https://agent.dms.aliyun.com/<地域>/session/<SESSION_ID>
+# Or guide user to Data Agent console (recommended)
+# https://agent.dms.aliyun.com/<region>/session/<SESSION_ID>
 ```

@@ -1,17 +1,17 @@
-# RAM 权限策略
+# RAM Permission Policies
 
-本 Skill 需要以下阿里云 RAM 权限：
+This Skill requires the following Alibaba Cloud RAM permissions:
 
-## 必需权限
+## Required Permissions
 
-| 权限策略 | 说明 |
+| Policy | Description |
 |----------|------|
-| `AliyunDMSFullAccess` | DMS 数据管理服务全权限 |
-| `AliyunDMSDataAgentFullAccess` | Data Agent 全权限 |
+| `AliyunDMSFullAccess` | Full access to DMS Data Management Service |
+| `AliyunDMSDataAgentFullAccess` | Full access to Data Agent |
 
-## 最小权限策略（推荐）
+## Minimal Permission Policy (Recommended)
 
-如果只需要使用 Data Agent 功能，可以配置以下最小权限：
+If you only need to use Data Agent features, you can configure the following minimal permissions:
 
 ```json
 {
@@ -51,9 +51,9 @@
 }
 ```
 
-## 配置说明
+## Configuration Instructions
 
-1. 登录 [阿里云 RAM 控制台](https://ram.console.aliyun.com/)
-2. 创建或选择用户
-3. 为用户添加以上权限策略
-4. 创建 AccessKey 用于 Skill 认证
+1. Log in to [Alibaba Cloud RAM Console](https://ram.console.aliyun.com/)
+2. Create or select a user
+3. Add the above permission policies to the user
+4. Create AccessKey for Skill authentication
