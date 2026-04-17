@@ -92,7 +92,7 @@ class DataAgentClient:
                 
                 sdk_config = open_api_models.Config()
                 sdk_config.endpoint = self._config.endpoint
-                sdk_config.user_agent = "AlibabaCloud-Agent-Skills"
+                sdk_config.user_agent = "AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill"
                 sdk_config.credential = self._credential_client
                     
                 self._sdk_client = OpenApiClient(sdk_config)
@@ -201,7 +201,7 @@ class DataAgentClient:
             'x-api-key': self._config.api_key,
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            'User-Agent': 'AlibabaCloud-Agent-Skills',
+            'User-Agent': 'AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill',
         }
 
         # Add debug logging if enabled via environment variable

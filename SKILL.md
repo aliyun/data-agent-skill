@@ -13,11 +13,10 @@ domain: AIOps
 ---
 metadata:
   author: DataAgent Team
-  version: "1.8.0"
+  version: "1.7.2"
 ---
 
 # Changelog
-- **v1.8.0**: Add custom agent management (`agent` command) and workspace management (`workspace` command), add `WorkspaceInfo` and `CustomAgentInfo` models, expand client API with agent/workspace operations, refactor CLI documentation to bilingual format
 - **v1.7.2**: Use Alibaba Cloud default credential chain instead of explicit AK/SK, add User-Agent header, fix RAM policy wildcard issues
 - **v1.7.1**: Fix CLI `ls` command API response parsing (support case-insensitive field names), optimize SKILL documentation structure, separate ANALYSIS mode specification document
 - **v1.7.0**: API_KEY authentication support, native async execution mode, session isolation, enhanced attach mode, optimized log output
