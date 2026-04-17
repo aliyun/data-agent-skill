@@ -75,3 +75,4 @@ tests/
 sessions/
 CLAUDE.md
 evals/
+.omc/
