@@ -15,6 +15,14 @@ from dotenv import load_dotenv
 from data_agent.exceptions import ConfigurationError
 
 
+def _none_if_blank(value: Optional[str]) -> Optional[str]:
+    """Normalize blank optional strings to None."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
 @dataclass
 class DataAgentConfig:
     """Configuration for Data Agent client.
@@ -27,6 +35,8 @@ class DataAgentConfig:
         max_retry: Maximum retry attempts (default: 3)
         poll_interval: Interval between polls in seconds (default: 2)
         max_poll_count: Maximum poll attempts (default: 60)
+        workspace_id: Optional workspace ID from DATA_AGENT_WORKSPACE_ID
+        dms_unit: Optional DMSUnit override from DATA_AGENT_DMS_UNIT
     
     Note:
         For AK/SK authentication, the SDK uses Alibaba Cloud default credential chain
@@ -41,9 +51,13 @@ class DataAgentConfig:
     max_retry: int = 3
     poll_interval: int = 2
     max_poll_count: int = 60
+    workspace_id: Optional[str] = None
+    dms_unit: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Generate endpoint if not provided and validate config."""
+        self.workspace_id = _none_if_blank(self.workspace_id)
+        self.dms_unit = _none_if_blank(self.dms_unit)
         if not self.endpoint:
             if self.api_key:
                 # For API key auth, use the dataagent domain format with /apikey suffix
@@ -98,6 +112,8 @@ class DataAgentConfig:
             max_retry=int(os.environ.get("DATA_AGENT_MAX_RETRY", "3")),
             poll_interval=int(os.environ.get("DATA_AGENT_POLL_INTERVAL", "2")),
             max_poll_count=int(os.environ.get("DATA_AGENT_MAX_POLL_COUNT", "60")),
+            workspace_id=os.environ.get("DATA_AGENT_WORKSPACE_ID"),
+            dms_unit=os.environ.get("DATA_AGENT_DMS_UNIT") or os.environ.get("DATA_AGENT_DMSUNIT"),
         )
 
     @classmethod
@@ -122,6 +138,8 @@ class DataAgentConfig:
             max_retry=config_dict.get("max_retry", 3),
             poll_interval=config_dict.get("poll_interval", 2),
             max_poll_count=config_dict.get("max_poll_count", 60),
+            workspace_id=config_dict.get("workspace_id") or config_dict.get("WorkspaceId"),
+            dms_unit=config_dict.get("dms_unit") or config_dict.get("DMSUnit"),
         )
 
     def to_dict(self) -> dict:
@@ -138,6 +156,10 @@ class DataAgentConfig:
             "poll_interval": self.poll_interval,
             "max_poll_count": self.max_poll_count,
         }
+        if self.workspace_id:
+            result["workspace_id"] = self.workspace_id
+        if self.dms_unit:
+            result["dms_unit"] = self.dms_unit
         # Only indicate auth type
         if self.api_key:
             result["auth_type"] = "api_key"
@@ -149,5 +171,6 @@ class DataAgentConfig:
         """String representation (hides secrets)."""
         return (
             f"DataAgentConfig(region='{self.region}', endpoint='{self.endpoint}', "
-            f"timeout={self.timeout}, max_retry={self.max_retry})"
+            f"timeout={self.timeout}, max_retry={self.max_retry}, "
+            f"dms_unit={self.dms_unit!r})"
         )

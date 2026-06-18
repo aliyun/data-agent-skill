@@ -256,6 +256,7 @@ def cmd_file(args: argparse.Namespace) -> None:
         "ASK_DATA": "ASK_DATA mode",
         "ANALYSIS": "ANALYSIS mode (recommended for file analysis)",
         "INSIGHT": "INSIGHT mode",
+        "CLAW": "CLAW mode (agentic)",
     }.get(session_mode, session_mode)
 
     print(f"\nCreating session: {mode_desc}...")

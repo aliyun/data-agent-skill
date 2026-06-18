@@ -11,6 +11,8 @@ import time
 import functools
 import json
 import os
+import inspect
+import uuid
 from typing import Optional, Any, Callable, TypeVar
 import requests
 
@@ -34,16 +36,72 @@ from data_agent.exceptions import (
 T = TypeVar("T")
 
 
+_SENSITIVE_FIELD_MARKERS = (
+    "api-key",
+    "apikey",
+    "authorization",
+    "accesskey",
+    "access-key",
+    "access_key",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
+
+
+def _is_debug_api_enabled() -> bool:
+    """Return whether verbose API debug logging is enabled."""
+    return os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ("true", "1", "yes")
+
+
+def _is_sensitive_field(key: Any) -> bool:
+    normalized = str(key).replace("_", "-").lower()
+    return any(marker in normalized for marker in _SENSITIVE_FIELD_MARKERS)
+
+
+def _redact_sensitive_values(value: Any) -> Any:
+    """Return a copy of ``value`` with credentials redacted for debug logs."""
+    if isinstance(value, dict):
+        return {
+            key: "<redacted>" if _is_sensitive_field(key) else _redact_sensitive_values(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive_values(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_sensitive_values(item) for item in value)
+    return value
+
+
+def _new_client_token(operation: str) -> str:
+    """Build an Alibaba Cloud ClientToken that is stable across retries."""
+    operation_name = operation.replace("_", "-")[:22]
+    return f"da-skill-{operation_name}-{uuid.uuid4().hex}"[:64]
+
+
 def retry_on_error(max_retries: int = 3, retry_codes: tuple = ("Throttling", "ServiceUnavailable")):
     """Decorator to retry API calls on transient errors with exponential backoff."""
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        signature = inspect.signature(func)
+        param_names = tuple(signature.parameters)
+        if "client_token" in param_names:
+            # ``args`` passed to wrapper excludes ``self``.
+            client_token_pos = param_names.index("client_token") - 1
+        else:
+            client_token_pos = None
+
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs) -> T:
             last_exception = None
+            call_kwargs = dict(kwargs)
+            if client_token_pos is not None and len(args) <= client_token_pos:
+                if not call_kwargs.get("client_token"):
+                    call_kwargs["client_token"] = _new_client_token(func.__name__)
             for attempt in range(max_retries + 1):
                 try:
-                    return func(self, *args, **kwargs)
+                    return func(self, *args, **call_kwargs)
                 except ApiError as e:
                     last_exception = e
                     if e.code not in retry_codes or attempt == max_retries:
@@ -64,6 +122,13 @@ class DataAgentClient:
     to interact with Data Agent sessions.
     """
 
+    # Process-level cache: DMSUnit is tenant-scoped and rarely changes, so
+    # we can safely cache it per (auth_fingerprint, region) for the whole run.
+    _dms_unit_cache: dict = {}
+
+    # Process-level cache for workspace ID resolution.
+    _workspace_cache: dict = {}
+
     def __init__(self, config: DataAgentConfig):
         """Initialize the Data Agent client.
 
@@ -72,7 +137,241 @@ class DataAgentClient:
         """
         self._config = config
         self._sdk_client: Optional[OpenApiClient] = None
+        # Instance-level cached DMSUnit (None = not yet resolved).
+        self._dms_unit: Optional[str] = None
+        self._dms_unit_region: Optional[str] = None
+        self._dms_unit_source: Optional[str] = None
         self._initialize_client()
+
+    def _resolve_dms_unit(self, force_refresh: bool = False, region_id: Optional[str] = None) -> str:
+        """Resolve the DMSUnit for the current tenant.
+
+        Resolution priority:
+          1. Explicit config/environment override (``DATA_AGENT_DMS_UNIT``).
+          2. dms-enterprise ``GetActiveRouteUnit`` (2018-11-01).
+          3. Region fallback.
+
+        ``region_id`` lets callers resolve for a non-default RegionId while
+        still honoring an explicit DMSUnit override.
+
+        Falls back to the selected region when:
+          - the response has no ``Route`` object (tenant belongs to the
+            default unit, which equals the current region);
+          - the call fails for any reason (network, auth, etc.).
+
+        Result is cached at both instance and process level. Set
+        ``force_refresh=True`` to bypass the cache.
+        """
+        if self._config.dms_unit:
+            self._dms_unit = self._config.dms_unit
+            self._dms_unit_region = region_id or self._config.region
+            self._dms_unit_source = "config"
+            return self._dms_unit
+
+        region = region_id or self._config.region
+        if not force_refresh and self._dms_unit and self._dms_unit_region == region:
+            return self._dms_unit
+
+        cache_key = (self._auth_type, region)
+        if not force_refresh and cache_key in DataAgentClient._dms_unit_cache:
+            self._dms_unit = DataAgentClient._dms_unit_cache[cache_key]
+            self._dms_unit_source = "cache"
+            return self._dms_unit
+
+        resolved = region  # safe default
+        source = "fallback"
+        try:
+            resp = self._call_dms_enterprise_route_unit(region)
+            route = resp.get("Route") or resp.get("data") or resp.get("Data")
+            if isinstance(route, dict):
+                unit = route.get("RegionId") or route.get("regionId")
+                if isinstance(unit, str) and unit:
+                    resolved = unit
+                    source = "route"
+        except Exception:
+            # Silent fallback: DMSUnit resolution must never block API calls.
+            pass
+
+        self._dms_unit = resolved
+        self._dms_unit_region = region
+        self._dms_unit_source = source
+        DataAgentClient._dms_unit_cache[cache_key] = resolved
+        return resolved
+
+    def _call_dms_enterprise_route_unit(self, region_id: Optional[str] = None) -> dict:
+        """Call dms-enterprise.GetActiveRouteUnit via a short-lived OpenApiClient.
+
+        The dms-enterprise endpoint differs from the Data Agent endpoint, so
+        we build a dedicated SDK client here (AK/SK mode only).
+        """
+        if self._auth_type != "default_credential_chain":
+            # API_KEY auth does not map to dms-enterprise; keep the fallback.
+            return {}
+
+        region = region_id or self._config.region
+        sdk_config = open_api_models.Config()
+        sdk_config.endpoint = f"dms-enterprise.{region}.aliyuncs.com"
+        sdk_config.user_agent = "AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill"
+        sdk_config.credential = self._credential_client
+        route_client = OpenApiClient(sdk_config)
+
+        api_params = open_api_models.Params(
+            action="GetActiveRouteUnit",
+            version="2018-11-01",
+            protocol="HTTPS",
+            method="POST",
+            auth_type="AK",
+            style="RPC",
+            pathname="/",
+            req_body_type="json",
+            body_type="json",
+        )
+        request = open_api_models.OpenApiRequest(query={})
+        runtime = util_models.RuntimeOptions(read_timeout=10000, connect_timeout=5000)
+        resp = route_client.call_api(api_params, request, runtime)
+        return resp.get("body", {}) if isinstance(resp, dict) else {}
+
+    def _call_init_personal_workspace(self) -> str:
+        """Call InitDataAgentPersonalWorkspace to get the user's personal workspace ID.
+
+        Returns:
+            The workspace ID string.
+
+        Raises:
+            RuntimeError: If workspace ID cannot be parsed from response.
+        """
+        params = {
+            "DMSUnit": self._resolve_dms_unit(),
+            "RegionId": self._config.region,
+        }
+        resp = self._call_api(
+            action="InitDataAgentPersonalWorkspace",
+            version="2025-04-14",
+            params=params,
+        )
+        # Try both PascalCase and camelCase response keys
+        workspace_id = None
+        data = resp.get("Data") or resp.get("data")
+        if isinstance(data, dict):
+            workspace_id = data.get("WorkspaceId") or data.get("workspaceId")
+        # Fallback: workspaceId may be a top-level field in the response
+        if not workspace_id:
+            workspace_id = resp.get("WorkspaceId") or resp.get("workspaceId")
+        if not workspace_id:
+            raise RuntimeError(
+                f"Failed to parse WorkspaceId from InitDataAgentPersonalWorkspace response: {resp}"
+            )
+        return workspace_id
+
+    def _resolve_workspace_id(self, explicit: Optional[str] = None, force_refresh: bool = False) -> str:
+        """Resolve workspace ID with priority: explicit > env > cache > API call.
+
+        Args:
+            explicit: Explicitly provided workspace ID (highest priority).
+            force_refresh: Force re-fetch from API even if cached.
+
+        Returns:
+            Resolved workspace ID string.
+        """
+        if explicit is not None:
+            self._workspace_source = "explicit"
+            return explicit
+
+        if self._config.workspace_id is not None:
+            self._workspace_source = "env"
+            return self._config.workspace_id
+
+        cache_key = (self._auth_type, self._config.region, self._resolve_dms_unit())
+        if not force_refresh and cache_key in DataAgentClient._workspace_cache:
+            self._workspace_source = "personal"
+            return DataAgentClient._workspace_cache[cache_key]
+
+        workspace_id = self._call_init_personal_workspace()
+        DataAgentClient._workspace_cache[cache_key] = workspace_id
+        self._workspace_source = "personal"
+        return workspace_id
+
+    def _call_dms_enterprise_list_tag_meta_asset(
+        self,
+        tag_name: str,
+        meta_type: str,
+        meta_parent_id: Optional[str] = None,
+        search_key: Optional[str] = None,
+        page_number: int = 1,
+        page_size: int = 50,
+    ) -> dict:
+        """Call dms-enterprise.ListTagMetaAsset via a short-lived OpenApiClient.
+
+        Args:
+            tag_name: The tag name to query assets for.
+            meta_type: Meta asset type (e.g. META_DATABASE, META_TABLE).
+            meta_parent_id: Optional parent ID for hierarchical queries.
+            search_key: Optional keyword filter.
+            page_number: Page number (1-based).
+            page_size: Number of results per page.
+
+        Returns:
+            Raw response body dict from dms-enterprise.
+
+        Raises:
+            ApiError: If the API call fails.
+        """
+        if self._auth_type != "default_credential_chain":
+            # API_KEY mode has no AK/SK credentials for dms-enterprise
+            import warnings
+            warnings.warn(
+                "ListTagMetaAsset requires AK/SK credentials. "
+                "Falling back is handled by the caller.",
+                stacklevel=2,
+            )
+            raise ApiError(
+                "ListTagMetaAsset not available in API_KEY mode (no AK/SK credentials).",
+                code="UnsupportedAuthMode",
+                request_id=None,
+            )
+
+        sdk_config = open_api_models.Config()
+        sdk_config.endpoint = f"dms-enterprise.{self._config.region}.aliyuncs.com"
+        sdk_config.user_agent = "AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill"
+        sdk_config.credential = self._credential_client
+        tag_client = OpenApiClient(sdk_config)
+
+        # Note: All query param values MUST be strings to avoid
+        # quote() errors in the Tea SDK signing logic.
+        query_params: dict = {
+            "TagName": tag_name,
+            "MetaType": meta_type,
+            "PageNumber": str(page_number),
+            "PageSize": str(page_size),
+        }
+        if meta_parent_id is not None:
+            query_params["MetaParentId"] = str(meta_parent_id)
+        if search_key is not None:
+            query_params["SearchKey"] = search_key
+
+        api_params = open_api_models.Params(
+            action="ListTagMetaAsset",
+            version="2018-11-01",
+            protocol="HTTPS",
+            method="POST",
+            auth_type="AK",
+            style="RPC",
+            pathname="/",
+            req_body_type="json",
+            body_type="json",
+        )
+        request = open_api_models.OpenApiRequest(query=query_params)
+        runtime = util_models.RuntimeOptions(read_timeout=10000, connect_timeout=5000)
+
+        try:
+            resp = tag_client.call_api(api_params, request, runtime)
+            return resp.get("body", {}) if isinstance(resp, dict) else {}
+        except TeaException as e:
+            raise ApiError(
+                message=str(e),
+                code=getattr(e, "code", "TeaException"),
+                request_id=getattr(e, "data", {}).get("RequestId") if hasattr(e, "data") and isinstance(e.data, dict) else None,
+            )
 
     def _initialize_client(self) -> None:
         """Initialize the underlying SDK client based on authentication type."""
@@ -103,6 +402,9 @@ class DataAgentClient:
                     "Please configure credentials via ~/.aliyun/config.json, "
                     "environment variables, or instance role."
                 )
+
+        # Instance attribute to track workspace resolution source
+        self._workspace_source: Optional[str] = None
 
     def _call_api(
         self,
@@ -148,7 +450,7 @@ class DataAgentClient:
         control_plane_actions = [
             'ListDataAgentSession', 'CreateDataAgentSession', 'DescribeDataAgentSession',
             'DescribeFileUploadSignature', 'FileUploadCallback',
-            'ListDataAgentWorkspace',
+            'ListDataAgentWorkspace', 'InitDataAgentPersonalWorkspace',
             'ListCustomAgent', 'DescribeCustomAgent'
         ]
 
@@ -205,16 +507,16 @@ class DataAgentClient:
         }
 
         # Add debug logging if enabled via environment variable
-        if os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ('true', '1', 'yes'):
+        if _is_debug_api_enabled():
             import pprint
             auth_type_display = "API_KEY" if self._auth_type == "api_key" else "AK/SK"
             print(f"[DEBUG] API Call: {action}")
             print(f"[DEBUG] Authentication Type: {auth_type_display}")
             print(f"[DEBUG] Method: {method}")
             print(f"[DEBUG] URL: {full_url}")
-            print(f"[DEBUG] Headers: {pprint.pformat(headers)}")
+            print(f"[DEBUG] Headers: {pprint.pformat(_redact_sensitive_values(headers))}")
             if prepared_body:
-                print(f"[DEBUG] Body: {pprint.pformat(prepared_body)}")
+                print(f"[DEBUG] Body: {pprint.pformat(_redact_sensitive_values(prepared_body))}")
 
         try:
             # Make the API call - Action and Version are now in the body
@@ -242,9 +544,9 @@ class DataAgentClient:
             processed_response = APIAdapter.process_response(response_data, api_action=action)
 
             # Add debug logging for response if enabled
-            if os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ('true', '1', 'yes'):
+            if _is_debug_api_enabled():
                 import pprint
-                print(f"[DEBUG] Response for {action}: {pprint.pformat(processed_response)}")
+                print(f"[DEBUG] Response for {action}: {pprint.pformat(_redact_sensitive_values(processed_response))}")
 
             return processed_response
         except requests.exceptions.RequestException as e:
@@ -290,15 +592,15 @@ class DataAgentClient:
         )
 
         # Add debug logging if enabled via environment variable
-        if os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ('true', '1', 'yes'):
+        if _is_debug_api_enabled():
             import pprint
             auth_type_display = "API_KEY" if self._auth_type == "api_key" else "AK/SK"
             print(f"[DEBUG] API Call: {action}")
             print(f"[DEBUG] Authentication Type: {auth_type_display}")
             print(f"[DEBUG] Method: {method}")
-            print(f"[DEBUG] Params: {pprint.pformat(prepared_params)}")
+            print(f"[DEBUG] Params: {pprint.pformat(_redact_sensitive_values(prepared_params))}")
             if prepared_body:
-                print(f"[DEBUG] Body: {pprint.pformat(prepared_body)}")
+                print(f"[DEBUG] Body: {pprint.pformat(_redact_sensitive_values(prepared_body))}")
 
         try:
             response = self._sdk_client.call_api(api_params, request, runtime)
@@ -307,9 +609,9 @@ class DataAgentClient:
             processed_response = APIAdapter.process_response(response.get("body", {}), api_action=action)
 
             # Add debug logging for response if enabled
-            if os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ('true', '1', 'yes'):
+            if _is_debug_api_enabled():
                 import pprint
-                print(f"[DEBUG] Response for {action}: {pprint.pformat(processed_response)}")
+                print(f"[DEBUG] Response for {action}: {pprint.pformat(_redact_sensitive_values(processed_response))}")
 
             return processed_response
         except TeaException as e:
@@ -347,6 +649,7 @@ class DataAgentClient:
         file_id: Optional[str] = None,  # 添加文件ID参数
         workspace_id: Optional[str] = None,
         custom_agent_id: Optional[str] = None,
+        client_token: Optional[str] = None,
     ) -> SessionInfo:
         """Create a new Data Agent session.
 
@@ -358,6 +661,7 @@ class DataAgentClient:
             file_id: Optional file ID for file-based analysis session.
             workspace_id: Optional workspace ID to bind to the session.
             custom_agent_id: Optional custom agent ID to use for the session.
+            client_token: Optional idempotency token, auto-generated for retries.
 
         Returns:
             SessionInfo with agent_id and session_id.
@@ -367,7 +671,7 @@ class DataAgentClient:
         """
         params = {
             "Title": title,
-            "DMSUnit": self._config.region,
+            "DMSUnit": self._resolve_dms_unit(),
         }
         if database_id:
             params["DatabaseId"] = database_id
@@ -378,6 +682,8 @@ class DataAgentClient:
             params["File"] = file_id
         if workspace_id:
             params["WorkspaceId"] = workspace_id
+        if client_token:
+            params["ClientToken"] = client_token
 
         # Ensure session configuration (language/mode/search) is persisted on server
         session_config = {"Language": "CHINESE", "EnableSearch": enable_search}
@@ -451,7 +757,7 @@ class DataAgentClient:
         """
         params = {
             "SessionId": session_id,
-            "DMSUnit": self._config.region,
+            "DMSUnit": self._resolve_dms_unit(),
         }
         # Only include AgentId in the request if it's provided
         # According to API spec, DescribeDataAgentSession doesn't require AgentId
@@ -497,6 +803,7 @@ class DataAgentClient:
         data_source: Optional[DataSource] = None,
         language: str = "CHINESE",
         workspace_id: str = "",
+        mode: Optional[str] = None,
     ) -> dict:
         """Send a message to the Data Agent.
 
@@ -508,6 +815,10 @@ class DataAgentClient:
             data_source: Optional DataSource with database metadata.
             language: Response language (default: "CHINESE").
             workspace_id: The workspace ID (required for workspace-bound sessions).
+            mode: Optional per-message analysis mode. Supported values:
+                ``ASK_DATA``, ``ANALYSIS``, ``INSIGHT``, ``CLAW``. When
+                provided it is injected into ``SessionConfig.Mode`` and
+                overrides the session-level mode for this single request.
 
         Returns:
             Response from the API.
@@ -518,7 +829,7 @@ class DataAgentClient:
             "SessionId": session_id,
             "Message": message,
             "MessageType": message_type,
-            "DMSUnit": self._config.region,
+            "DMSUnit": self._resolve_dms_unit(),
         }
         if workspace_id:
             params["WorkspaceId"] = workspace_id
@@ -526,7 +837,10 @@ class DataAgentClient:
         # SessionConfig format depends on auth type
         # For API_KEY auth: JSON object
         # For AK/SK auth: JSON string
-        session_config = {"Language": language}
+        session_config: dict = {"Language": language}
+        if mode:
+            # Per-message mode override; supports CLAW / ASK_DATA / ANALYSIS / INSIGHT.
+            session_config["Mode"] = mode
         if self._auth_type == "api_key":
             params["SessionConfig"] = session_config
         else:
@@ -604,7 +918,14 @@ class DataAgentClient:
         )
 
     @retry_on_error(max_retries=3)
-    def file_upload_callback(self, file_id: str, filename: str, upload_location: str, file_size: int = None) -> dict:
+    def file_upload_callback(
+        self,
+        file_id: str,
+        filename: str,
+        upload_location: str,
+        file_size: int = None,
+        client_token: Optional[str] = None,
+    ) -> dict:
         """Notify the service that file upload is complete.
 
         Args:
@@ -612,6 +933,7 @@ class DataAgentClient:
             filename: The original filename.
             upload_location: The full OSS path (UploadHost/UploadDir/Filename).
             file_size: The file size in bytes (required for API_KEY auth).
+            client_token: Optional idempotency token, auto-generated for retries.
 
         Returns:
             Response confirming the upload.
@@ -623,6 +945,8 @@ class DataAgentClient:
         }
         if file_size:
             params["FileSize"] = file_size
+        if client_token:
+            params["ClientToken"] = client_token
 
         return self._call_api(
             action="FileUploadCallback",
@@ -655,13 +979,13 @@ class DataAgentClient:
         )
 
     @retry_on_error(max_retries=3)
-    def list_databases(
+    def list_file_databases(
         self,
         search_key: Optional[str] = None,
         page_number: int = 1,
         page_size: int = 50,
     ) -> dict:
-        """List databases registered in DMS Data Center.
+        """List databases registered in DMS Data Center (legacy file-based).
 
         Args:
             search_key: Optional keyword to filter by database or instance name.
@@ -684,18 +1008,52 @@ class DataAgentClient:
         )
 
     @retry_on_error(max_retries=3)
-    def list_tables(
+    def list_databases(self, workspace_id=None, search_key=None, page_number=1, page_size=50) -> dict:
+        """List databases in workspace via ListTagMetaAsset.
+
+        Falls back to list_file_databases in API_KEY mode.
+
+        Args:
+            workspace_id: Optional explicit workspace ID.
+            search_key: Optional keyword filter.
+            page_number: Page number (1-based).
+            page_size: Number of results per page.
+
+        Returns:
+            Raw response dict from ListTagMetaAsset or fallback.
+        """
+        if self._auth_type != "default_credential_chain":
+            # Fallback: API_KEY mode cannot call dms-enterprise directly
+            return self.list_file_databases(
+                search_key=search_key,
+                page_number=page_number,
+                page_size=page_size,
+            )
+        ws = self._resolve_workspace_id(workspace_id)
+        # ListTagMetaAsset tags are region-scoped. Do not use DMSUnit here:
+        # DATA_AGENT_DMS_UNIT may differ from DATA_AGENT_REGION for session APIs.
+        tag = f"sys::DMS-DA::{self._config.region}::space:{ws}"
+        return self._call_dms_enterprise_list_tag_meta_asset(
+            tag_name=tag,
+            meta_type="META_DATABASE",
+            search_key=search_key,
+            page_number=page_number,
+            page_size=page_size,
+        )
+
+    @retry_on_error(max_retries=3)
+    def list_file_tables(
         self,
         instance_name: str,
         database_name: str,
         page_number: int = 1,
         page_size: int = 200,
     ) -> dict:
-        """List tables inside a DMS Data Center database.
+        """List tables inside a DMS Data Center database (legacy file-based).
 
         Args:
-            instance_name: The InstanceName returned by list_databases.
-            database_name: The DatabaseName returned by list_databases.
+            instance_name: The InstanceName returned by list_file_databases.
+            database_name: The DatabaseName returned by list_file_databases.
             page_number: Page number (1-based).
             page_size: Number of results per page.
 
@@ -714,18 +1072,58 @@ class DataAgentClient:
         )
 
     @retry_on_error(max_retries=3)
-    def delete_file(self, file_id: str) -> dict:
+    def list_tables(self, agent_db_id, workspace_id=None, page_number=1, page_size=200) -> dict:
+        """List tables for a database via ListTagMetaAsset.
+
+        Falls back to list_file_tables in API_KEY mode (not supported without extra params).
+
+        Args:
+            agent_db_id: The database meta parent ID.
+            workspace_id: Optional explicit workspace ID.
+            page_number: Page number (1-based).
+            page_size: Number of results per page.
+
+        Returns:
+            Raw response dict from ListTagMetaAsset or raises error for unsupported mode.
+        """
+        if self._auth_type != "default_credential_chain":
+            raise ApiError(
+                "list_tables via ListTagMetaAsset not available in API_KEY mode. "
+                "Use list_file_tables(instance_name, database_name) instead.",
+                code="UnsupportedAuthMode",
+                request_id=None,
+            )
+        ws = self._resolve_workspace_id(workspace_id)
+        # ListTagMetaAsset tags are region-scoped. Do not use DMSUnit here:
+        # DATA_AGENT_DMS_UNIT may differ from DATA_AGENT_REGION for session APIs.
+        tag = f"sys::DMS-DA::{self._config.region}::space:{ws}"
+        return self._call_dms_enterprise_list_tag_meta_asset(
+            tag_name=tag,
+            meta_type="META_TABLE",
+            meta_parent_id=agent_db_id,
+            page_number=page_number,
+            page_size=page_size,
+        )
+
+    @retry_on_error(max_retries=3)
+    def delete_file(self, file_id: str, client_token: Optional[str] = None) -> dict:
         """Delete an uploaded file.
 
         Args:
             file_id: The file ID to delete.
+            client_token: Optional idempotency token, auto-generated for retries.
 
         Returns:
             Response confirming deletion.
         """
+        if not file_id or not str(file_id).strip():
+            raise ApiError("FileId is required before deleting a file.", code="InvalidParameter", request_id=None)
+
         params = {
-            "FileId": file_id,
+            "FileId": str(file_id).strip(),
         }
+        if client_token:
+            params["ClientToken"] = client_token
 
         return self._call_api(
             action="DeleteFileUpload",
@@ -743,6 +1141,7 @@ class DataAgentClient:
         table_name_list: list[str],
         db_type: str = "mysql",
         region_id: Optional[str] = None,
+        client_token: Optional[str] = None,
     ) -> dict:
         """Add DMS database tables to Data Agent Data Center.
 
@@ -757,6 +1156,7 @@ class DataAgentClient:
             table_name_list: List of table names to import (required).
             db_type: Database type (default: "mysql").
             region_id: Optional region ID (defaults to config.region).
+            client_token: Optional idempotency token, auto-generated for retries.
 
         Returns:
             API response containing the import result.
@@ -765,13 +1165,18 @@ class DataAgentClient:
             ApiError: If the API call fails.
         """
         region = region_id or self._config.region
+        dms_unit = self._resolve_dms_unit(region_id=region)
 
-        # Convert table_name_list to JSON string for RPC API
-        import json
-        table_list_json = json.dumps(table_name_list, ensure_ascii=False)
+        if not table_name_list:
+            raise ApiError("At least one table name is required for import.", code="InvalidParameter", request_id=None)
+        normalized_tables = [str(table).strip() for table in table_name_list if str(table).strip()]
+        if not normalized_tables:
+            raise ApiError("At least one table name is required for import.", code="InvalidParameter", request_id=None)
+
+        table_list_json = json.dumps(normalized_tables, ensure_ascii=False)
 
         params = {
-            "DMSUnit": region,
+            "DMSUnit": dms_unit,
             "RegionId": region,
             "ImportType": "DMS",
             "InstanceName": instance_name,
@@ -781,6 +1186,8 @@ class DataAgentClient:
             "DmsDbId": dms_db_id,
             "TableNameList": table_list_json,
         }
+        if client_token:
+            params["ClientToken"] = client_token
 
         return self._call_api(
             action="AddDataCenterTable",
@@ -862,7 +1269,7 @@ class DataAgentClient:
             "WorkspaceType": workspace_type,
             "PageNumber": page_number,
             "PageSize": page_size,
-            "DMSUnit": self._config.region,
+            "DMSUnit": self._resolve_dms_unit(),
         }
         if workspace_name:
             params["WorkspaceName"] = workspace_name
@@ -903,7 +1310,7 @@ class DataAgentClient:
             "PageNumber": page_number,
             "PageSize": page_size,
             "Status": status,
-            "DMSUnit": self._config.region,
+            "DMSUnit": self._resolve_dms_unit(),
         }
         if workspace_id:
             params["WorkspaceId"] = workspace_id
@@ -934,7 +1341,7 @@ class DataAgentClient:
         """
         params: dict = {
             "CustomAgentId": custom_agent_id,
-            "DMSUnit": self._config.region,
+            "DMSUnit": self._resolve_dms_unit(),
         }
         if workspace_id:
             params["WorkspaceId"] = workspace_id
@@ -993,6 +1400,7 @@ class AsyncDataAgentClient:
         file_id: Optional[str] = None,  # 添加文件ID参数
         workspace_id: Optional[str] = None,
         custom_agent_id: Optional[str] = None,
+        client_token: Optional[str] = None,
     ) -> SessionInfo:
         """Create a new Data Agent session asynchronously.
 
@@ -1004,6 +1412,7 @@ class AsyncDataAgentClient:
             file_id: Optional file ID for file-based analysis session.
             workspace_id: Optional workspace ID to bind to the session.
             custom_agent_id: Optional custom agent ID to use for the session.
+            client_token: Optional idempotency token.
 
         Returns:
             SessionInfo with agent_id and session_id.
@@ -1017,6 +1426,7 @@ class AsyncDataAgentClient:
             file_id=file_id,
             workspace_id=workspace_id,
             custom_agent_id=custom_agent_id,
+            client_token=client_token,
         )
 
     async def describe_session(self, session_id: str, agent_id: str = "", workspace_id: str = "") -> SessionInfo:
@@ -1046,6 +1456,7 @@ class AsyncDataAgentClient:
         data_source: Optional[DataSource] = None,
         language: str = "CHINESE",
         workspace_id: str = "",
+        mode: Optional[str] = None,
     ) -> dict:
         """Send a message to the Data Agent asynchronously.
 
@@ -1057,6 +1468,7 @@ class AsyncDataAgentClient:
             data_source: Optional DataSource with database metadata.
             language: Response language (default: "CHINESE").
             workspace_id: The workspace ID (required for workspace-bound sessions).
+            mode: Optional per-message mode (ASK_DATA / ANALYSIS / INSIGHT / CLAW).
 
         Returns:
             Response from the API.
@@ -1070,6 +1482,7 @@ class AsyncDataAgentClient:
             data_source=data_source,
             language=language,
             workspace_id=workspace_id,
+            mode=mode,
         )
 
     async def get_chat_content(
@@ -1115,7 +1528,14 @@ class AsyncDataAgentClient:
             file_size=file_size,
         )
 
-    async def file_upload_callback(self, file_id: str, filename: str, upload_location: str, file_size: int = None) -> dict:
+    async def file_upload_callback(
+        self,
+        file_id: str,
+        filename: str,
+        upload_location: str,
+        file_size: int = None,
+        client_token: Optional[str] = None,
+    ) -> dict:
         """Notify file upload completion asynchronously.
 
         Args:
@@ -1123,6 +1543,7 @@ class AsyncDataAgentClient:
             filename: The original filename.
             upload_location: The full OSS path.
             file_size: The file size in bytes (required for API_KEY auth).
+            client_token: Optional idempotency token.
 
         Returns:
             Response confirming the upload.
@@ -1133,6 +1554,7 @@ class AsyncDataAgentClient:
             filename=filename,
             upload_location=upload_location,
             file_size=file_size,
+            client_token=client_token,
         )
 
     async def list_files(self, session_id: str, file_category: Optional[str] = None) -> dict:
@@ -1151,11 +1573,12 @@ class AsyncDataAgentClient:
             file_category=file_category,
         )
 
-    async def delete_file(self, file_id: str) -> dict:
+    async def delete_file(self, file_id: str, client_token: Optional[str] = None) -> dict:
         """Delete a file asynchronously.
 
         Args:
             file_id: The file ID to delete.
+            client_token: Optional idempotency token.
 
         Returns:
             Response confirming deletion.
@@ -1163,6 +1586,7 @@ class AsyncDataAgentClient:
         return await self._run_in_executor(
             self._sync_client.delete_file,
             file_id=file_id,
+            client_token=client_token,
         )
 
     async def list_workspaces(

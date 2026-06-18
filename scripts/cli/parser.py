@@ -133,9 +133,9 @@ Mode Description:
     db_parser.add_argument(
         "--session-mode",
         default="ASK_DATA",
-        choices=["ASK_DATA", "ANALYSIS", "INSIGHT"],
+        choices=["ASK_DATA", "ANALYSIS", "INSIGHT", "CLAW"],
         metavar="MODE",
-        help="Session mode: ASK_DATA (default) | ANALYSIS | INSIGHT",
+        help="Session mode: ASK_DATA (default) | ANALYSIS | INSIGHT | CLAW",
     )
     db_parser.add_argument(
         "--output",
@@ -208,9 +208,9 @@ Mode Description:
     file_parser.add_argument(
         "--session-mode",
         default="ANALYSIS",
-        choices=["ASK_DATA", "ANALYSIS", "INSIGHT"],
+        choices=["ASK_DATA", "ANALYSIS", "INSIGHT", "CLAW"],
         metavar="MODE",
-        help="Session mode: ASK_DATA | ANALYSIS (default) | INSIGHT",
+        help="Session mode: ASK_DATA | ANALYSIS (default) | INSIGHT | CLAW",
     )
     file_parser.add_argument(
         "--output",
@@ -305,6 +305,12 @@ Mode Description:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ls_parser.add_argument(
+        "--workspace-id",
+        type=str,
+        default=None,
+        help="Workspace ID. Leave empty for automatic resolution (CLI --workspace-id > env DATA_AGENT_WORKSPACE_ID > personal workspace).",
+    )
+    ls_parser.add_argument(
         "--search", "-s",
         metavar="KEYWORD",
         help="Filter databases by keyword (database or instance name)",
@@ -312,7 +318,7 @@ Mode Description:
     ls_parser.add_argument(
         "--db-id",
         metavar="DB_ID",
-        help="DbId of a specific database; lists its tables and prints the ready-to-use db command",
+        help="AgentDbId (MetaEntityAttrs.dbId) — list tables for this database",
     )
     ls_parser.set_defaults(func=cmd_ls)
 
@@ -404,7 +410,8 @@ Examples:
     --dms-db-id <DMS_DB_ID> \\
     --instance-name <INSTANCE_NAME> \\
     --db-name employees \\
-    --tables "departments,employees,salaries"
+    --tables "departments,employees,salaries" \\
+    --yes
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -450,6 +457,11 @@ Examples:
         default=_default_region,
         metavar="REGION",
         help=f"Region ID (default: {_default_region})",
+    )
+    import_parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Confirm the import operation without an interactive prompt",
     )
 
     import_parser.set_defaults(func=cmd_import)

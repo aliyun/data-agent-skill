@@ -8,6 +8,16 @@ This document contains detailed descriptions and complete parameter lists for al
 
 Before initiating analysis, use `ls` to understand what databases and tables are available.
 
+### Environment Resolution
+
+CLI commands load `.env` and process environment variables through `DataAgentConfig.from_env()`.
+
+| Variable | Description |
+|------|------|
+| `DATA_AGENT_REGION` | RegionId for Data Agent and DMS endpoints, default `cn-hangzhou` |
+| `DATA_AGENT_DMS_UNIT` | Optional explicit DMSUnit override for Data Agent session APIs; `ListTagMetaAsset` discovery tags still use `DATA_AGENT_REGION` |
+| `DATA_AGENT_WORKSPACE_ID` | Optional default workspace ID when `--workspace-id` is omitted |
+
 > **⚠️ Important**: The `ls` command only shows databases that have been **imported into Data Agent Data Center**. If you can't find the database you need, it means the database has not been imported from DMS yet.
 
 ### List All Databases
@@ -20,13 +30,10 @@ Output is divided into two groups:
 - **Database Connections** (ImportType: RDS/DMS) — Real relational databases, can be used with `db` subcommand
 - **File Data Sources** (ImportType: FILE) — Uploaded file datasets
 
-Each database record displays:
+Output displays databases in compact format:
 ```
-  internal_data_employees  [mysql]  (RDS)
-    AgentDbId     : <AGENT_DB_ID>
-    DmsDbId       : <DMS_DB_ID>
-    DmsInstanceId : <DMS_INSTANCE_ID>
-    InstanceName  : <INSTANCE_NAME>
+chinook [mysql]  dbId=abc123  instanceResourceId=rm-xxx  catalogName=chinook
+employees [mysql]  dbId=def456  instanceResourceId=rm-yyy  catalogName=employees
 ```
 
 > **Tip**: `internal_data_employees` is DataAgent's built-in demo database, containing employee, department, and salary test data, suitable for first-time experience.
@@ -196,6 +203,7 @@ Import DMS database tables into Data Agent Data Center.
 | `--tables` | **Required**, Table name list to import (comma-separated) |
 | `--engine` | Database engine type (default: mysql) |
 | `--region` | Region ID (default: cn-hangzhou) |
+| `--yes`, `-y` | Confirm the import operation without an interactive prompt |
 
 ---
 

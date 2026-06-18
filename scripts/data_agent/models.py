@@ -144,7 +144,6 @@ class DataSource:
         else:
             # Database analysis needs full connection info
             result.update({
-                "DmsInstanceId": str(self.dms_instance_id) if self.dms_instance_id else "",
                 "DmsDatabaseId": str(self.dms_database_id) if self.dms_database_id else "",
                 "FileId": self.instance_name,
                 "DbName": self.db_name,
@@ -154,6 +153,10 @@ class DataSource:
                 "Engine": self.engine,
                 "RegionId": self.region_id,
             })
+            if self.dms_instance_id is not None:
+                result["DmsInstanceId"] = str(self.dms_instance_id)
+            if self.instance_name:
+                result["InstanceName"] = self.instance_name
 
         # Apply API parameter formatting with PascalCase
         return APIAdapter.prepare_request_params(result)
