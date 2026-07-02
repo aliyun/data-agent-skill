@@ -77,7 +77,8 @@ Output includes a `db` command template ready to copy and use.
 | `--output` | `summary` (default) / `detail` / `raw` |
 | `--enable-search` | Enable search capability (default `false`) |
 | `--workspace-id` | Workspace ID to bind the session to a specific workspace |
-| `--custom-agent-id` | Custom Agent ID to use for the analysis session | No |
+| `--custom-agent-id` | Custom Agent ID to use for the analysis session |
+| `--dms-unit` | DMSUnit override for Data Agent APIs |
 
 ### Query Methods
 
@@ -99,7 +100,8 @@ File analysis uses `ANALYSIS` mode by default.
 | `--output` | `summary` (default) / `detail` / `raw` |
 | `--enable-search` | Enable search capability (default `false`) |
 | `--workspace-id` | Workspace ID to bind the session to a specific workspace |
-| `--custom-agent-id` | Custom Agent ID to use for the analysis session | No |
+| `--custom-agent-id` | Custom Agent ID to use for the analysis session |
+| `--dms-unit` | DMSUnit override for Data Agent APIs |
 | `-q` / `--query` | Custom query question |
 
 ---
@@ -220,3 +222,5 @@ Connect to an existing session to continue conversation, confirm plans, or check
 | `--from-start` | Replay session history from beginning (equivalent to --checkpoint 0) |
 | `--checkpoint` | Specify exact checkpoint to resume from (e.g., `--checkpoint 219`), used for precise recovery after network interruption |
 | `--output` | `summary` (default) / `detail` / `raw` |
+| `--dms-unit` | DMSUnit override for Data Agent APIs |
+| `--workspace-id` | Workspace ID override |

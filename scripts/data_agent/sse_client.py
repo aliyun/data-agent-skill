@@ -218,6 +218,8 @@ class SSEClient:
         }
         if checkpoint is not None:
             body['Checkpoint'] = str(checkpoint)
+        if self._config.dms_unit:
+            body['DMSUnit'] = self._config.dms_unit
 
         # Set up headers with API_KEY
         headers = {
@@ -271,8 +273,16 @@ class SSEClient:
                             event_type = event_part.split()[0] if event_part else ""
                     elif line.startswith("data:"):
                         data_str = line[5:].strip()
-                        if data_str and event_type:
-                            event = self._parse_event(event_type, data_str)
+                        if not data_str:
+                            continue
+                        etype = event_type
+                        if not etype:
+                            try:
+                                etype = json.loads(data_str).get("event_type", "")
+                            except (json.JSONDecodeError, AttributeError):
+                                pass
+                        if etype:
+                            event = self._parse_event(etype, data_str)
                             yield event
                             if event.event_type == "SSE_FINISH":
                                 return
@@ -286,19 +296,21 @@ class SSEClient:
     ) -> Iterator[SSEEvent]:
         """Stream with AK/SK authentication via default credential chain."""
         from alibabacloud_credentials.client import Client as CredentialClient
-        
+
         credential_client = CredentialClient()
         credential = credential_client.get_credential()
         access_key_id = credential.access_key_id
         access_key_secret = credential.access_key_secret
         security_token = credential.security_token
-        
+
         params = {
             "AgentId": agent_id,
             "SessionId": session_id,
         }
         if checkpoint is not None:
             params["Checkpoint"] = str(checkpoint)
+        if self._config.dms_unit:
+            params["DMSUnit"] = self._config.dms_unit
 
         host = self._config.endpoint
         headers = AliyunSignerV3.sign(
@@ -364,8 +376,16 @@ class SSEClient:
                             event_type = event_part.split()[0] if event_part else ""
                     elif line.startswith("data:"):
                         data_str = line[5:].strip()
-                        if data_str and event_type:
-                            event = self._parse_event(event_type, data_str)
+                        if not data_str:
+                            continue
+                        etype = event_type
+                        if not etype:
+                            try:
+                                etype = json.loads(data_str).get("event_type", "")
+                            except (json.JSONDecodeError, AttributeError):
+                                pass
+                        if etype:
+                            event = self._parse_event(etype, data_str)
                             yield event
                             if event.event_type == "SSE_FINISH":
                                 return
@@ -541,6 +561,8 @@ class AsyncSSEClient:
         }
         if checkpoint is not None:
             body['Checkpoint'] = str(checkpoint)
+        if self._config.dms_unit:
+            body['DMSUnit'] = self._config.dms_unit
 
         # Set up headers with API_KEY
         headers = {
@@ -583,8 +605,16 @@ class AsyncSSEClient:
                                 event_type = event_part.split()[0] if event_part else ""
                         elif line.startswith("data:"):
                             data_str = line[5:].strip()
-                            if data_str and event_type:
-                                event = self._parse_event(event_type, data_str)
+                            if not data_str:
+                                continue
+                            etype = event_type
+                            if not etype:
+                                try:
+                                    etype = json.loads(data_str).get("event_type", "")
+                                except (json.JSONDecodeError, AttributeError):
+                                    pass
+                            if etype:
+                                event = self._parse_event(etype, data_str)
                                 yield event
                                 if event.event_type == "SSE_FINISH":
                                     return
@@ -598,19 +628,21 @@ class AsyncSSEClient:
     ) -> AsyncIterator[SSEEvent]:
         """Async stream with AK/SK authentication via default credential chain."""
         from alibabacloud_credentials.client import Client as CredentialClient
-        
+
         credential_client = CredentialClient()
         credential = credential_client.get_credential()
         access_key_id = credential.access_key_id
         access_key_secret = credential.access_key_secret
         security_token = credential.security_token
-        
+
         params = {
             "AgentId": agent_id,
             "SessionId": session_id,
         }
         if checkpoint is not None:
             params["Checkpoint"] = str(checkpoint)
+        if self._config.dms_unit:
+            params["DMSUnit"] = self._config.dms_unit
 
         host = self._config.endpoint
         headers = AliyunSignerV3.sign(
@@ -664,8 +696,16 @@ class AsyncSSEClient:
                                 event_type = event_part.split()[0] if event_part else ""
                         elif line.startswith("data:"):
                             data_str = line[5:].strip()
-                            if data_str and event_type:
-                                event = self._parse_event(event_type, data_str)
+                            if not data_str:
+                                continue
+                            etype = event_type
+                            if not etype:
+                                try:
+                                    etype = json.loads(data_str).get("event_type", "")
+                                except (json.JSONDecodeError, AttributeError):
+                                    pass
+                            if etype:
+                                event = self._parse_event(etype, data_str)
                                 yield event
                                 if event.event_type == "SSE_FINISH":
                                     return

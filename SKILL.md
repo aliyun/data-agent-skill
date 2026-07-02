@@ -18,7 +18,7 @@ metadata:
 ---
 
 # Changelog
-- **v1.8.6**: Add explicit DMSUnit configuration via `DATA_AGENT_DMS_UNIT`; DMSUnit resolution now uses env/config override before `GetActiveRouteUnit` and region fallback.
+- **v1.8.6**: Fix SSE parsing when server omits `event:` prefix line (extract event_type from JSON payload as fallback); add DMSUnit to all SSE streaming methods (GetChatContent); add `--dms-unit` CLI flag to `db`, `file`, `attach` subcommands; add `--workspace-id` CLI flag to `attach` subcommand; DMSUnit resolution uses env/config/CLI override before `GetActiveRouteUnit` and region fallback.
 - **v1.8.5** — Database listing migrated to `ListTagMetaAsset` (dms-enterprise 2018-11-01); workspace auto-resolution (CLI `--workspace-id` > env `DATA_AGENT_WORKSPACE_ID` > `InitDataAgentPersonalWorkspace`); `db` subcommand relaxed `--dms-instance-id` / `--instance-name` to optional.
 - **v1.8.4**: Document project Python virtualenv (`venv/`) setup and activation; add end-to-end regression notes for ASK_DATA / ANALYSIS (async + attach)
 - **v1.8.3**: `db` and `file` subcommands now accept `--session-mode CLAW`
@@ -81,6 +81,24 @@ pip install -r scripts/requirements.txt
 ## Configure Credentials
 
 This Skill uses Alibaba Cloud default credential chain (recommended) or API_KEY authentication.
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DATA_AGENT_API_KEY` | API Key authentication (file analysis scenarios) | — |
+| `DATA_AGENT_REGION` | Region ID | `cn-hangzhou` |
+| `DATA_AGENT_DMS_UNIT` | DMSUnit override (alias `DATA_AGENT_DMSUNIT`) | auto-resolved |
+| `DATA_AGENT_WORKSPACE_ID` | Default workspace ID | auto personal workspace |
+| `DATA_AGENT_CUSTOM_AGENT_ID` | Default custom agent ID | — |
+| `DATA_AGENT_ENDPOINT` | Custom endpoint | auto-generated |
+| `DATA_AGENT_TIMEOUT` | Request timeout (seconds) | `300` |
+| `DATA_AGENT_MAX_RETRY` | Max retry attempts | `3` |
+| `DATA_AGENT_POLL_INTERVAL` | Poll interval (seconds) | `2` |
+| `DATA_AGENT_MAX_POLL_COUNT` | Max poll attempts | `60` |
+| `DATA_AGENT_DEBUG_API` | Print API request details | `false` |
+
+All variables can be set in a `.env` file or exported as environment variables. CLI flags (`--dms-unit`, `--workspace-id`, `--custom-agent-id`) override the corresponding environment variable.
 
 ### Option 1: Default Credential Chain (Recommended)
 
@@ -225,6 +243,7 @@ After you call `db` / `file` to start a session, **all subsequent interactions o
 | **Progress monitoring** | `attach --session-id <ID>` (no `-q`) | Tail live SSE progress of a long-running session |
 | **Resume after network drop** | `attach --session-id <ID> --checkpoint <N>` | Precise recovery from the Nth event after interruption |
 | **Replay full history** | `attach --session-id <ID> --from-start` | Re-stream the entire session from event 0 |
+| **Cross-region attach** | `attach --session-id <ID> --dms-unit cn-hangzhou --workspace-id <WS>` | Override DMSUnit and workspace for the session |
 
 ### Golden Workflow (Async + attach)
 
@@ -309,6 +328,14 @@ python3 scripts/data_agent_cli.py db \
     --dms-db-id <dbId> \
     --db-name <schemaName> \
     --tables <table1,table2> -q "Which department has the highest average salary"
+
+# 5b. Query with explicit DMSUnit (e.g. cn-shenzhen region, cn-hangzhou DMSUnit)
+DATA_AGENT_REGION=cn-shenzhen python3 scripts/data_agent_cli.py db \
+    --workspace-id <WORKSPACE_ID> \
+    --dms-unit cn-hangzhou \
+    --dms-db-id <dbId> \
+    --db-name <schemaName> \
+    --tables <table1,table2> -q "your question"
 
 # 6. List available custom agents
 python3 scripts/data_agent_cli.py agent

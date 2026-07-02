@@ -259,6 +259,10 @@ def cmd_db(args: argparse.Namespace) -> None:
 
     # Initialize components
     config = DataAgentConfig.from_env()
+    if getattr(args, 'dms_unit', None):
+        config.dms_unit = args.dms_unit
+    if getattr(args, 'custom_agent_id', None):
+        config.custom_agent_id = args.custom_agent_id
     client = DataAgentClient(config)
     session_manager = SessionManager(client)
     message_handler = MessageHandler(client)
@@ -273,7 +277,7 @@ def cmd_db(args: argparse.Namespace) -> None:
         enable_search = getattr(args, 'enable_search', False)
         print(f"Creating session for async execution...")
         workspace_id = getattr(args, 'workspace_id', None)
-        custom_agent_id = getattr(args, 'custom_agent_id', None)
+        custom_agent_id = config.custom_agent_id
         session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id), enable_search=enable_search, workspace_id=workspace_id, custom_agent_id=custom_agent_id)
 
         # Use common async worker setup

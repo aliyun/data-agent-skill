@@ -160,6 +160,11 @@ Mode Description:
         default=None,
         help="Custom Agent ID to use for the analysis session",
     )
+    db_parser.add_argument(
+        "--dms-unit",
+        metavar="DMS_UNIT",
+        help="DMSUnit override for Data Agent APIs",
+    )
 
     db_parser.set_defaults(func=cmd_db)
 
@@ -235,6 +240,11 @@ Mode Description:
         default=None,
         help="Custom Agent ID to use for the analysis session",
     )
+    file_parser.add_argument(
+        "--dms-unit",
+        metavar="DMS_UNIT",
+        help="DMSUnit override for Data Agent APIs",
+    )
 
     file_parser.set_defaults(func=cmd_file)
 
@@ -287,6 +297,16 @@ Mode Description:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Run asynchronously in background (default: True). Use --no-async-run for synchronous mode.",
+    )
+    attach_parser.add_argument(
+        "--dms-unit",
+        metavar="DMS_UNIT",
+        help="DMSUnit override for Data Agent APIs",
+    )
+    attach_parser.add_argument(
+        "--workspace-id",
+        metavar="WORKSPACE_ID",
+        help="Workspace ID override",
     )
     attach_parser.set_defaults(func=cmd_attach)
 

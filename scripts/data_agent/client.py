@@ -884,6 +884,9 @@ class DataAgentClient:
         }
         if checkpoint:
             params["Checkpoint"] = checkpoint
+        dms_unit = self._resolve_dms_unit()
+        if dms_unit:
+            params["DMSUnit"] = dms_unit
 
         return self._call_api(
             action="GetChatContent",
@@ -1202,6 +1205,12 @@ class DataAgentClient:
         end_time: Optional[str] = None,
         page_number: int = 1,
         page_size: int = 10,
+        custom_agent_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        mode: Optional[str] = None,
+        title: Optional[str] = None,
+        is_saved: Optional[bool] = None,
+        query_type: Optional[str] = None,
     ) -> dict:
         """List Data Agent sessions.
 
@@ -1213,6 +1222,12 @@ class DataAgentClient:
             end_time: End time for filtering sessions (ISO format).
             page_number: Page number (1-based).
             page_size: Number of results per page.
+            custom_agent_id: Filter by custom agent ID.
+            workspace_id: Filter by workspace ID.
+            mode: Filter by session mode (ASK_DATA/ANALYSIS/INSIGHT/CLAW).
+            title: Filter by session title.
+            is_saved: Filter by saved status.
+            query_type: Filter by query type.
 
         Returns:
             Response containing list of sessions.
@@ -1221,6 +1236,25 @@ class DataAgentClient:
             "PageNumber": page_number,
             "PageSize": page_size,
         }
+
+        dms_unit = self._resolve_dms_unit()
+        if dms_unit:
+            params["DMSUnit"] = dms_unit
+
+        workspace_id = workspace_id or self._resolve_workspace_id()
+        if workspace_id:
+            params["WorkspaceId"] = workspace_id
+
+        if custom_agent_id:
+            params["CustomAgentId"] = custom_agent_id
+        if mode:
+            params["Mode"] = mode
+        if title:
+            params["Title"] = title
+        if is_saved is not None:
+            params["IsSaved"] = is_saved
+        if query_type:
+            params["QueryType"] = query_type
 
         # Add time parameters based on authentication type
         if self._auth_type == "api_key":

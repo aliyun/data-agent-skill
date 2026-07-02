@@ -42,6 +42,10 @@ def cmd_file(args: argparse.Namespace) -> None:
 
     # Initialize components
     config = DataAgentConfig.from_env()
+    if getattr(args, 'dms_unit', None):
+        config.dms_unit = args.dms_unit
+    if getattr(args, 'custom_agent_id', None):
+        config.custom_agent_id = args.custom_agent_id
     client = DataAgentClient(config)
     session_manager = SessionManager(client)
     message_handler = MessageHandler(client)
@@ -68,7 +72,7 @@ def cmd_file(args: argparse.Namespace) -> None:
 
             # Create regular session without binding to specific data source initially
             workspace_id = getattr(args, 'workspace_id', None)
-            custom_agent_id = getattr(args, 'custom_agent_id', None)
+            custom_agent_id = config.custom_agent_id
             session = session_manager.create_or_reuse(mode=session_mode, enable_search=enable_search, file_id=file_id, workspace_id=workspace_id, custom_agent_id=custom_agent_id)
         else:
             # Local file workflow: upload first
@@ -102,7 +106,7 @@ def cmd_file(args: argparse.Namespace) -> None:
 
             # Create session
             workspace_id = getattr(args, 'workspace_id', None)
-            custom_agent_id = getattr(args, 'custom_agent_id', None)
+            custom_agent_id = config.custom_agent_id
             session = session_manager.create_or_reuse(mode=session_mode, enable_search=enable_search, file_id=file_info.file_id, workspace_id=workspace_id, custom_agent_id=custom_agent_id)
 
         # Store file_data_source as a dict for async worker to use (avoid serialization issues)

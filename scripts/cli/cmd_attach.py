@@ -36,6 +36,10 @@ def cmd_attach(args: argparse.Namespace) -> None:
 
     # Initialize components
     config = DataAgentConfig.from_env()
+    if getattr(args, 'dms_unit', None):
+        config.dms_unit = args.dms_unit
+    if getattr(args, 'workspace_id', None):
+        config.workspace_id = args.workspace_id
     client = DataAgentClient(config)
     session_manager = SessionManager(client)
     message_handler = MessageHandler(client)
