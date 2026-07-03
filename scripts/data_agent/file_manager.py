@@ -186,18 +186,17 @@ class FileManager:
             List of FileInfo objects.
         """
         response = self._client.list_files(session_id, file_category=file_category)
-        files = response.get("Data", response.get("Files", []))
+        files = response.get("data", response.get("Data", response.get("Files", [])))
         if not isinstance(files, list):
             files = []
 
         return [
             FileInfo(
-                file_id=f.get("FileId", ""),
-                filename=f.get("FileName", ""),
-                file_type=f.get("FileType", ""),
-                size=f.get("FileSize", 0),
-                # API returns DownloadLink; fall back to DownloadUrl for compatibility
-                download_url=f.get("DownloadLink") or f.get("DownloadUrl"),
+                file_id=f.get("fileId") or f.get("FileId", ""),
+                filename=f.get("fileName") or f.get("FileName", ""),
+                file_type=f.get("fileType") or f.get("FileType", ""),
+                size=f.get("fileSize") or f.get("FileSize", 0),
+                download_url=f.get("downloadLink") or f.get("DownloadLink") or f.get("downloadUrl") or f.get("DownloadUrl"),
             )
             for f in files
         ]
