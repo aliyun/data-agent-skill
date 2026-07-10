@@ -229,7 +229,7 @@ class DmsMcpTools:
         # This method serves as a wrapper for MCP tool compatibility
         raise NotImplementedError(
             "askDatabase is implemented via DataAgentClient. "
-            "Use DataAgentClient with ASK_DATA mode for NL2SQL queries."
+            "Use DataAgentClient with lite mode for NL2SQL queries."
         )
 
     def search_database(

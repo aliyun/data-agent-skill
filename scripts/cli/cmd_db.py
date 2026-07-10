@@ -268,7 +268,7 @@ def cmd_db(args: argparse.Namespace) -> None:
     message_handler = MessageHandler(client)
 
     # Create new session
-    session_mode = args.session_mode.upper()
+    session_mode = args.session_mode
     data_source = _build_data_source(args)
     is_worker = is_worker_process()
 
@@ -292,7 +292,7 @@ def cmd_db(args: argparse.Namespace) -> None:
             if args.query:
                 _, need_confirm, _ = _db_single(message_handler, session, data_source, args.query, output_mode=output_mode, output_dir=Path(f"sessions/{session.session_id}"))
             else:
-                if session_mode == "ANALYSIS":
+                if session_mode in ("pro", "ultra"):
                     default_queries = [
                         f"Analyze the overall data structure and table relationships of {data_source.db_name} database",
                         "Identify key metrics and distribution characteristics in the data",
@@ -309,10 +309,10 @@ def cmd_db(args: argparse.Namespace) -> None:
 
     # NORMAL SYNCHRONOUS LOGIC
     mode_desc = {
-        "ASK_DATA": "ASK_DATA mode (SQL query + natural language response)",
-        "ANALYSIS": "ANALYSIS mode (deep analysis + report generation)",
-        "INSIGHT": "INSIGHT mode",
-        "CLAW": "CLAW mode (agentic)",
+        "auto": "auto mode (backend intelligent decision)",
+        "lite": "lite mode (quick SQL query + natural language response)",
+        "pro": "pro mode (deep analysis + report generation)",
+        "ultra": "ultra mode (most thorough analysis)",
     }.get(session_mode, session_mode)
 
     print(f"Creating session: {mode_desc}...")
@@ -338,7 +338,7 @@ def cmd_db(args: argparse.Namespace) -> None:
             _, _, output_text = _db_single(message_handler, session, data_source, args.query, output_mode=output_mode, output_dir=session_dir)
         else:
             # Default batch preset queries
-            if session_mode == "ANALYSIS":
+            if session_mode in ("pro", "ultra"):
                 default_queries = [
                     f"Analyze the overall data structure and table relationships of {data_source.db_name} database",
                     "Identify key metrics and distribution characteristics in the data",

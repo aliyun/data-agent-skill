@@ -1,6 +1,6 @@
-# ANALYSIS Mode Sub-Agent Specification
+# Pro/Ultra Mode Sub-Agent Specification
 
-ANALYSIS mode tasks are long-running (5-40 minutes), **you must spawn a sub-agent to execute in background** to avoid blocking the main conversation flow.
+Pro and ultra mode tasks are long-running (5-40 minutes), **you must spawn a sub-agent to execute in background** to avoid blocking the main conversation flow.
 
 ---
 

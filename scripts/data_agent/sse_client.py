@@ -401,7 +401,7 @@ class SSEClient:
         """Stream chat content from Data Agent using SSE.
 
         Automatically reconnects from the last checkpoint on SSL/connection
-        errors, enabling resilience during long-running ANALYSIS sessions.
+        errors, enabling resilience during long-running analysis sessions.
 
         Args:
             agent_id: The agent ID.
@@ -721,7 +721,7 @@ class AsyncSSEClient:
         """Stream chat content asynchronously.
 
         Automatically reconnects from the last checkpoint on SSL/connection
-        errors, enabling resilience during long-running ANALYSIS sessions.
+        errors, enabling resilience during long-running analysis sessions.
 
         Args:
             agent_id: The agent ID.

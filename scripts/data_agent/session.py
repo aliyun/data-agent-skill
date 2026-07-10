@@ -38,7 +38,7 @@ class SessionManager:
         agent_id: Optional[str] = None,
         database_id: Optional[str] = None,
         wait_for_running: bool = True,
-        mode: Optional[str] = "ASK_DATA",
+        mode: Optional[str] = "auto",
         enable_search: bool = False,
         file_id: Optional[str] = None,
         workspace_id: Optional[str] = None,
@@ -53,7 +53,7 @@ class SessionManager:
             database_id: Optional database ID to bind to new session.
             wait_for_running: Whether to wait for session to be RUNNING.
             mode: Session mode to use when creating a new session.
-                  One of "ASK_DATA" (default), "ANALYSIS", "INSIGHT", "CLAW".
+                  One of "auto" (default), "lite", "pro", "ultra".
             enable_search: Whether to enable search capability in the session.
             file_id: Optional file ID for file-based analysis session.
             workspace_id: Optional workspace ID to bind the session to a workspace.

@@ -21,12 +21,12 @@ metadata:
 - **v1.8.6**: Fix SSE parsing when server omits `event:` prefix line (extract event_type from JSON payload as fallback); add DMSUnit to all SSE streaming methods (GetChatContent); add `--dms-unit` CLI flag to `db`, `file`, `attach` subcommands; add `--workspace-id` CLI flag to `attach` subcommand; DMSUnit resolution uses env/config/CLI override before `GetActiveRouteUnit` and region fallback.
 - **v1.8.5** — Database listing migrated to `ListTagMetaAsset` (dms-enterprise 2018-11-01); workspace auto-resolution (CLI `--workspace-id` > env `DATA_AGENT_WORKSPACE_ID` > `InitDataAgentPersonalWorkspace`); `db` subcommand relaxed `--dms-instance-id` / `--instance-name` to optional.
 - **v1.8.4**: Document project Python virtualenv (`venv/`) setup and activation; add end-to-end regression notes for ASK_DATA / ANALYSIS (async + attach)
-- **v1.8.3**: `db` and `file` subcommands now accept `--session-mode CLAW`
-- **v1.8.2**: `SendChatMessage` now supports per-message `Mode=CLAW` (injected via `SessionConfig.Mode`); dynamic DMSUnit resolution via `GetActiveRouteUnit`
+- **v1.8.3**: `db` and `file` subcommands now accept `--session-mode` with simplified mode tiers
+- **v1.8.2**: `SendChatMessage` now supports per-message mode override (injected via `SessionConfig.Mode`); dynamic DMSUnit resolution via `GetActiveRouteUnit`
 - **v1.8.1**: Emphasize `attach`-based session reuse as the core interaction mechanism; add golden workflow, capability matrix, and usage rules
 - **v1.8.0**: Add workspace (collaborative space) support, add custom agent support
 - **v1.7.2**: Use Alibaba Cloud default credential chain instead of explicit AK/SK, add User-Agent header, fix RAM policy wildcard issues
-- **v1.7.1**: Fix CLI `ls` command API response parsing (support case-insensitive field names), optimize SKILL documentation structure, separate ANALYSIS mode specification document
+- **v1.7.1**: Fix CLI `ls` command API response parsing (support case-insensitive field names), optimize SKILL documentation structure, separate pro mode specification document
 - **v1.7.0**: API_KEY authentication support, native async execution mode, session isolation, enhanced attach mode, optimized log output
 
 ---
@@ -153,33 +153,31 @@ DATA_AGENT_DEBUG_API=1 python3 scripts/data_agent_cli.py file example.csv -q "an
 
 ---
 
-## Analysis Modes
+## Session Modes
 
-- **ASK_DATA** (default): Synchronous execution, sub-second response, suitable for quick Q&A
-- **ANALYSIS**: Deep analysis, takes 5-40 minutes, requires spawning a sub-agent for async execution or using --async-run parameter
-- **INSIGHT**: Insight-oriented exploration, follows the same plan-confirmation flow as ANALYSIS
-- **CLAW**: Agentic CLAW mode. Two entry points:
-  - CLI: `db --session-mode CLAW ...` / `file --session-mode CLAW ...` (session-level)
-  - SDK: pass `mode="CLAW"` to `client.send_message(...)` / `AsyncDataAgentClient.send_message(...)` to override mode for a single message via `SessionConfig.Mode`
+- **auto** (default): Backend intelligent decision — automatically selects the best mode based on query complexity
+- **lite**: Quick query mode, sub-second response, suitable for quick Q&A and simple SQL queries
+- **pro**: Deep analysis, takes 5-40 minutes, requires spawning a sub-agent for async execution or using --async-run parameter
+- **ultra**: Most thorough analysis with multi-dimensional insights, follows the same plan-confirmation flow as pro
 
 ### End-to-End Regression Reference (v1.8.4 verified)
 
-Both ASK_DATA and ANALYSIS modes are regression-tested against `chinook` database with the async + attach flow:
+Both lite and pro modes are regression-tested against `chinook` database with the async + attach flow:
 
 | Mode | Kickoff | Observed Chain | Typical Duration |
 |------|---------|----------------|------------------|
-| ASK_DATA | `db --session-mode ASK_DATA -q "..."` | async worker → live SSE → `result.json={"status":"completed"}` | ~15s |
-| ANALYSIS | `db --session-mode ANALYSIS -q "..."` | async worker → **Plan** → `WAIT_INPUT` → `attach -q "confirm"` → step-by-step execution → Excel/Chart artifacts → text report → **2nd WAIT_INPUT** (webpage render) | 2-10 min (text); +10 min if rendering webpage |
+| lite | `db --session-mode lite -q "..."` | async worker → live SSE → `result.json={"status":"completed"}` | ~15s |
+| pro | `db --session-mode pro -q "..."` | async worker → **Plan** → `WAIT_INPUT` → `attach -q "confirm"` → step-by-step execution → Excel/Chart artifacts → text report → **2nd WAIT_INPUT** (webpage render) | 2-10 min (text); +10 min if rendering webpage |
 
 Key checkpoints to look for in `sessions/<SESSION_ID>/progress.log`:
 
 - `> User Query: ...` — request received
-- `### Execution Plan (ID: ...)` — ANALYSIS plan generated, use `attach -q "confirm"` to proceed
+- `### Execution Plan (ID: ...)` — pro/ultra plan generated, use `attach -q "confirm"` to proceed
 - `> ⚠️  Plan confirmed, continuing analysis...` — plan approved, execution starts
 - `## Step N/M: ...` — per-step progress with artifacts links
 - `### Report Render` + `⚠️  Please review the report rendering request.` — optional HTML report render confirmation
 
-> See [ANALYSIS_MODE.md](references/ANALYSIS_MODE.md) for details
+> See [ANALYSIS_MODE.md](references/ANALYSIS_MODE.md) for pro/ultra mode details
 
 ---
 
@@ -238,7 +236,7 @@ After you call `db` / `file` to start a session, **all subsequent interactions o
 | Capability | Command | Scenario |
 |------------|---------|----------|
 | **Follow-up questions** | `attach --session-id <ID> -q "..."` | Continue the conversation with full context, skip data-understanding overhead |
-| **Plan confirmation** | `attach --session-id <ID> -q "confirm"` | Approve the execution plan generated by ANALYSIS/INSIGHT mode |
+| **Plan confirmation** | `attach --session-id <ID> -q "confirm"` | Approve the execution plan generated by pro/ultra mode |
 | **Plan modification** | `attach --session-id <ID> -q "simplify to 3 steps"` | Refine the plan before execution |
 | **Progress monitoring** | `attach --session-id <ID>` (no `-q`) | Tail live SSE progress of a long-running session |
 | **Resume after network drop** | `attach --session-id <ID> --checkpoint <N>` | Precise recovery from the Nth event after interruption |
@@ -256,7 +254,7 @@ python3 scripts/data_agent_cli.py db \
     --db-name <schemaName> \
     --tables "employees,departments" \
     --workspace-id <workspace_id> \
-    --session-mode ANALYSIS \
+    --session-mode pro \
     -q "Analyze salary distribution"
 # -> ✅ Async task started. Session ID: abc123xyz
 
@@ -280,7 +278,7 @@ python3 scripts/data_agent_cli.py reports --session-id abc123xyz
 
 - **Context preservation** — previous SQL, table profiling, and user intent are kept, answers stay consistent.
 - **Cost reduction** — skip re-discovering schema / re-profiling tables on every question.
-- **Plan governance** — ANALYSIS / INSIGHT plans require explicit confirmation; only `attach -q "confirm"` can unblock them.
+- **Plan governance** — pro / ultra plans require explicit confirmation; only `attach -q "confirm"` can unblock them.
 - **Resilience** — `--checkpoint` / `--from-start` make long-running tasks robust against network drops and client restarts.
 - **Team collaboration** — share the Session ID, teammates can `attach` to the same session to review progress and results.
 
@@ -288,7 +286,7 @@ python3 scripts/data_agent_cli.py reports --session-id abc123xyz
 
 1. Create session **once** with `db` / `file`; drive everything else with `attach`.
 2. Record the `Session ID` printed after kickoff — it is the only handle to the session.
-3. For ANALYSIS / INSIGHT mode, always use `attach` (not a new `db`) to confirm plans; creating a new session loses the plan.
+3. For pro / ultra mode, always use `attach` (not a new `db`) to confirm plans; creating a new session loses the plan.
 4. Session artifacts (progress log, checkpoint, result, images) are persisted under `sessions/<SESSION_ID>/`.
 
 > See [COMMANDS.md](references/COMMANDS.md) for the full `attach` parameter list and [WORKFLOWS.md](references/WORKFLOWS.md) for end-to-end scenarios.
@@ -315,7 +313,7 @@ python3 scripts/data_agent_cli.py db \
 
 # 3. ⭐ Reuse the session — follow-up questions, confirm plans, monitor progress
 python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "Break down by month"
-python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "confirm"     # approve ANALYSIS plan
+python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "confirm"     # approve pro/ultra plan
 python3 scripts/data_agent_cli.py attach --session-id abc123xyz                  # tail live progress
 python3 scripts/data_agent_cli.py attach --session-id abc123xyz --checkpoint 219 # resume after drop
 

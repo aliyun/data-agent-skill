@@ -45,7 +45,7 @@ def cmd_reports(args: argparse.Namespace) -> None:
 
     if not found_files:
         print("No report files found for this session.")
-        print("Note: Reports are usually generated in ANALYSIS or INSIGHT modes.")
+        print("Note: Reports are usually generated in pro or ultra modes.")
         return
 
     report_dir.mkdir(parents=True, exist_ok=True)

@@ -31,7 +31,7 @@ python3 scripts/data_agent_cli.py db \
     --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> \
     --instance-name <INSTANCE_NAME> --db-name internal_data_employees \
     --tables "employees,departments,salaries" \
-    --session-mode ASK_DATA \
+    --session-mode auto \
     -q "Which position has the highest salary"
 
 # Step 4: Connect to existing session for follow-up questions
@@ -93,12 +93,12 @@ python3 scripts/data_agent_cli.py db \
 For long-running `ls` and `db` commands, running in background is recommended:
 
 ```bash
-# Start ANALYSIS task in background
+# Start pro mode task in background
 nohup python3 scripts/data_agent_cli.py db \
     --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> \
     --instance-name <INSTANCE_NAME> --db-name internal_data_employees \
     --tables "employees,departments,salaries" \
-    --session-mode ANALYSIS \
+    --session-mode pro \
     -q "Analyze salary distribution and generate report" > analysis.log 2>&1 &
 
 # Get session ID from log
@@ -127,7 +127,7 @@ python3 scripts/data_agent_cli.py attach --session-id <SESSION_ID> --checkpoint 
 | Scenario | Command |
 |----------|---------|
 | Follow-up question with full context | `attach --session-id <ID> -q "..."` |
-| Confirm ANALYSIS / INSIGHT plan | `attach --session-id <ID> -q "confirm"` |
+| Confirm pro / ultra plan | `attach --session-id <ID> -q "confirm"` |
 | Modify / refine the plan | `attach --session-id <ID> -q "simplify to 3 steps"` |
 | Tail live progress (no query) | `attach --session-id <ID>` |
 | Replay from beginning | `attach --session-id <ID> --from-start` |
@@ -141,7 +141,7 @@ python3 scripts/data_agent_cli.py db \
     --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> \
     --instance-name <INSTANCE_NAME> --db-name internal_data_employees \
     --tables "employees,departments" \
-    --session-mode ANALYSIS \
+    --session-mode pro \
     -q "Analyze 2024 salary growth trends"
 # Output: ✅ Async task started. Session ID: abc123xyz
 
@@ -151,7 +151,7 @@ python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "Break down s
 # Analysis 3: Modify plan
 python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "Simplify to 3 steps"
 
-# Analysis 4: Confirm execution (ANALYSIS/INSIGHT plans are blocked until confirmed)
+# Analysis 4: Confirm execution (pro/ultra plans are blocked until confirmed)
 python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "confirm"
 
 # Analysis 5: Recover precisely if the stream was cut (e.g., at event #219)
@@ -167,7 +167,7 @@ python3 scripts/data_agent_cli.py reports --session-id abc123xyz
 **Benefits of Reuse via `attach`**:
 - Preserve conversation context, SQL history, and data profiling — consistent follow-up answers
 - Skip repeated data-understanding phase, reducing latency and API cost
-- Plan governance: ANALYSIS / INSIGHT plans **must** be confirmed through `attach -q "confirm"`
+- Plan governance: pro / ultra plans **must** be confirmed through `attach -q "confirm"`
 - Resilience: `--checkpoint` / `--from-start` guarantee safe recovery after network drops or client restarts
 - Collaboration: share the Session ID so teammates can `attach` and watch progress live
 

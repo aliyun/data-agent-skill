@@ -26,20 +26,22 @@ def build_parser() -> argparse.ArgumentParser:
         description="Data Agent Unified CLI - Database Query/Analysis & File Analysis",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Database Mode Description
-  ASK_DATA: Quick query mode with SQL execution + natural language response
-  ANALYSIS: Deep analysis mode with planning, multi-step reasoning, and report generation
+Session Mode Description
+  auto  : Backend intelligent decision (default)
+  lite  : Quick query mode with SQL execution + natural language response
+  pro   : Deep analysis mode with planning, multi-step reasoning, and report generation
+  ultra : Most thorough analysis with multi-dimensional insights
 
 Examples:
-  # -- Database ASK_DATA (default) --
+  # -- Database query (auto mode, default) --
   python data_agent_cli.py db \\
       --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> \\
       --instance-name <INSTANCE_NAME> --db-name chinook \\
       --tables "album,artist,customer" \\
       -q "Who has the highest sales?"
 
-  # -- Database ANALYSIS mode --
-  python data_agent_cli.py db --session-mode ANALYSIS \\
+  # -- Database deep analysis (pro mode) --
+  python data_agent_cli.py db --session-mode pro \\
       --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> \\
       --instance-name <INSTANCE_NAME> --db-name chinook \\
       --tables "album,artist,customer" \\
@@ -57,12 +59,14 @@ Examples:
     # -- db subcommand --
     db_parser = subparsers.add_parser(
         "db",
-        help="Database query/analysis (supports ASK_DATA and ANALYSIS modes)",
+        help="Database query/analysis (supports auto/lite/pro/ultra modes)",
         description="""Connect to DMS database for natural language queries or data analysis.
 
 Mode Description:
-  ASK_DATA (default): Quick SQL query + natural language response
-  ANALYSIS          : Deep analysis, multi-step reasoning, report generation""",
+  auto (default): Backend intelligent decision
+  lite          : Quick SQL query + natural language response
+  pro           : Deep analysis, multi-step reasoning, report generation
+  ultra         : Most thorough analysis with multi-dimensional insights""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -132,10 +136,10 @@ Mode Description:
     # Session options
     db_parser.add_argument(
         "--session-mode",
-        default="ASK_DATA",
-        choices=["ASK_DATA", "ANALYSIS", "INSIGHT", "CLAW"],
+        default="auto",
+        choices=["auto", "lite", "pro", "ultra"],
         metavar="MODE",
-        help="Session mode: ASK_DATA (default) | ANALYSIS | INSIGHT | CLAW",
+        help="Session mode: auto (default) | lite | pro | ultra",
     )
     db_parser.add_argument(
         "--output",
@@ -212,10 +216,10 @@ Mode Description:
     )
     file_parser.add_argument(
         "--session-mode",
-        default="ANALYSIS",
-        choices=["ASK_DATA", "ANALYSIS", "INSIGHT", "CLAW"],
+        default="auto",
+        choices=["auto", "lite", "pro", "ultra"],
         metavar="MODE",
-        help="Session mode: ASK_DATA | ANALYSIS (default) | INSIGHT | CLAW",
+        help="Session mode: auto (default) | lite | pro | ultra",
     )
     file_parser.add_argument(
         "--output",
@@ -254,7 +258,7 @@ Mode Description:
         help="Connect to an existing session to continue analysis or confirm plan",
         description=(
             "Attach to an existing Data Agent session. Use this to:\n"
-            "  - Continue an interrupted ANALYSIS session\n"
+            "  - Continue an interrupted analysis session\n"
             "  - Confirm an execution plan after WAIT_INPUT\n"
             "  - Ask follow-up questions in an existing session\n\n"
             "Examples:\n"
@@ -490,7 +494,7 @@ Examples:
     reports_parser = subparsers.add_parser(
         "reports",
         help="List and download agent-generated files (reports, charts, data files)",
-        description="""List and download files generated during an ANALYSIS or INSIGHT session.
+        description="""List and download files generated during a pro or ultra session.
 
 Examples:
   python3 scripts/data_agent_cli.py reports --session-id <ID>

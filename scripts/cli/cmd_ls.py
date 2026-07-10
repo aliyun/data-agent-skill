@@ -154,6 +154,6 @@ def cmd_ls(args: argparse.Namespace) -> None:
     print(f"    --db-name {schema_name} \\")
     print(f"    --tables {tables_arg} \\")
     print(f"    --workspace-id {workspace_id} \\")
-    print(f"    --session-mode ASK_DATA \\")
+    print(f"    --session-mode auto \\")
     print(f"    -q \"your question here\"")
     print(sep)

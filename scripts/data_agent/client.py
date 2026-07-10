@@ -656,7 +656,7 @@ class DataAgentClient:
         Args:
             database_id: Optional database ID to bind to the session.
             title: Session title (required by API).
-            mode: Optional session mode, such as "ASK_DATA", "ANALYSIS", "INSIGHT".
+            mode: Optional session mode: "auto", "lite", "pro", "ultra".
             enable_search: Whether to enable search capability in the session.
             file_id: Optional file ID for file-based analysis session.
             workspace_id: Optional workspace ID to bind to the session.
@@ -816,9 +816,9 @@ class DataAgentClient:
             language: Response language (default: "CHINESE").
             workspace_id: The workspace ID (required for workspace-bound sessions).
             mode: Optional per-message analysis mode. Supported values:
-                ``ASK_DATA``, ``ANALYSIS``, ``INSIGHT``, ``CLAW``. When
-                provided it is injected into ``SessionConfig.Mode`` and
-                overrides the session-level mode for this single request.
+                ``auto``, ``lite``, ``pro``, ``ultra``. When provided
+                it is injected into ``SessionConfig.Mode`` and overrides
+                the session-level mode for this single request.
 
         Returns:
             Response from the API.
@@ -839,7 +839,7 @@ class DataAgentClient:
         # For AK/SK auth: JSON string
         session_config: dict = {"Language": language}
         if mode:
-            # Per-message mode override; supports CLAW / ASK_DATA / ANALYSIS / INSIGHT.
+            # Per-message mode override; supports auto / lite / pro / ultra.
             session_config["Mode"] = mode
         if self._auth_type == "api_key":
             params["SessionConfig"] = session_config
@@ -1224,7 +1224,7 @@ class DataAgentClient:
             page_size: Number of results per page.
             custom_agent_id: Filter by custom agent ID.
             workspace_id: Filter by workspace ID.
-            mode: Filter by session mode (ASK_DATA/ANALYSIS/INSIGHT/CLAW).
+            mode: Filter by session mode (auto/lite/pro/ultra).
             title: Filter by session title.
             is_saved: Filter by saved status.
             query_type: Filter by query type.
@@ -1441,7 +1441,7 @@ class AsyncDataAgentClient:
         Args:
             database_id: Optional database ID to bind to the session.
             title: Session title (required by API).
-            mode: Optional session mode, such as "ASK_DATA", "ANALYSIS", "INSIGHT".
+            mode: Optional session mode: "auto", "lite", "pro", "ultra".
             enable_search: Whether to enable search capability in the session.
             file_id: Optional file ID for file-based analysis session.
             workspace_id: Optional workspace ID to bind to the session.
@@ -1502,7 +1502,7 @@ class AsyncDataAgentClient:
             data_source: Optional DataSource with database metadata.
             language: Response language (default: "CHINESE").
             workspace_id: The workspace ID (required for workspace-bound sessions).
-            mode: Optional per-message mode (ASK_DATA / ANALYSIS / INSIGHT / CLAW).
+            mode: Optional per-message mode (auto / lite / pro / ultra).
 
         Returns:
             Response from the API.

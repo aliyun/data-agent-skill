@@ -52,7 +52,7 @@ def cmd_file(args: argparse.Namespace) -> None:
     file_manager = FileManager(client)
 
     is_worker = is_worker_process()
-    session_mode = args.session_mode.upper()
+    session_mode = args.session_mode
 
     if getattr(args, "async_run", False) and not is_worker:
         # PARENT PROCESS LOGIC
@@ -255,12 +255,12 @@ def cmd_file(args: argparse.Namespace) -> None:
         )
 
     # Create session
-    session_mode = args.session_mode.upper()
+    session_mode = args.session_mode
     mode_desc = {
-        "ASK_DATA": "ASK_DATA mode",
-        "ANALYSIS": "ANALYSIS mode (recommended for file analysis)",
-        "INSIGHT": "INSIGHT mode",
-        "CLAW": "CLAW mode (agentic)",
+        "auto": "auto mode (backend intelligent decision)",
+        "lite": "lite mode (quick query)",
+        "pro": "pro mode (deep analysis + report generation)",
+        "ultra": "ultra mode (most thorough analysis)",
     }.get(session_mode, session_mode)
 
     print(f"\nCreating session: {mode_desc}...")
