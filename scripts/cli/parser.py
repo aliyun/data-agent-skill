@@ -75,6 +75,7 @@ Mode Description:
     ds_group.add_argument(
         "--dms-instance-id",
         type=int,
+        required=True,
         metavar="INT",
         help="DMS Instance ID (e.g., 1234567)",
     )

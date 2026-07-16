@@ -34,7 +34,7 @@ def _build_data_source(args: argparse.Namespace) -> DataSource:
     table_ids = [t.strip() for t in args.table_ids.split(",")] if args.table_ids else []
 
     return DataSource(
-        dms_instance_id=getattr(args, 'dms_instance_id', None),
+        dms_instance_id=args.dms_instance_id,
         dms_database_id=args.dms_db_id,
         instance_name=getattr(args, 'instance_name', None) or "",
         db_name=args.db_name,
@@ -247,6 +247,7 @@ def cmd_db(args: argparse.Namespace) -> None:
     # Validate required database parameters
     missing = []
     for attr, name in [
+        ("dms_instance_id", "--dms-instance-id"),
         ("dms_db_id", "--dms-db-id"),
         ("db_name", "--db-name"),
         ("tables", "--tables"),

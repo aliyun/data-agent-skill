@@ -19,7 +19,7 @@ metadata:
 
 # Changelog
 - **v1.8.6**: Fix SSE parsing when server omits `event:` prefix line (extract event_type from JSON payload as fallback); add DMSUnit to all SSE streaming methods (GetChatContent); add `--dms-unit` CLI flag to `db`, `file`, `attach` subcommands; add `--workspace-id` CLI flag to `attach` subcommand; DMSUnit resolution uses env/config/CLI override before `GetActiveRouteUnit` and region fallback.
-- **v1.8.5** — Database listing migrated to `ListTagMetaAsset` (dms-enterprise 2018-11-01); workspace auto-resolution (CLI `--workspace-id` > env `DATA_AGENT_WORKSPACE_ID` > `InitDataAgentPersonalWorkspace`); `db` subcommand relaxed `--dms-instance-id` / `--instance-name` to optional.
+- **v1.8.5** — Database listing migrated to `ListTagMetaAsset` (dms-enterprise 2018-11-01); workspace auto-resolution (CLI `--workspace-id` > env `DATA_AGENT_WORKSPACE_ID` > `InitDataAgentPersonalWorkspace`); `db` subcommand relaxed `--instance-name` to optional.
 - **v1.8.4**: Document project Python virtualenv (`venv/`) setup and activation; add end-to-end regression notes for ASK_DATA / ANALYSIS (async + attach)
 - **v1.8.3**: `db` and `file` subcommands now accept `--session-mode` with simplified mode tiers
 - **v1.8.2**: `SendChatMessage` now supports per-message mode override (injected via `SessionConfig.Mode`); dynamic DMSUnit resolution via `GetActiveRouteUnit`
@@ -250,6 +250,7 @@ The canonical pattern for long-running analyses is **async `db` kickoff → `att
 ```bash
 # 1) Kick off async analysis, returns SESSION_ID immediately
 python3 scripts/data_agent_cli.py db \
+    --dms-instance-id <DMS_INSTANCE_ID> \
     --dms-db-id <dbId> \
     --db-name <schemaName> \
     --tables "employees,departments" \
@@ -304,6 +305,7 @@ python3 scripts/data_agent_cli.py ls
 
 # 2. Create a session for initial analysis (record the returned Session ID!)
 python3 scripts/data_agent_cli.py db \
+    --dms-instance-id <DMS_INSTANCE_ID> \
     --dms-db-id <dbId> \
     --db-name <schemaName> \
     --tables <table1,table2> \
@@ -322,6 +324,7 @@ python3 scripts/data_agent_cli.py workspace
 
 # 5. Query in a specific workspace
 python3 scripts/data_agent_cli.py db \
+    --dms-instance-id <DMS_INSTANCE_ID> \
     --workspace-id <WORKSPACE_ID> \
     --dms-db-id <dbId> \
     --db-name <schemaName> \
@@ -329,6 +332,7 @@ python3 scripts/data_agent_cli.py db \
 
 # 5b. Query with explicit DMSUnit (e.g. cn-shenzhen region, cn-hangzhou DMSUnit)
 DATA_AGENT_REGION=cn-shenzhen python3 scripts/data_agent_cli.py db \
+    --dms-instance-id <DMS_INSTANCE_ID> \
     --workspace-id <WORKSPACE_ID> \
     --dms-unit cn-hangzhou \
     --dms-db-id <dbId> \

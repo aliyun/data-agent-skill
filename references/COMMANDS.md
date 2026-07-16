@@ -62,7 +62,7 @@ Output includes a `db` command template ready to copy and use.
 
 | Parameter | Description |
 |------|------|
-| `--dms-instance-id` | DMS Instance ID (numeric) |
+| `--dms-instance-id` | **Required**, DMS Instance ID (numeric) |
 | `--dms-db-id` | DMS Database ID (numeric) |
 | `--instance-name` | RDS Instance Name |
 | `--db-name` | Database Name |
