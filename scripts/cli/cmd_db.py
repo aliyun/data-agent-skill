@@ -28,20 +28,23 @@ from data_agent import (
 )
 
 
-def _build_data_source(args: argparse.Namespace) -> DataSource:
-    """Build DataSource from command-line arguments."""
-    tables = [t.strip() for t in args.tables.split(",")] if args.tables else []
-    table_ids = [t.strip() for t in args.table_ids.split(",")] if args.table_ids else []
+def _build_data_source(args: argparse.Namespace) -> Optional[DataSource]:
+    """Build DataSource from command-line arguments. Returns None if essential DB params are missing (custom agent mode)."""
+    if not getattr(args, 'dms_instance_id', None):
+        return None
+
+    tables = [t.strip() for t in args.tables.split(",")] if getattr(args, 'tables', None) else []
+    table_ids = [t.strip() for t in args.table_ids.split(",")] if getattr(args, 'table_ids', None) else []
 
     return DataSource(
         dms_instance_id=args.dms_instance_id,
-        dms_database_id=args.dms_db_id,
+        dms_database_id=getattr(args, 'dms_db_id', None),
         instance_name=getattr(args, 'instance_name', None) or "",
-        db_name=args.db_name,
+        db_name=getattr(args, 'db_name', None) or "",
         tables=tables,
         table_ids=table_ids,
-        engine=args.engine,
-        region_id=args.region,
+        engine=getattr(args, 'engine', 'mysql'),
+        region_id=getattr(args, 'region', 'cn-hangzhou'),
     )
 
 
@@ -201,7 +204,7 @@ def _db_attach(
 def _db_batch(
     message_handler: MessageHandler,
     session,
-    data_source: DataSource,
+    data_source: Optional[DataSource],
     queries: list,
     output_mode: str = "summary",
     output_dir: Optional[Path] = None,
@@ -225,7 +228,7 @@ def _db_batch(
 def _db_single(
     message_handler: MessageHandler,
     session,
-    data_source: DataSource,
+    data_source: Optional[DataSource],
     query: str,
     output_mode: str = "summary",
     output_dir: Optional[Path] = None,
@@ -244,19 +247,21 @@ def _db_single(
 
 def cmd_db(args: argparse.Namespace) -> None:
     """Handle db subcommand."""
-    # Validate required database parameters
-    missing = []
-    for attr, name in [
-        ("dms_instance_id", "--dms-instance-id"),
-        ("dms_db_id", "--dms-db-id"),
-        ("db_name", "--db-name"),
-        ("tables", "--tables"),
-    ]:
-        if not getattr(args, attr, None):
-            missing.append(name)
-    if missing:
-        print(f"Error: Missing required parameters: {', '.join(missing)}", file=sys.stderr)
-        sys.exit(1)
+    # Validate required database parameters (skip when using custom agent)
+    custom_agent_id = getattr(args, 'custom_agent_id', None)
+    if not custom_agent_id:
+        missing = []
+        for attr, name in [
+            ("dms_instance_id", "--dms-instance-id"),
+            ("dms_db_id", "--dms-db-id"),
+            ("db_name", "--db-name"),
+            ("tables", "--tables"),
+        ]:
+            if not getattr(args, attr, None):
+                missing.append(name)
+        if missing:
+            print(f"Error: Missing required parameters: {', '.join(missing)}", file=sys.stderr)
+            sys.exit(1)
 
     # Initialize components
     config = DataAgentConfig.from_env()
@@ -279,7 +284,8 @@ def cmd_db(args: argparse.Namespace) -> None:
         print(f"Creating session for async execution...")
         workspace_id = getattr(args, 'workspace_id', None)
         custom_agent_id = config.custom_agent_id
-        session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id), enable_search=enable_search, workspace_id=workspace_id, custom_agent_id=custom_agent_id)
+        plan_mode = getattr(args, 'plan_mode', 'force')
+        session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id) if getattr(args, 'dms_db_id', None) else None, enable_search=enable_search, workspace_id=workspace_id, custom_agent_id=custom_agent_id, plan_mode=plan_mode)
 
         # Use common async worker setup
         setup_async_worker(args, session)
@@ -293,14 +299,15 @@ def cmd_db(args: argparse.Namespace) -> None:
             if args.query:
                 _, need_confirm, _ = _db_single(message_handler, session, data_source, args.query, output_mode=output_mode, output_dir=Path(f"sessions/{session.session_id}"))
             else:
+                db_name = data_source.db_name if data_source else "the"
                 if session_mode in ("pro", "ultra"):
                     default_queries = [
-                        f"Analyze the overall data structure and table relationships of {data_source.db_name} database",
+                        f"Analyze the overall data structure and table relationships of {db_name} database",
                         "Identify key metrics and distribution characteristics in the data",
                     ]
                 else:
                     default_queries = [
-                        f"What tables exist in {data_source.db_name} database?",
+                        f"What tables exist in {db_name} database?",
                         "Who has the highest sales?",
                     ]
                 _, need_confirm, _ = _db_batch(message_handler, session, data_source, default_queries, output_mode=output_mode, output_dir=Path(f"sessions/{session.session_id}"))
@@ -321,7 +328,8 @@ def cmd_db(args: argparse.Namespace) -> None:
     enable_search = getattr(args, 'enable_search', False)
     workspace_id = getattr(args, 'workspace_id', None)
     custom_agent_id = getattr(args, 'custom_agent_id', None)
-    session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id), enable_search=enable_search, workspace_id=workspace_id, custom_agent_id=custom_agent_id)
+    plan_mode = getattr(args, 'plan_mode', 'force')
+    session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id) if getattr(args, 'dms_db_id', None) else None, enable_search=enable_search, workspace_id=workspace_id, custom_agent_id=custom_agent_id, plan_mode=plan_mode)
     print(f"Session ready: {session.session_id}")
     print(f"\n💡 Tip: To continue this session later, use: python3 scripts/data_agent_cli.py attach --session-id {session.session_id}")
 
@@ -339,14 +347,15 @@ def cmd_db(args: argparse.Namespace) -> None:
             _, _, output_text = _db_single(message_handler, session, data_source, args.query, output_mode=output_mode, output_dir=session_dir)
         else:
             # Default batch preset queries
+            db_name = data_source.db_name if data_source else "the"
             if session_mode in ("pro", "ultra"):
                 default_queries = [
-                    f"Analyze the overall data structure and table relationships of {data_source.db_name} database",
+                    f"Analyze the overall data structure and table relationships of {db_name} database",
                     "Identify key metrics and distribution characteristics in the data",
                 ]
             else:
                 default_queries = [
-                    f"What tables exist in {data_source.db_name} database?",
+                    f"What tables exist in {db_name} database?",
                     "Who has the highest sales?",
                 ]
             print(f"\nNo query specified, running preset queries ({len(default_queries)} total)...")

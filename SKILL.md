@@ -221,6 +221,8 @@ Custom Agents are user-defined AI agents with specialized instructions, knowledg
 - **View agent details**: Use `agent describe --custom-agent-id <ID>` to see full agent configuration
 - **Bind session to custom agent**: Pass `--custom-agent-id <ID>` when using `db` or `file` to create a session powered by a specific custom agent
 
+> **Note**: When `--custom-agent-id` is specified, data source parameters (`--dms-instance-id`, `--dms-db-id`, `--db-name`, `--tables`) are **not required** and should **not** be passed. The custom agent already has its own data scope configuration. Only `--workspace-id` and session options (e.g. `--session-mode`, `--plan-mode`) are needed.
+
 > **Note**: Custom Agent sessions automatically use the `prod` stage. The custom agent's instructions, knowledge, and data scope will be applied to the analysis session.
 
 ---
@@ -342,8 +344,8 @@ DATA_AGENT_REGION=cn-shenzhen python3 scripts/data_agent_cli.py db \
 # 6. List available custom agents
 python3 scripts/data_agent_cli.py agent
 
-# 7. Use a custom agent for analysis
-python3 scripts/data_agent_cli.py db --custom-agent-id <AGENT_ID> --dms-instance-id ... -q "your question"
+# 7. Use a custom agent for analysis (no DB params needed)
+python3 scripts/data_agent_cli.py db --custom-agent-id <AGENT_ID> --workspace-id <WS_ID> -q "your question"
 ```
 
 > **Remember**: `db` / `file` create the session **once**; all follow-ups go through `attach --session-id <ID>`.

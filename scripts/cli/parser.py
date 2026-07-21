@@ -71,13 +71,12 @@ Mode Description:
     )
 
     # Data source parameters
-    ds_group = db_parser.add_argument_group("Data Source Parameters (required)")
+    ds_group = db_parser.add_argument_group("Data Source Parameters (required unless --custom-agent-id is set)")
     ds_group.add_argument(
         "--dms-instance-id",
         type=int,
-        required=True,
         metavar="INT",
-        help="DMS Instance ID (e.g., 1234567)",
+        help="DMS Instance ID (e.g., 1234567). Not required when --custom-agent-id is specified.",
     )
     ds_group.add_argument(
         "--dms-db-id",
@@ -155,6 +154,13 @@ Mode Description:
         help="Enable search capability in the session (default: False)",
     )
     db_parser.add_argument(
+        "--plan-mode",
+        default="force",
+        choices=["force", "disable"],
+        metavar="PLAN",
+        help="Plan mode: force (default, always generate execution plan) | disable (skip planning)",
+    )
+    db_parser.add_argument(
         "--workspace-id",
         metavar="WORKSPACE_ID",
         help="Workspace ID to bind the session to a specific workspace",
@@ -163,7 +169,7 @@ Mode Description:
         "--custom-agent-id",
         type=str,
         default=None,
-        help="Custom Agent ID to use for the analysis session",
+        help="Custom Agent ID to use for the analysis session. When specified, data source parameters (--dms-instance-id, --dms-db-id, --db-name, --tables) are not required.",
     )
     db_parser.add_argument(
         "--dms-unit",
@@ -233,6 +239,13 @@ Mode Description:
         "--enable-search",
         action="store_true",
         help="Enable search capability in the session (default: False)",
+    )
+    file_parser.add_argument(
+        "--plan-mode",
+        default="force",
+        choices=["force", "disable"],
+        metavar="PLAN",
+        help="Plan mode: force (default, always generate execution plan) | disable (skip planning)",
     )
     file_parser.add_argument(
         "--workspace-id",

@@ -43,6 +43,7 @@ class SessionManager:
         file_id: Optional[str] = None,
         workspace_id: Optional[str] = None,
         custom_agent_id: Optional[str] = None,
+        plan_mode: Optional[str] = "force",
     ) -> SessionInfo:
         """Create a new session or reuse an existing one.
 
@@ -106,7 +107,7 @@ class SessionManager:
                 ) from e
 
         # Create new session
-        session = self._client.create_session(database_id=database_id, mode=mode, enable_search=enable_search, file_id=file_id, workspace_id=workspace_id, custom_agent_id=custom_agent_id)
+        session = self._client.create_session(database_id=database_id, mode=mode, enable_search=enable_search, file_id=file_id, workspace_id=workspace_id, custom_agent_id=custom_agent_id, plan_mode=plan_mode)
 
         # Only wait if session is not already running
         if wait_for_running and not session.is_running():

@@ -646,10 +646,11 @@ class DataAgentClient:
         title: str = "data-agent-session",
         mode: Optional[str] = None,
         enable_search: bool = False,
-        file_id: Optional[str] = None,  # 添加文件ID参数
+        file_id: Optional[str] = None,
         workspace_id: Optional[str] = None,
         custom_agent_id: Optional[str] = None,
         client_token: Optional[str] = None,
+        plan_mode: Optional[str] = "force",
     ) -> SessionInfo:
         """Create a new Data Agent session.
 
@@ -662,6 +663,7 @@ class DataAgentClient:
             workspace_id: Optional workspace ID to bind to the session.
             custom_agent_id: Optional custom agent ID to use for the session.
             client_token: Optional idempotency token, auto-generated for retries.
+            plan_mode: Plan mode: "force" (default, always plan) or "disable" (skip planning).
 
         Returns:
             SessionInfo with agent_id and session_id.
@@ -689,6 +691,8 @@ class DataAgentClient:
         session_config = {"Language": "CHINESE", "EnableSearch": enable_search}
         if mode:
             session_config["Mode"] = mode
+        if plan_mode:
+            session_config["PlanMode"] = plan_mode
         if custom_agent_id:
             session_config["CustomAgentId"] = custom_agent_id
             session_config["CustomAgentStage"] = "prod"
@@ -804,6 +808,7 @@ class DataAgentClient:
         language: str = "CHINESE",
         workspace_id: str = "",
         mode: Optional[str] = None,
+        plan_mode: Optional[str] = None,
     ) -> dict:
         """Send a message to the Data Agent.
 
@@ -819,6 +824,7 @@ class DataAgentClient:
                 ``auto``, ``lite``, ``pro``, ``ultra``. When provided
                 it is injected into ``SessionConfig.Mode`` and overrides
                 the session-level mode for this single request.
+            plan_mode: Optional per-message plan mode: "force" or "disable".
 
         Returns:
             Response from the API.
@@ -839,8 +845,9 @@ class DataAgentClient:
         # For AK/SK auth: JSON string
         session_config: dict = {"Language": language}
         if mode:
-            # Per-message mode override; supports auto / lite / pro / ultra.
             session_config["Mode"] = mode
+        if plan_mode:
+            session_config["PlanMode"] = plan_mode
         if self._auth_type == "api_key":
             params["SessionConfig"] = session_config
         else:
