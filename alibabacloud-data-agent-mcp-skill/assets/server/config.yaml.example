@@ -1,0 +1,61 @@
+# Data Agent MCP Server configuration (YAML).
+# Location: $DATA_AGENT_CONFIG > ./config.yaml > ~/.data-agent/config.yaml
+#           > ~/.data-agent/config.json (legacy)
+# Priority: env vars > .env file > this file > defaults.
+# Credentials (AK/SK) belong in .env or the credential chain — never here.
+
+region: cn-hangzhou
+dms_unit: ""              # empty = auto-resolved via GetActiveRouteUnit
+workspace_id: ""          # empty = auto personal workspace
+sessions_dir: ~/.data-agent/sessions
+api_key: ""               # API Key auth; leave empty for AK/SK (required for identity mode)
+
+# STS AssumeRole settings used by identity multi-tenant mode.
+sts:
+  endpoint: ""            # default: sts.{region}.aliyuncs.com
+  session_expiration: 3600
+
+# Multi-tenant identity mode (generic; legacy section name "aily" still works).
+# The upstream caller (Feishu Aily, a gateway, a portal, ...) forwards the
+# end-user identity as HTTP headers on every MCP request. The server maps the
+# identity to a RAM role, assumes it via STS, and runs all Data Agent calls
+# with the per-user temporary credential — RAM access policies and DMS data
+# permissions apply per end user.
+#
+# Two mapping styles (combinable; named groups win over default):
+#   1. Global sharing: identity.default — one role (+ workspace/agent/mode
+#      defaults) for every identified user.
+#   2. Groups: identity.groups.<name> — each group has its own role and
+#      defaults, and lists its member users.
+identity:
+  enabled: false
+  # Reject requests without identity headers instead of using the server identity.
+  require_identity: true
+  # Caller authentication: must equal the token header on every request, so
+  # only the trusted upstream platform can act on behalf of users. Configure
+  # the same value as a custom header in the upstream MCP registration.
+  # Env override: IDENTITY_AUTH_TOKEN (legacy: shared_secret / AILY_SHARED_SECRET).
+  auth_token: ""
+  # STS RoleSessionName: "<prefix>-<user_id>". Default "aily" keeps the
+  # historical "aily-<user_id>" form in ActionTrail audit logs.
+  session_name_prefix: ""
+  # Identity header names; defaults are Feishu Aily compatible.
+  headers:
+    user: ""              # default: x-aily-user
+    email: ""             # default: x-aily-email
+    token: ""             # default: x-aily-token
+  # Style 1 — global sharing: catch-all for every identified user.
+  # Remove/empty it to reject users that belong to no group (fail-closed).
+  default:
+    role_arn: ""          # e.g. acs:ram::<account-id>:role/da-default
+    workspace_id: ""      # optional session defaults for this group
+    custom_agent_id: ""
+    mode: ""              # auto | lite | pro | ultra
+  # Style 2 — groups: per-group role + defaults + member list.
+  groups: {}
+  #  analysts:
+  #    role_arn: acs:ram::<account-id>:role/da-analysts
+  #    workspace_id: ws-analysts
+  #    custom_agent_id: ca-xxxx
+  #    mode: pro
+  #    users: [ou_alice, bob@example.com]   # user id or email; one group per user

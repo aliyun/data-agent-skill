@@ -1,0 +1,11 @@
+# Build artifacts are never committed; select-binary.sh auto-builds from source
+bin/
+/dacli
+/data-agent-mcp-server
+
+# Go build cache
+*.test
+
+# Local secrets and config (use .env.example / config.yaml.example as templates)
+.env
+config.yaml
