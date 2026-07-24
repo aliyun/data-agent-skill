@@ -3,10 +3,13 @@ VERSION=$(shell git describe --tags --always 2>/dev/null || echo "dev")
 LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
 GOFLAGS=-trimpath
 
-.PHONY: build build-all clean test
+.PHONY: build build-all dacli clean test
 
 build:
 	go build $(GOFLAGS) $(LDFLAGS) -o bin/$(BINARY) .
+
+dacli:
+	go build $(GOFLAGS) $(LDFLAGS) -o bin/dacli ./cmd/dacli
 
 build-all:
 	GOOS=linux GOARCH=amd64 go build $(GOFLAGS) $(LDFLAGS) -o bin/$(BINARY)-linux-amd64 .

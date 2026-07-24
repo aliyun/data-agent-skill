@@ -194,7 +194,7 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion
 `cmd/dacli` is a bundled CLI that calls the HTTP endpoint exactly like Aily does (identity headers on every request). Ideal for verifying an Option 2/3 deployment by hand:
 
 ```bash
-cd assets/server && go build -o bin/dacli ./cmd/dacli
+cd assets/server && make dacli   # -> bin/dacli (or: go build -o bin/dacli ./cmd/dacli)
 
 # identity via flags (or env: AILY_MCP_URL / AILY_USER / AILY_EMAIL / AILY_TOKEN)
 ./bin/dacli --url http://localhost:8931/mcp \
@@ -216,13 +216,27 @@ A wrong `--token` or a user matching no group (without `identity.default`) must 
 
 Then from the AI client: `data_agent_list_workspaces` → `data_agent_list_workspace_databases` should return real data. Full tool reference, workflows, and troubleshooting: [SKILL.md](SKILL.md).
 
-## Development
+## Build & Development
+
+All builds run from `assets/server/` and output to `assets/server/bin/` (gitignored — binaries are never committed). Go 1.23+ required.
 
 ```bash
 cd assets/server
-go test ./...        # unit tests (config / tenant / mcp / session / dataagent / event)
+
+# MCP server — normally you don't build it by hand:
+#   scripts/select-binary.sh builds it automatically on first launch.
+make build            # -> bin/data-agent-mcp-server (current platform)
+make build-all        # -> bin/data-agent-mcp-server-linux-{amd64,arm64} (cross-compile)
+
+# dacli — manual verification client
+make dacli            # -> bin/dacli
+
+# equivalents without make
 go build -trimpath -ldflags "-s -w" -o bin/data-agent-mcp-server .
-make build-all       # cross-compile linux amd64/arm64
+go build -trimpath -ldflags "-s -w" -o bin/dacli ./cmd/dacli
+
+# tests & debugging
+make test             # go test ./... (config / tenant / mcp / session / dataagent / event)
 DATA_AGENT_DEBUG_SSE=1 ...   # log raw SSE traffic when debugging event parsing
 ```
 
