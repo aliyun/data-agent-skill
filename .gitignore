@@ -76,4 +76,5 @@ sessions/
 CLAUDE.md
 evals/
 .omc/
+.worktrees/
 ua-fix-report.md
