@@ -92,6 +92,7 @@ This Skill uses Alibaba Cloud default credential chain (recommended) or API_KEY 
 | `DATA_AGENT_WORKSPACE_ID` | Default workspace ID | auto personal workspace |
 | `DATA_AGENT_CUSTOM_AGENT_ID` | Default custom agent ID | — |
 | `DATA_AGENT_ENDPOINT` | Custom endpoint | auto-generated |
+| `DATA_AGENT_DMS_ENTERPRISE_ENDPOINT` | dms-enterprise host for discovery APIs (not covered by `DATA_AGENT_ENDPOINT`); set for VPC-only egress | `dms-enterprise.{region}.aliyuncs.com` |
 | `DATA_AGENT_TIMEOUT` | Request timeout (seconds) | `300` |
 | `DATA_AGENT_MAX_RETRY` | Max retry attempts | `3` |
 | `DATA_AGENT_POLL_INTERVAL` | Poll interval (seconds) | `2` |

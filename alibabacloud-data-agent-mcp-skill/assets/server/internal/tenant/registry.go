@@ -189,6 +189,9 @@ func (r *Registry) tenant(key, groupName string, mapped config.IdentityGroup) (*
 	if r.cfg.DMSUnit != "" {
 		opts = append(opts, dataagent.WithDMSUnit(r.cfg.DMSUnit))
 	}
+	if r.cfg.DMSEnterpriseEndpoint != "" {
+		opts = append(opts, dataagent.WithDMSEnterpriseEndpoint(r.cfg.DMSEnterpriseEndpoint))
+	}
 	workspaceID := mapped.WorkspaceID
 	if workspaceID == "" {
 		workspaceID = r.cfg.WorkspaceID

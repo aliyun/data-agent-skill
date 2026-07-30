@@ -56,6 +56,10 @@ func main() {
 	if cfg.DMSUnit != "" {
 		clientOpts = append(clientOpts, dataagent.WithDMSUnit(cfg.DMSUnit))
 	}
+	if cfg.DMSEnterpriseEndpoint != "" {
+		clientOpts = append(clientOpts, dataagent.WithDMSEnterpriseEndpoint(cfg.DMSEnterpriseEndpoint))
+		log.Printf("using dms-enterprise endpoint %s", cfg.DMSEnterpriseEndpoint)
+	}
 	if cfg.WorkspaceID != "" {
 		clientOpts = append(clientOpts, dataagent.WithWorkspaceID(cfg.WorkspaceID))
 	}

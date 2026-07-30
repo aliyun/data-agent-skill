@@ -118,8 +118,7 @@ class DmsMcpTools:
         sdk_config.credential = credential_client
         
         # Use DMS Enterprise endpoint
-        region = self._config.region
-        sdk_config.endpoint = f"dms-enterprise.{region}.aliyuncs.com"
+        sdk_config.endpoint = self._config.resolve_dms_enterprise_endpoint()
         sdk_config.user_agent = "AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill"
         
         self._dms_client = DmsClient(sdk_config)
@@ -392,8 +391,7 @@ class AsyncDmsMcpTools:
         sdk_config = open_api_models.Config()
         sdk_config.credential = credential_client
         
-        region = self._config.region
-        sdk_config.endpoint = f"dms-enterprise.{region}.aliyuncs.com"
+        sdk_config.endpoint = self._config.resolve_dms_enterprise_endpoint()
         sdk_config.user_agent = "AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill"
         
         self._dms_client = DmsClient(sdk_config)

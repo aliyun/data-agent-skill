@@ -210,7 +210,7 @@ class DataAgentClient:
 
         region = region_id or self._config.region
         sdk_config = open_api_models.Config()
-        sdk_config.endpoint = f"dms-enterprise.{region}.aliyuncs.com"
+        sdk_config.endpoint = self._config.resolve_dms_enterprise_endpoint(region)
         sdk_config.user_agent = "AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill"
         sdk_config.credential = self._credential_client
         route_client = OpenApiClient(sdk_config)
@@ -331,7 +331,7 @@ class DataAgentClient:
             )
 
         sdk_config = open_api_models.Config()
-        sdk_config.endpoint = f"dms-enterprise.{self._config.region}.aliyuncs.com"
+        sdk_config.endpoint = self._config.resolve_dms_enterprise_endpoint()
         sdk_config.user_agent = "AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill"
         sdk_config.credential = self._credential_client
         tag_client = OpenApiClient(sdk_config)

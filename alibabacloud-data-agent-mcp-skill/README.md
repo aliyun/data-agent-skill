@@ -50,6 +50,7 @@ The `.env` file (path: `$DATA_AGENT_ENV_FILE`, else `./.env`) is loaded into the
 | `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | Long-term AK/SK. Falls back to the default credential chain (`~/.aliyun/config.json`, ECS instance role) when unset |
 | `DATA_AGENT_REGION` / `BUDDY_REGION` | Region override (`DATA_AGENT_REGION` wins) |
 | `DATA_AGENT_DMS_UNIT` / `DATA_AGENT_WORKSPACE_ID` / `DATA_AGENT_SESSIONS_DIR` / `DATA_AGENT_API_KEY` | Override the matching config keys |
+| `DATA_AGENT_DMS_ENTERPRISE_ENDPOINT` | dms-enterprise host for the metadata APIs; overrides `dms_enterprise_endpoint`. Default `dms-enterprise.{region}.aliyuncs.com` — set for VPC-only egress or non-public-cloud |
 | `DATA_AGENT_CONFIG` / `DATA_AGENT_ENV_FILE` | Explicit config / .env file paths |
 | `AILY_SHARED_SECRET` / `IDENTITY_SHARED_SECRET` / `IDENTITY_AUTH_TOKEN` | Overrides `identity.auth_token` |
 | `MCP_TRANSPORT` / `MCP_PORT` | `stdio` (default) \| `streamable-http` \| `sse`; port is required for HTTP transports |

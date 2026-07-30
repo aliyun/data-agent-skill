@@ -38,6 +38,11 @@ class DataAgentConfig:
         workspace_id: Optional workspace ID from DATA_AGENT_WORKSPACE_ID
         dms_unit: Optional DMSUnit override from DATA_AGENT_DMS_UNIT
         custom_agent_id: Optional custom agent ID from DATA_AGENT_CUSTOM_AGENT_ID
+        dms_enterprise_endpoint: Optional dms-enterprise host for the 2018-11-01
+            metadata APIs (database/table/instance discovery, GetActiveRouteUnit).
+            Defaults to dms-enterprise.{region}.aliyuncs.com. Set it for VPC-only
+            egress or non-public-cloud deployments. Note that ``endpoint`` only
+            covers the Data Agent APIs, not these metadata calls.
     
     Note:
         For AK/SK authentication, the SDK uses Alibaba Cloud default credential chain
@@ -55,12 +60,14 @@ class DataAgentConfig:
     workspace_id: Optional[str] = None
     dms_unit: Optional[str] = None
     custom_agent_id: Optional[str] = None
+    dms_enterprise_endpoint: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Generate endpoint if not provided and validate config."""
         self.workspace_id = _none_if_blank(self.workspace_id)
         self.dms_unit = _none_if_blank(self.dms_unit)
         self.custom_agent_id = _none_if_blank(self.custom_agent_id)
+        self.dms_enterprise_endpoint = _none_if_blank(self.dms_enterprise_endpoint)
         if not self.endpoint:
             if self.api_key:
                 # For API key auth, use the dataagent domain format with /apikey suffix
@@ -69,6 +76,22 @@ class DataAgentConfig:
                 # Standard DMS endpoint for AK/SK auth (uses default credential chain)
                 self.endpoint = f"dms.{self.region}.aliyuncs.com"
         self.validate()
+
+    def resolve_dms_enterprise_endpoint(self, region_id: Optional[str] = None) -> str:
+        """Return the effective dms-enterprise host for the 2018-11-01 APIs.
+
+        The configured override wins; otherwise the host is derived from the
+        region (``region_id`` when given, else the configured region).
+
+        Args:
+            region_id: Region to derive the default host from.
+
+        Returns:
+            dms-enterprise hostname.
+        """
+        if self.dms_enterprise_endpoint:
+            return self.dms_enterprise_endpoint
+        return f"dms-enterprise.{region_id or self.region}.aliyuncs.com"
 
     def validate(self) -> None:
         """Validate configuration values.
@@ -118,6 +141,7 @@ class DataAgentConfig:
             workspace_id=os.environ.get("DATA_AGENT_WORKSPACE_ID"),
             dms_unit=os.environ.get("DATA_AGENT_DMS_UNIT") or os.environ.get("DATA_AGENT_DMSUNIT"),
             custom_agent_id=os.environ.get("DATA_AGENT_CUSTOM_AGENT_ID"),
+            dms_enterprise_endpoint=os.environ.get("DATA_AGENT_DMS_ENTERPRISE_ENDPOINT"),
         )
 
     @classmethod
@@ -145,6 +169,7 @@ class DataAgentConfig:
             workspace_id=config_dict.get("workspace_id") or config_dict.get("WorkspaceId"),
             dms_unit=config_dict.get("dms_unit") or config_dict.get("DMSUnit"),
             custom_agent_id=config_dict.get("custom_agent_id") or config_dict.get("CustomAgentId"),
+            dms_enterprise_endpoint=config_dict.get("dms_enterprise_endpoint"),
         )
 
     def to_dict(self) -> dict:
@@ -167,6 +192,8 @@ class DataAgentConfig:
             result["dms_unit"] = self.dms_unit
         if self.custom_agent_id:
             result["custom_agent_id"] = self.custom_agent_id
+        if self.dms_enterprise_endpoint:
+            result["dms_enterprise_endpoint"] = self.dms_enterprise_endpoint
         # Only indicate auth type
         if self.api_key:
             result["auth_type"] = "api_key"

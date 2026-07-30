@@ -56,8 +56,11 @@ type Client struct {
 	credFn   func() *Credential // optional dynamic credential provider (e.g. STS auto-refresh)
 	region   string
 	endpoint string // dms.{region}.aliyuncs.com  (Data Agent 2025-04-14)
-	http     *http.Client
-	sse      *SSEClient
+	// dmsEnterpriseEndpoint overrides the dms-enterprise host (2018-11-01
+	// metadata APIs). Empty means dms-enterprise.{region}.aliyuncs.com.
+	dmsEnterpriseEndpoint string
+	http                  *http.Client
+	sse                   *SSEClient
 
 	dmsUnitMu   sync.Mutex
 	dmsUnit     string // cached DMSUnit from GetActiveRouteUnit
@@ -71,6 +74,15 @@ type ClientOption func(*Client)
 // WithDMSUnit pre-sets the DMSUnit, skipping GetActiveRouteUnit auto-resolution.
 func WithDMSUnit(unit string) ClientOption {
 	return func(c *Client) { c.dmsUnit = unit }
+}
+
+// WithDMSEnterpriseEndpoint overrides the dms-enterprise endpoint used by the
+// 2018-11-01 metadata APIs (database/table/instance discovery, import tagging,
+// GetActiveRouteUnit). Use it for VPC endpoints
+// (dms-enterprise-vpc.{region}.aliyuncs.com) or non-public-cloud deployments.
+// An empty value keeps the region-derived default.
+func WithDMSEnterpriseEndpoint(endpoint string) ClientOption {
+	return func(c *Client) { c.dmsEnterpriseEndpoint = endpoint }
 }
 
 // WithWorkspaceID pre-sets the workspace ID, skipping InitDataAgentPersonalWorkspace auto-resolution.
@@ -118,6 +130,15 @@ func (c *Client) credential() *Credential {
 
 // Region returns the configured region.
 func (c *Client) Region() string { return c.region }
+
+// DMSEnterpriseEndpoint returns the effective dms-enterprise host for the
+// 2018-11-01 metadata APIs: the configured override, else the region default.
+func (c *Client) DMSEnterpriseEndpoint() string {
+	if c.dmsEnterpriseEndpoint != "" {
+		return c.dmsEnterpriseEndpoint
+	}
+	return fmt.Sprintf("dms-enterprise.%s.aliyuncs.com", c.region)
+}
 
 // ---------- public API methods ----------
 
@@ -298,7 +319,7 @@ func (c *Client) ResolveWorkspaceID() string {
 // ListDatabases calls ListTagMetaAsset on the dms-enterprise endpoint to
 // list databases visible in the user's Data Agent workspace.
 func (c *Client) ListDatabases() ([]DatabaseInfo, error) {
-	dmsEndpoint := fmt.Sprintf("dms-enterprise.%s.aliyuncs.com", c.region)
+	dmsEndpoint := c.DMSEnterpriseEndpoint()
 
 	tid := c.resolveTid(dmsEndpoint)
 	ws := c.ResolveWorkspaceID()
@@ -417,7 +438,7 @@ func (c *Client) ListFiles(sessionID, agentID, workspaceID, category string) ([]
 // This returns tables from DMS directly (not workspace-scoped), suitable for
 // discovering tables before importing them via import_database.
 func (c *Client) ListTables(databaseID string) ([]TableInfo, error) {
-	dmsEndpoint := fmt.Sprintf("dms-enterprise.%s.aliyuncs.com", c.region)
+	dmsEndpoint := c.DMSEnterpriseEndpoint()
 	tid := c.resolveTid(dmsEndpoint)
 
 	params := map[string]string{
@@ -465,7 +486,7 @@ func (c *Client) ListTables(databaseID string) ([]TableInfo, error) {
 
 // ListImportedTables queries tables already imported into a workspace via ListTagMetaAsset.
 func (c *Client) ListImportedTables(databaseID string) ([]TableInfo, error) {
-	dmsEndpoint := fmt.Sprintf("dms-enterprise.%s.aliyuncs.com", c.region)
+	dmsEndpoint := c.DMSEnterpriseEndpoint()
 	tid := c.resolveTid(dmsEndpoint)
 	ws := c.ResolveWorkspaceID()
 	tagName := fmt.Sprintf("sys::DMS-DA::%s::space:%s", c.region, ws)
@@ -536,7 +557,7 @@ func (c *Client) ImportDatabase(opts ImportDatabaseOpts) error {
 		wsID = c.ResolveWorkspaceID()
 	}
 
-	dmsEndpoint := fmt.Sprintf("dms-enterprise.%s.aliyuncs.com", c.region)
+	dmsEndpoint := c.DMSEnterpriseEndpoint()
 	tid := c.resolveTid(dmsEndpoint)
 	tagName := fmt.Sprintf("sys::DMS-DA::%s::space:%s", c.region, wsID)
 
@@ -571,7 +592,7 @@ func (c *Client) ImportDatabase(opts ImportDatabaseOpts) error {
 
 // ListInstances lists DMS instances with optional filters.
 func (c *Client) ListInstances(searchKey, dbType string, page, size int) ([]InstanceInfo, error) {
-	dmsEndpoint := fmt.Sprintf("dms-enterprise.%s.aliyuncs.com", c.region)
+	dmsEndpoint := c.DMSEnterpriseEndpoint()
 	tid := c.resolveTid(dmsEndpoint)
 
 	params := map[string]string{
@@ -638,7 +659,7 @@ func (c *Client) ListInstances(searchKey, dbType string, page, size int) ([]Inst
 
 // SearchDatabases searches DMS databases by keyword.
 func (c *Client) SearchDatabases(searchKey string, page, size int) ([]SearchDBInfo, error) {
-	dmsEndpoint := fmt.Sprintf("dms-enterprise.%s.aliyuncs.com", c.region)
+	dmsEndpoint := c.DMSEnterpriseEndpoint()
 	tid := c.resolveTid(dmsEndpoint)
 
 	params := map[string]string{
@@ -999,7 +1020,7 @@ func (c *Client) ResolveDMSUnit() string {
 		return ""
 	}
 
-	dmsEndpoint := fmt.Sprintf("dms-enterprise.%s.aliyuncs.com", c.region)
+	dmsEndpoint := c.DMSEnterpriseEndpoint()
 	body, err := c.callDMSEnterprise(dmsEndpoint, "GetActiveRouteUnit", "2018-11-01", nil)
 	if err == nil && body != nil {
 		route := jsonObj(body, "Route")

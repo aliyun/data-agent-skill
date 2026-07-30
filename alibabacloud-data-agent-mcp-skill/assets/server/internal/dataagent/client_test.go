@@ -259,3 +259,23 @@ func jsonHTTPResponse(t *testing.T, payload any) *http.Response {
 		Body:       io.NopCloser(strings.NewReader(string(body))),
 	}
 }
+
+func TestDMSEnterpriseEndpoint(t *testing.T) {
+	c := NewClient(&Credential{}, "cn-shanghai")
+	if got, want := c.DMSEnterpriseEndpoint(), "dms-enterprise.cn-shanghai.aliyuncs.com"; got != want {
+		t.Errorf("default endpoint = %q, want %q", got, want)
+	}
+
+	// An explicit override wins over the region default (e.g. VPC endpoints).
+	const vpc = "dms-enterprise-vpc.cn-shanghai.aliyuncs.com"
+	c = NewClient(&Credential{}, "cn-shanghai", WithDMSEnterpriseEndpoint(vpc))
+	if got := c.DMSEnterpriseEndpoint(); got != vpc {
+		t.Errorf("overridden endpoint = %q, want %q", got, vpc)
+	}
+
+	// An empty override keeps the region default.
+	c = NewClient(&Credential{}, "cn-shanghai", WithDMSEnterpriseEndpoint(""))
+	if got, want := c.DMSEnterpriseEndpoint(), "dms-enterprise.cn-shanghai.aliyuncs.com"; got != want {
+		t.Errorf("empty override endpoint = %q, want %q", got, want)
+	}
+}

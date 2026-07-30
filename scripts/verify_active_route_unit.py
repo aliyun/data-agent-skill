@@ -60,9 +60,14 @@ def _debug_enabled() -> bool:
     return os.getenv("DATA_AGENT_DEBUG_API", "").lower() in ("true", "1", "yes")
 
 
+def _dms_enterprise_endpoint(region: str) -> str:
+    """Resolve the dms-enterprise host, honouring the endpoint override."""
+    return os.getenv("DATA_AGENT_DMS_ENTERPRISE_ENDPOINT") or f"dms-enterprise.{region}.aliyuncs.com"
+
+
 def _build_client(region: str) -> OpenApiClient:
     """Build an OpenApiClient for dms-enterprise using the default credential chain."""
-    endpoint = f"dms-enterprise.{region}.aliyuncs.com"
+    endpoint = _dms_enterprise_endpoint(region)
     cred = CredentialClient()
     cfg = open_api_models.Config()
     cfg.endpoint = endpoint
@@ -117,7 +122,7 @@ def _extract_unit(body: dict[str, Any]) -> Optional[tuple[str, str]]:
 
 def _print_request(region: str, params: dict[str, Any]) -> None:
     print("=" * 70)
-    print(f"Endpoint : dms-enterprise.{region}.aliyuncs.com")
+    print(f"Endpoint : {_dms_enterprise_endpoint(region)}")
     print(f"Action   : {API_ACTION}")
     print(f"Version  : {API_VERSION}")
     print(f"Region   : {region}")

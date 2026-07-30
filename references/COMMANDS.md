@@ -16,6 +16,7 @@ CLI commands load `.env` and process environment variables through `DataAgentCon
 |------|------|
 | `DATA_AGENT_REGION` | RegionId for Data Agent and DMS endpoints, default `cn-hangzhou` |
 | `DATA_AGENT_DMS_UNIT` | Optional explicit DMSUnit override for Data Agent session APIs; `ListTagMetaAsset` discovery tags still use `DATA_AGENT_REGION` |
+| `DATA_AGENT_DMS_ENTERPRISE_ENDPOINT` | Optional dms-enterprise host for the discovery APIs (`ls`, `dms`, `import`, route lookup), default `dms-enterprise.{region}.aliyuncs.com`; use a VPC endpoint when public egress is unavailable |
 | `DATA_AGENT_WORKSPACE_ID` | Optional default workspace ID when `--workspace-id` is omitted |
 
 > **⚠️ Important**: The `ls` command only shows databases that have been **imported into Data Agent Data Center**. If you can't find the database you need, it means the database has not been imported from DMS yet.

@@ -165,6 +165,7 @@ sessions_dir: ~/.data-agent/sessions
 | `DATA_AGENT_REGION` | `cn-hangzhou` | DMS region |
 | `BUDDY_REGION` | — | DataBuddy container region fallback when `DATA_AGENT_REGION` is not set |
 | `DATA_AGENT_DMS_UNIT` | auto-resolved | DMS unit override (skip GetActiveRouteUnit) |
+| `DATA_AGENT_DMS_ENTERPRISE_ENDPOINT` | `dms-enterprise.{region}.aliyuncs.com` | dms-enterprise host for metadata APIs (discovery, import tagging, GetActiveRouteUnit); overrides `dms_enterprise_endpoint`. Use for VPC-only egress or non-public-cloud |
 | `DATA_AGENT_WORKSPACE_ID` | auto-resolved | Workspace ID override (skip auto-resolution) |
 | `DATA_AGENT_API_KEY` | — | API Key (alternative to AK/SK, some tools unavailable) |
 | `DATA_AGENT_SESSIONS_DIR` | `~/.data-agent/sessions` | Session data directory |

@@ -10,6 +10,13 @@ workspace_id: ""          # empty = auto personal workspace
 sessions_dir: ~/.data-agent/sessions
 api_key: ""               # API Key auth; leave empty for AK/SK (required for identity mode)
 
+# Host for the dms-enterprise (2018-11-01) metadata APIs: database/table/
+# instance discovery, import tagging, GetActiveRouteUnit.
+# Empty = dms-enterprise.{region}.aliyuncs.com. Set it for VPC-only egress
+# (dms-enterprise-vpc.{region}.aliyuncs.com) or non-public-cloud deployments.
+# Env override: DATA_AGENT_DMS_ENTERPRISE_ENDPOINT.
+dms_enterprise_endpoint: ""
+
 # STS AssumeRole settings used by identity multi-tenant mode.
 sts:
   endpoint: ""            # default: sts.{region}.aliyuncs.com

@@ -109,8 +109,12 @@ type Config struct {
 	WorkspaceID string `yaml:"workspace_id"`
 	SessionsDir string `yaml:"sessions_dir"`
 	APIKey      string `yaml:"api_key"`
-	STS         STS    `yaml:"sts"`
-	Upload      Upload `yaml:"upload"`
+	// DMSEnterpriseEndpoint overrides the dms-enterprise host used by the
+	// 2018-11-01 metadata APIs (database/table/instance discovery, import
+	// tagging, GetActiveRouteUnit). Empty = dms-enterprise.{region}.aliyuncs.com.
+	DMSEnterpriseEndpoint string `yaml:"dms_enterprise_endpoint"`
+	STS                   STS    `yaml:"sts"`
+	Upload                Upload `yaml:"upload"`
 	// Identity is the multi-tenant identity section. The legacy section
 	// name "aily" is still accepted as an alias.
 	Identity       Identity  `yaml:"identity"`
@@ -229,6 +233,9 @@ func Load() (Config, string, error) {
 	}
 	if v := os.Getenv("DATA_AGENT_DMS_UNIT"); v != "" {
 		cfg.DMSUnit = v
+	}
+	if v := os.Getenv("DATA_AGENT_DMS_ENTERPRISE_ENDPOINT"); v != "" {
+		cfg.DMSEnterpriseEndpoint = v
 	}
 	if v := os.Getenv("DATA_AGENT_WORKSPACE_ID"); v != "" {
 		cfg.WorkspaceID = v
