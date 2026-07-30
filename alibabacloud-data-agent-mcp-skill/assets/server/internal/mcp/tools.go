@@ -620,9 +620,9 @@ func (s *Server) handleUploadFile(_ context.Context, req mcp.CallToolRequest) (*
 		return mcp.NewToolResultError("file_path is required"), nil
 	}
 
-	info, err := os.Stat(filePath)
+	realPath, info, err := s.resolveUploadPath(filePath)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("file not found: %v", err)), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	sig, err := s.client.GetFileUploadSignature(info.Name(), info.Size())
@@ -630,7 +630,7 @@ func (s *Server) handleUploadFile(_ context.Context, req mcp.CallToolRequest) (*
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get upload signature: %v", err)), nil
 	}
 
-	f, err := os.Open(filePath)
+	f, err := os.Open(realPath)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to open file: %v", err)), nil
 	}

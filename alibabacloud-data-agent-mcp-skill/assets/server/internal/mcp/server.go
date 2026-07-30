@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -29,6 +31,13 @@ type Server struct {
 	hdrUser  string
 	hdrEmail string
 	hdrToken string
+
+	// uploadRoots confines data_agent_upload_file to these directories
+	// (empty = no allowlist configured).
+	uploadRoots []string
+	// remoteCaller is true on the HTTP transports, where the caller is not
+	// the local user and uploads must be confined to uploadRoots.
+	remoteCaller bool
 }
 
 // SessionDefaults are group-level fallbacks applied when a tool call omits
@@ -78,6 +87,7 @@ func New(mgr *session.Manager, client *dataagent.Client, version string) *Server
 	s := &Server{
 		mgr: mgr, client: client, version: version,
 		hdrUser: "x-aily-user", hdrEmail: "x-aily-email", hdrToken: "x-aily-token",
+		remoteCaller: isRemoteTransport(os.Getenv("MCP_TRANSPORT")),
 	}
 
 	mcpServer := server.NewMCPServer(
@@ -124,6 +134,88 @@ func (s *Server) SetIdentityHeaders(user, email, token string) {
 	if token != "" {
 		s.hdrToken = token
 	}
+}
+
+// SetUploadRoots confines data_agent_upload_file to the given directories.
+// Relative entries are resolved against the working directory and symlinked
+// roots are followed, so the check compares real paths. Passing no directory
+// leaves stdio unrestricted and keeps the HTTP transports fail-closed.
+func (s *Server) SetUploadRoots(dirs []string) {
+	roots := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		if d == "" {
+			continue
+		}
+		abs, err := filepath.Abs(d)
+		if err != nil {
+			log.Printf("upload root %q ignored: %v", d, err)
+			continue
+		}
+		real, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			log.Printf("upload root %q ignored: %v", d, err)
+			continue
+		}
+		roots = append(roots, real)
+	}
+	s.uploadRoots = roots
+	switch {
+	case len(roots) > 0:
+		log.Printf("file uploads confined to %v", roots)
+	case s.remoteCaller:
+		log.Print("file uploads disabled: upload.allowed_dirs is required on HTTP transports " +
+			"(set upload.allowed_dirs or DATA_AGENT_UPLOAD_DIRS)")
+	}
+}
+
+// resolveUploadPath validates a caller-supplied upload path and returns the
+// real path together with its file info.
+//
+// The path is resolved through symlinks before the allowlist check so a link
+// inside an allowed directory cannot point outside it, and only regular files
+// are accepted (directories, devices, and pipes are not uploadable).
+func (s *Server) resolveUploadPath(filePath string) (string, os.FileInfo, error) {
+	if len(s.uploadRoots) == 0 && s.remoteCaller {
+		return "", nil, fmt.Errorf("file uploads are disabled: no upload directory is allowed on this " +
+			"transport; configure upload.allowed_dirs (or DATA_AGENT_UPLOAD_DIRS) on the server")
+	}
+
+	abs, err := filepath.Abs(filePath)
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid file path: %w", err)
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", nil, fmt.Errorf("file not found: %w", err)
+	}
+	info, err := os.Stat(real)
+	if err != nil {
+		return "", nil, fmt.Errorf("file not found: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", nil, fmt.Errorf("not a regular file: %s", filePath)
+	}
+
+	if len(s.uploadRoots) == 0 {
+		return real, info, nil // stdio without allowlist: local caller, any path
+	}
+	for _, root := range s.uploadRoots {
+		if withinRoot(root, real) {
+			return real, info, nil
+		}
+	}
+	return "", nil, fmt.Errorf("file path is outside the allowed upload directories: %s", filePath)
+}
+
+// withinRoot reports whether path is root itself or nested under it.
+func withinRoot(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	// ".." as the first segment means path escapes root; Rel already cleaned
+	// the result, so a prefix check on the separator is enough.
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // withTenant wraps a tool handler so it runs against the tenant resolved from
@@ -199,6 +291,12 @@ func mcpAddr() (string, error) {
 		return "", fmt.Errorf("MCP_PORT must be set for %s transport; choose an available local port in the agent runtime", os.Getenv("MCP_TRANSPORT"))
 	}
 	return ":" + port, nil
+}
+
+// isRemoteTransport reports whether the transport serves callers over the
+// network rather than the local process on stdin/stdout.
+func isRemoteTransport(transport string) bool {
+	return transport == "sse" || transport == "streamable-http"
 }
 
 var listWorkspaceDatabasesTool = mcp.NewTool(
@@ -333,5 +431,5 @@ var listAgentsTool = mcp.NewTool(
 var uploadFileTool = mcp.NewTool(
 	"data_agent_upload_file",
 	mcp.WithDescription("Upload a local file (CSV, XLSX, XLS, JSON, TXT) for Data Agent analysis. Returns file_id for use with create_session."),
-	mcp.WithString("file_path", mcp.Required(), mcp.Description("Absolute path to the local file to upload")),
+	mcp.WithString("file_path", mcp.Required(), mcp.Description("Absolute path to the local file to upload. Must be a regular file inside the server's allowed upload directories when the server configures them (always required on HTTP transports)")),
 )

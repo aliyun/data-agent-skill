@@ -66,6 +66,7 @@ func main() {
 	go mgr.RunHousekeeping(ctx)
 
 	srv := mcpserver.New(mgr, client, version)
+	srv.SetUploadRoots(cfg.Upload.AllowedDirs)
 
 	// Identity multi-tenant mode: map upstream identity headers (e.g. Feishu
 	// Aily's x-aily-user/x-aily-email) to per-user RAM roles via STS

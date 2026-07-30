@@ -89,6 +89,19 @@ type STS struct {
 	SessionExpiration int    `yaml:"session_expiration"` // seconds, default 3600
 }
 
+// Upload restricts which local files data_agent_upload_file may read.
+//
+// The tool reads a server-side path chosen by the caller, so on the HTTP
+// transports (where the caller is remote) an unrestricted path would let any
+// client exfiltrate arbitrary server files. AllowedDirs confines uploads to
+// an explicit set of directories; HTTP transports refuse every upload while
+// it is empty (fail-closed). The stdio transport, where client and server
+// share one trust domain and the caller is the local user, stays
+// unrestricted unless AllowedDirs is set.
+type Upload struct {
+	AllowedDirs []string `yaml:"allowed_dirs"`
+}
+
 // Config holds all server configuration.
 type Config struct {
 	Region      string `yaml:"region"`
@@ -97,6 +110,7 @@ type Config struct {
 	SessionsDir string `yaml:"sessions_dir"`
 	APIKey      string `yaml:"api_key"`
 	STS         STS    `yaml:"sts"`
+	Upload      Upload `yaml:"upload"`
 	// Identity is the multi-tenant identity section. The legacy section
 	// name "aily" is still accepted as an alias.
 	Identity       Identity  `yaml:"identity"`
@@ -234,8 +248,15 @@ func Load() (Config, string, error) {
 	if v := os.Getenv("IDENTITY_AUTH_TOKEN"); v != "" {
 		cfg.Identity.AuthToken = v
 	}
+	// Colon-separated on Unix, semicolon-separated on Windows (os.PathListSeparator).
+	if v := os.Getenv("DATA_AGENT_UPLOAD_DIRS"); v != "" {
+		cfg.Upload.AllowedDirs = filepath.SplitList(v)
+	}
 
 	cfg.SessionsDir = expandHome(cfg.SessionsDir)
+	for i, d := range cfg.Upload.AllowedDirs {
+		cfg.Upload.AllowedDirs[i] = expandHome(strings.TrimSpace(d))
+	}
 	cfg.ApplyDefaults()
 
 	if err := cfg.validate(); err != nil {

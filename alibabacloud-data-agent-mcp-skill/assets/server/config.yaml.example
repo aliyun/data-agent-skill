@@ -15,6 +15,17 @@ sts:
   endpoint: ""            # default: sts.{region}.aliyuncs.com
   session_expiration: 3600
 
+# Confine data_agent_upload_file to these directories. The tool reads a
+# server-side path chosen by the caller, so leaving this empty on the HTTP
+# transports (streamable-http / sse) disables uploads entirely (fail-closed) —
+# otherwise a remote client could read any file the server process can.
+# The stdio transport (local caller, same trust domain) stays unrestricted
+# while the list is empty. Env override: DATA_AGENT_UPLOAD_DIRS (path list).
+upload:
+  allowed_dirs: []
+  #  - ~/data-agent-uploads
+  #  - /srv/data-agent/inbox
+
 # Multi-tenant identity mode (generic; legacy section name "aily" still works).
 # The upstream caller (Feishu Aily, a gateway, a portal, ...) forwards the
 # end-user identity as HTTP headers on every MCP request. The server maps the
