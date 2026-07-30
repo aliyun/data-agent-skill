@@ -29,17 +29,22 @@ type SSEClient struct {
 	cred       *Credential
 	credFn     func() *Credential // optional dynamic credential provider
 	dmsUnitFn  func() string      // optional DMSUnit resolver (set by Client)
-	endpoint   string // e.g. "dataagent-cn-hangzhou.aliyuncs.com"
-	region     string
+	endpoint   string             // AK/SK signed host, e.g. "dms.cn-hangzhou.aliyuncs.com"
+	// streamEndpoint is the API Key data-plane host, e.g.
+	// "dataagent-stream-cn-hangzhou.aliyuncs.com". Client keeps it in sync
+	// with its own endpoint overrides.
+	streamEndpoint string
+	region         string
 }
 
 // NewSSEClient creates a new SSE streaming client.
 func NewSSEClient(cred *Credential, region string) *SSEClient {
 	return &SSEClient{
-		httpClient: &http.Client{Timeout: 0}, // no timeout; SSE streams are long-lived
-		cred:       cred,
-		endpoint:   fmt.Sprintf("dms.%s.aliyuncs.com", region),
-		region:     region,
+		httpClient:     &http.Client{Timeout: 0}, // no timeout; SSE streams are long-lived
+		cred:           cred,
+		endpoint:       fmt.Sprintf("dms.%s.aliyuncs.com", region),
+		streamEndpoint: fmt.Sprintf("dataagent-stream-%s.aliyuncs.com", region),
+		region:         region,
 	}
 }
 
@@ -137,7 +142,7 @@ func (c *SSEClient) doStream(
 	sseCred := c.credential()
 	if sseCred.IsAPIKey() {
 		// API Key mode: POST JSON body to stream endpoint with x-api-key header.
-		host := fmt.Sprintf("dataagent-stream-%s.aliyuncs.com", c.region)
+		host := c.streamEndpoint
 		bodyMap := map[string]string{
 			"Action":   "GetChatContent",
 			"Version":  "2025-04-14",

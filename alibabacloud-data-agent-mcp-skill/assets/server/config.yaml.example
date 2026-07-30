@@ -10,12 +10,25 @@ workspace_id: ""          # empty = auto personal workspace
 sessions_dir: ~/.data-agent/sessions
 api_key: ""               # API Key auth; leave empty for AK/SK (required for identity mode)
 
-# Host for the dms-enterprise (2018-11-01) metadata APIs: database/table/
-# instance discovery, import tagging, GetActiveRouteUnit.
-# Empty = dms-enterprise.{region}.aliyuncs.com. Set it for VPC-only egress
-# (dms-enterprise-vpc.{region}.aliyuncs.com) or non-public-cloud deployments.
-# Env override: DATA_AGENT_DMS_ENTERPRISE_ENDPOINT.
+# Endpoint overrides. Each is empty by default and then derived from `region`.
+# Set them for VPC-only egress or non-public-cloud deployments; every host the
+# server talks to is listed here, so a fully private deployment needs no other
+# network change (the OSS upload host comes from the signature response).
+
+# AK/SK-signed Data Agent API (2025-04-14): create/send/status + SSE stream.
+# Empty = dms.{region}.aliyuncs.com. Env: DATA_AGENT_ENDPOINT.
+data_agent_endpoint: ""
+
+# dms-enterprise (2018-11-01) metadata APIs: database/table/instance discovery,
+# import tagging, GetActiveRouteUnit.
+# Empty = dms-enterprise.{region}.aliyuncs.com. Env: DATA_AGENT_DMS_ENTERPRISE_ENDPOINT.
 dms_enterprise_endpoint: ""
+
+# API Key auth only (ignored with AK/SK): control plane and streaming plane.
+# Empty = dataagent-{region}.aliyuncs.com / dataagent-stream-{region}.aliyuncs.com.
+# Env: DATA_AGENT_API_KEY_ENDPOINT / DATA_AGENT_API_KEY_STREAM_ENDPOINT.
+api_key_endpoint: ""
+api_key_stream_endpoint: ""
 
 # STS AssumeRole settings used by identity multi-tenant mode.
 sts:

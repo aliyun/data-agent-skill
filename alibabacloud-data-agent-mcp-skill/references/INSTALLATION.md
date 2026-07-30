@@ -157,6 +157,10 @@ sessions_dir: ~/.data-agent/sessions
 # Optional: VPC endpoint for the dms-enterprise metadata APIs when the host
 # has no public egress. Empty = dms-enterprise.{region}.aliyuncs.com.
 dms_enterprise_endpoint: ""
+# Optional: host of the AK/SK-signed Data Agent API (sessions + SSE).
+# Empty = dms.{region}.aliyuncs.com. Override it together with
+# dms_enterprise_endpoint for a fully private deployment.
+data_agent_endpoint: ""
 # Required on the HTTP transports: data_agent_upload_file reads a caller-chosen
 # server path, so uploads are refused until the directories are listed here.
 upload:
@@ -175,6 +179,9 @@ upload:
 | `BUDDY_REGION` | — | DataBuddy container region fallback when `DATA_AGENT_REGION` is not set |
 | `DATA_AGENT_DMS_UNIT` | auto-resolved | DMS unit override (skip GetActiveRouteUnit) |
 | `DATA_AGENT_DMS_ENTERPRISE_ENDPOINT` | `dms-enterprise.{region}.aliyuncs.com` | dms-enterprise host for metadata APIs (discovery, import tagging, GetActiveRouteUnit); overrides `dms_enterprise_endpoint`. Use for VPC-only egress or non-public-cloud |
+| `DATA_AGENT_ENDPOINT` | `dms.{region}.aliyuncs.com` | Host of the AK/SK-signed Data Agent API (session create/send/status + SSE); overrides `data_agent_endpoint` |
+| `DATA_AGENT_API_KEY_ENDPOINT` | `dataagent-{region}.aliyuncs.com` | API Key control-plane host; overrides `api_key_endpoint` (ignored with AK/SK) |
+| `DATA_AGENT_API_KEY_STREAM_ENDPOINT` | `dataagent-stream-{region}.aliyuncs.com` | API Key streaming host; overrides `api_key_stream_endpoint` (ignored with AK/SK) |
 | `DATA_AGENT_WORKSPACE_ID` | auto-resolved | Workspace ID override (skip auto-resolution) |
 | `DATA_AGENT_API_KEY` | — | API Key (alternative to AK/SK, some tools unavailable) |
 | `DATA_AGENT_SESSIONS_DIR` | `~/.data-agent/sessions` | Session data directory |

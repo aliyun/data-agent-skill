@@ -56,14 +56,21 @@ func main() {
 	if cfg.DMSUnit != "" {
 		clientOpts = append(clientOpts, dataagent.WithDMSUnit(cfg.DMSUnit))
 	}
-	if cfg.DMSEnterpriseEndpoint != "" {
-		clientOpts = append(clientOpts, dataagent.WithDMSEnterpriseEndpoint(cfg.DMSEnterpriseEndpoint))
-		log.Printf("using dms-enterprise endpoint %s", cfg.DMSEnterpriseEndpoint)
-	}
+	// Endpoint overrides; empty values keep the region-derived defaults.
+	clientOpts = append(clientOpts,
+		dataagent.WithDataAgentEndpoint(cfg.DataAgentEndpoint),
+		dataagent.WithDMSEnterpriseEndpoint(cfg.DMSEnterpriseEndpoint),
+		dataagent.WithAPIKeyEndpoint(cfg.APIKeyEndpoint),
+		dataagent.WithAPIKeyStreamEndpoint(cfg.APIKeyStreamEndpoint),
+	)
 	if cfg.WorkspaceID != "" {
 		clientOpts = append(clientOpts, dataagent.WithWorkspaceID(cfg.WorkspaceID))
 	}
 	client := dataagent.NewClient(cred, cfg.Region, clientOpts...)
+	log.Printf("endpoints: data-agent=%s dms-enterprise=%s", client.DataAgentEndpoint(), client.DMSEnterpriseEndpoint())
+	if cred.IsAPIKey() {
+		log.Printf("endpoints: api-key=%s api-key-stream=%s", client.APIKeyEndpoint(), client.APIKeyStreamEndpoint())
+	}
 
 	mgr := session.NewManager(client, cfg.SessionsDir)
 	mgr.RestoreSessions(ctx)

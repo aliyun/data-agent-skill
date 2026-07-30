@@ -59,8 +59,14 @@ type Client struct {
 	// dmsEnterpriseEndpoint overrides the dms-enterprise host (2018-11-01
 	// metadata APIs). Empty means dms-enterprise.{region}.aliyuncs.com.
 	dmsEnterpriseEndpoint string
-	http                  *http.Client
-	sse                   *SSEClient
+	// apiKeyEndpoint overrides the API Key control-plane host. Empty means
+	// dataagent-{region}.aliyuncs.com.
+	apiKeyEndpoint string
+	// apiKeyStreamEndpoint overrides the API Key data-plane (streaming) host.
+	// Empty means dataagent-stream-{region}.aliyuncs.com.
+	apiKeyStreamEndpoint string
+	http                 *http.Client
+	sse                  *SSEClient
 
 	dmsUnitMu   sync.Mutex
 	dmsUnit     string // cached DMSUnit from GetActiveRouteUnit
@@ -74,6 +80,31 @@ type ClientOption func(*Client)
 // WithDMSUnit pre-sets the DMSUnit, skipping GetActiveRouteUnit auto-resolution.
 func WithDMSUnit(unit string) ClientOption {
 	return func(c *Client) { c.dmsUnit = unit }
+}
+
+// WithDataAgentEndpoint overrides the host of the AK/SK-signed Data Agent API
+// (2025-04-14): session create/send/status plus the AK/SK SSE stream. Use it
+// for VPC endpoints or non-public-cloud deployments. An empty value keeps the
+// region-derived default dms.{region}.aliyuncs.com.
+func WithDataAgentEndpoint(endpoint string) ClientOption {
+	return func(c *Client) {
+		if endpoint != "" {
+			c.endpoint = endpoint
+		}
+	}
+}
+
+// WithAPIKeyEndpoint overrides the API Key control-plane host
+// (default dataagent-{region}.aliyuncs.com). Only used in API Key auth mode.
+func WithAPIKeyEndpoint(endpoint string) ClientOption {
+	return func(c *Client) { c.apiKeyEndpoint = endpoint }
+}
+
+// WithAPIKeyStreamEndpoint overrides the API Key data-plane host used for
+// streaming actions (default dataagent-stream-{region}.aliyuncs.com). Only
+// used in API Key auth mode.
+func WithAPIKeyStreamEndpoint(endpoint string) ClientOption {
+	return func(c *Client) { c.apiKeyStreamEndpoint = endpoint }
 }
 
 // WithDMSEnterpriseEndpoint overrides the dms-enterprise endpoint used by the
@@ -115,6 +146,10 @@ func NewClient(cred *Credential, region string, opts ...ClientOption) *Client {
 	}
 	c.sse.credFn = c.credFn
 	c.sse.dmsUnitFn = c.ResolveDMSUnit
+	// Endpoint overrides are applied by the options above, so propagate the
+	// resolved hosts into the SSE client that shares this configuration.
+	c.sse.endpoint = c.endpoint
+	c.sse.streamEndpoint = c.APIKeyStreamEndpoint()
 	return c
 }
 
@@ -138,6 +173,25 @@ func (c *Client) DMSEnterpriseEndpoint() string {
 		return c.dmsEnterpriseEndpoint
 	}
 	return fmt.Sprintf("dms-enterprise.%s.aliyuncs.com", c.region)
+}
+
+// DataAgentEndpoint returns the host of the AK/SK-signed Data Agent API.
+func (c *Client) DataAgentEndpoint() string { return c.endpoint }
+
+// APIKeyEndpoint returns the effective API Key control-plane host.
+func (c *Client) APIKeyEndpoint() string {
+	if c.apiKeyEndpoint != "" {
+		return c.apiKeyEndpoint
+	}
+	return fmt.Sprintf("dataagent-%s.aliyuncs.com", c.region)
+}
+
+// APIKeyStreamEndpoint returns the effective API Key data-plane (streaming) host.
+func (c *Client) APIKeyStreamEndpoint() string {
+	if c.apiKeyStreamEndpoint != "" {
+		return c.apiKeyStreamEndpoint
+	}
+	return fmt.Sprintf("dataagent-stream-%s.aliyuncs.com", c.region)
 }
 
 // ---------- public API methods ----------
@@ -1126,9 +1180,9 @@ func (c *Client) doAPIKeyPost(action, version string, params map[string]string) 
 		action = renamed
 	}
 	// Choose endpoint: control plane vs data plane.
-	host := fmt.Sprintf("dataagent-%s.aliyuncs.com", c.region)
+	host := c.APIKeyEndpoint()
 	if apiKeyDataPlaneActions[action] {
-		host = fmt.Sprintf("dataagent-stream-%s.aliyuncs.com", c.region)
+		host = c.APIKeyStreamEndpoint()
 	}
 
 	// Build JSON body with Action, Version, RegionId, and all params.

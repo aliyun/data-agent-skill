@@ -189,9 +189,13 @@ func (r *Registry) tenant(key, groupName string, mapped config.IdentityGroup) (*
 	if r.cfg.DMSUnit != "" {
 		opts = append(opts, dataagent.WithDMSUnit(r.cfg.DMSUnit))
 	}
-	if r.cfg.DMSEnterpriseEndpoint != "" {
-		opts = append(opts, dataagent.WithDMSEnterpriseEndpoint(r.cfg.DMSEnterpriseEndpoint))
-	}
+	// Endpoint overrides; empty values keep the region-derived defaults.
+	opts = append(opts,
+		dataagent.WithDataAgentEndpoint(r.cfg.DataAgentEndpoint),
+		dataagent.WithDMSEnterpriseEndpoint(r.cfg.DMSEnterpriseEndpoint),
+		dataagent.WithAPIKeyEndpoint(r.cfg.APIKeyEndpoint),
+		dataagent.WithAPIKeyStreamEndpoint(r.cfg.APIKeyStreamEndpoint),
+	)
 	workspaceID := mapped.WorkspaceID
 	if workspaceID == "" {
 		workspaceID = r.cfg.WorkspaceID

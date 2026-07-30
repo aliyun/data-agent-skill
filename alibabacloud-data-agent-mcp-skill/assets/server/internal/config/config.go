@@ -113,8 +113,18 @@ type Config struct {
 	// 2018-11-01 metadata APIs (database/table/instance discovery, import
 	// tagging, GetActiveRouteUnit). Empty = dms-enterprise.{region}.aliyuncs.com.
 	DMSEnterpriseEndpoint string `yaml:"dms_enterprise_endpoint"`
-	STS                   STS    `yaml:"sts"`
-	Upload                Upload `yaml:"upload"`
+	// DataAgentEndpoint overrides the host of the AK/SK-signed Data Agent API
+	// (2025-04-14): session create/send/status and the AK/SK SSE stream.
+	// Empty = dms.{region}.aliyuncs.com.
+	DataAgentEndpoint string `yaml:"data_agent_endpoint"`
+	// APIKeyEndpoint overrides the API Key control-plane host.
+	// Empty = dataagent-{region}.aliyuncs.com. Only used with api_key auth.
+	APIKeyEndpoint string `yaml:"api_key_endpoint"`
+	// APIKeyStreamEndpoint overrides the API Key data-plane (streaming) host.
+	// Empty = dataagent-stream-{region}.aliyuncs.com. Only used with api_key auth.
+	APIKeyStreamEndpoint string `yaml:"api_key_stream_endpoint"`
+	STS                  STS    `yaml:"sts"`
+	Upload               Upload `yaml:"upload"`
 	// Identity is the multi-tenant identity section. The legacy section
 	// name "aily" is still accepted as an alias.
 	Identity       Identity  `yaml:"identity"`
@@ -236,6 +246,15 @@ func Load() (Config, string, error) {
 	}
 	if v := os.Getenv("DATA_AGENT_DMS_ENTERPRISE_ENDPOINT"); v != "" {
 		cfg.DMSEnterpriseEndpoint = v
+	}
+	if v := os.Getenv("DATA_AGENT_ENDPOINT"); v != "" {
+		cfg.DataAgentEndpoint = v
+	}
+	if v := os.Getenv("DATA_AGENT_API_KEY_ENDPOINT"); v != "" {
+		cfg.APIKeyEndpoint = v
+	}
+	if v := os.Getenv("DATA_AGENT_API_KEY_STREAM_ENDPOINT"); v != "" {
+		cfg.APIKeyStreamEndpoint = v
 	}
 	if v := os.Getenv("DATA_AGENT_WORKSPACE_ID"); v != "" {
 		cfg.WorkspaceID = v
