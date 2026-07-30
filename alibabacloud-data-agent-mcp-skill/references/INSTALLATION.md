@@ -154,6 +154,14 @@ region: cn-hangzhou
 dms_unit: cn-hangzhou
 workspace_id: your-workspace-id
 sessions_dir: ~/.data-agent/sessions
+# Optional: VPC endpoint for the dms-enterprise metadata APIs when the host
+# has no public egress. Empty = dms-enterprise.{region}.aliyuncs.com.
+dms_enterprise_endpoint: ""
+# Required on the HTTP transports: data_agent_upload_file reads a caller-chosen
+# server path, so uploads are refused until the directories are listed here.
+upload:
+  allowed_dirs:
+    - /srv/data-agent/inbox
 ```
 
 **Environment Variables** (override .env and config file):
@@ -162,6 +170,7 @@ sessions_dir: ~/.data-agent/sessions
 |----------|---------|-------------|
 | `ALIBABA_CLOUD_ACCESS_KEY_ID` | — | Alibaba Cloud Access Key ID |
 | `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | — | Alibaba Cloud Access Key Secret |
+| `ALIBABA_CLOUD_SECURITY_TOKEN` | — | STS token, read with the AK/SK pair when using temporary credentials |
 | `DATA_AGENT_REGION` | `cn-hangzhou` | DMS region |
 | `BUDDY_REGION` | — | DataBuddy container region fallback when `DATA_AGENT_REGION` is not set |
 | `DATA_AGENT_DMS_UNIT` | auto-resolved | DMS unit override (skip GetActiveRouteUnit) |

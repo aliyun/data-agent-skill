@@ -31,6 +31,8 @@ Lookup order: `$DATA_AGENT_CONFIG` > `./config.yaml` > `~/.data-agent/config.yam
 | `workspace_id` | auto personal workspace | Default Data Agent workspace |
 | `sessions_dir` | `~/.data-agent/sessions` | Local session state directory |
 | `api_key` | — | API Key auth (alternative to AK/SK; **incompatible with identity mode**) |
+| `dms_enterprise_endpoint` | `dms-enterprise.{region}.aliyuncs.com` | Host for the dms-enterprise metadata APIs (database/table/instance discovery, import tagging, `GetActiveRouteUnit`); set a VPC endpoint when public egress is unavailable. Not covered by any Data Agent endpoint setting |
+| `upload.allowed_dirs` | `[]` (empty) | Directories `data_agent_upload_file` may read. HTTP transports refuse every upload while empty (fail-closed); stdio stays unrestricted until the list is set |
 | `sts.endpoint` | `sts.{region}.aliyuncs.com` | STS endpoint used for AssumeRole |
 | `sts.session_expiration` | `3600` | Temporary credential lifetime in seconds |
 | `identity.enabled` | `false` | Turn on multi-tenant identity mapping (HTTP/SSE transports only; legacy section name `aily` still accepted) |
@@ -48,6 +50,7 @@ The `.env` file (path: `$DATA_AGENT_ENV_FILE`, else `./.env`) is loaded into the
 | Variable | Purpose |
 |----------|---------|
 | `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | Long-term AK/SK. Falls back to the default credential chain (`~/.aliyun/config.json`, ECS instance role) when unset |
+| `ALIBABA_CLOUD_SECURITY_TOKEN` | STS token, read together with the AK/SK pair when running on temporary credentials |
 | `DATA_AGENT_REGION` / `BUDDY_REGION` | Region override (`DATA_AGENT_REGION` wins) |
 | `DATA_AGENT_DMS_UNIT` / `DATA_AGENT_WORKSPACE_ID` / `DATA_AGENT_SESSIONS_DIR` / `DATA_AGENT_API_KEY` | Override the matching config keys |
 | `DATA_AGENT_DMS_ENTERPRISE_ENDPOINT` | dms-enterprise host for the metadata APIs; overrides `dms_enterprise_endpoint`. Default `dms-enterprise.{region}.aliyuncs.com` — set for VPC-only egress or non-public-cloud |
