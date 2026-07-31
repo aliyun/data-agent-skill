@@ -78,7 +78,7 @@ func main() {
 
 	srv := mcpserver.New(mgr, client, version)
 	srv.SetUploadRoots(cfg.Upload.AllowedDirs)
-	srv.SetRequestLogLevel(mcpserver.ParseRequestLogLevel(cfg.Log.Requests))
+	srv.ApplyRequestLogConfig(cfg.Log.Requests)
 
 	// Identity multi-tenant mode: map upstream identity headers (e.g. Feishu
 	// Aily's x-aily-user/x-aily-email) to per-user RAM roles via STS

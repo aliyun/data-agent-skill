@@ -32,7 +32,9 @@ const (
 )
 
 // ParseRequestLogLevel maps a config/env value to a level. Unknown values fall
-// back to basic so a typo degrades to less logging, never to none.
+// back to basic so a typo degrades to less logging, never to none. An empty
+// value also yields basic; callers holding a possibly-unset config value should
+// use ApplyRequestLogConfig so the transport default survives.
 func ParseRequestLogLevel(v string) RequestLogLevel {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "off", "none", "false", "0":
@@ -47,8 +49,31 @@ func ParseRequestLogLevel(v string) RequestLogLevel {
 	}
 }
 
+// defaultRequestLogLevel picks the level for an unconfigured server.
+//
+// A standalone deployment listens on a port and its stderr goes to a log file
+// or the process supervisor, so per-call logging is what makes the service
+// operable. Under stdio the server is a child of the host agent, which owns
+// the console and already records the calls it makes, so staying quiet avoids
+// duplicating its transcript.
+func defaultRequestLogLevel(standalone bool) RequestLogLevel {
+	if standalone {
+		return RequestLogBasic
+	}
+	return RequestLogOff
+}
+
 // SetRequestLogLevel selects how much of each tool call is logged.
 func (s *Server) SetRequestLogLevel(l RequestLogLevel) { s.reqLog = l }
+
+// ApplyRequestLogConfig applies a configured level, keeping the
+// transport-derived default when the value is unset.
+func (s *Server) ApplyRequestLogConfig(configured string) {
+	if strings.TrimSpace(configured) == "" {
+		return
+	}
+	s.reqLog = ParseRequestLogLevel(configured)
+}
 
 // sensitiveArgKeys are argument names whose values are never logged. The
 // identity token is not an argument and is never logged at all.

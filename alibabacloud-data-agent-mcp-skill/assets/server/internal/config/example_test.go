@@ -16,8 +16,9 @@ func TestShippedExampleConfigLoads(t *testing.T) {
 	if cfg.Region != "cn-hangzhou" {
 		t.Errorf("region = %q, want cn-hangzhou", cfg.Region)
 	}
-	if cfg.Log.Requests != "basic" {
-		t.Errorf("log.requests = %q, want basic", cfg.Log.Requests)
+	// Left unset in the template so the transport-derived default applies.
+	if cfg.Log.Requests != "" {
+		t.Errorf("log.requests = %q, want empty in the template", cfg.Log.Requests)
 	}
 	// The endpoint keys must exist and stay empty so the region defaults apply.
 	for name, got := range map[string]string{

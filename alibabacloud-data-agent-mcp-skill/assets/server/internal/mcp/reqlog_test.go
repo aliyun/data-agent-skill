@@ -192,6 +192,53 @@ func TestRequestLogPairsIDs(t *testing.T) {
 	}
 }
 
+// A standalone deployment listens on a port and owns its log, so calls are
+// recorded by default. Under stdio the host agent owns the console.
+func TestDefaultRequestLogLevelDependsOnTransport(t *testing.T) {
+	for transport, want := range map[string]RequestLogLevel{
+		"streamable-http": RequestLogBasic,
+		"sse":             RequestLogBasic,
+		"stdio":           RequestLogOff,
+		"":                RequestLogOff,
+	} {
+		t.Setenv("MCP_TRANSPORT", transport)
+		s := New(nil, nil, "test")
+		if s.reqLog != want {
+			t.Errorf("MCP_TRANSPORT=%q: default level = %v, want %v", transport, s.reqLog, want)
+		}
+	}
+}
+
+func TestApplyRequestLogConfig(t *testing.T) {
+	t.Setenv("MCP_TRANSPORT", "streamable-http")
+
+	// An unset value must not erase the transport default.
+	s := New(nil, nil, "test")
+	s.ApplyRequestLogConfig("")
+	if s.reqLog != RequestLogBasic {
+		t.Errorf("empty config changed the default to %v", s.reqLog)
+	}
+	s.ApplyRequestLogConfig("   ")
+	if s.reqLog != RequestLogBasic {
+		t.Errorf("blank config changed the default to %v", s.reqLog)
+	}
+
+	// An explicit value wins, including switching logging off on a
+	// standalone deployment.
+	s.ApplyRequestLogConfig("off")
+	if s.reqLog != RequestLogOff {
+		t.Errorf("explicit off ignored, got %v", s.reqLog)
+	}
+
+	// And it can raise the level under stdio, where the default is off.
+	t.Setenv("MCP_TRANSPORT", "stdio")
+	s = New(nil, nil, "test")
+	s.ApplyRequestLogConfig("full")
+	if s.reqLog != RequestLogFull {
+		t.Errorf("explicit full ignored under stdio, got %v", s.reqLog)
+	}
+}
+
 func TestQuoteForLogTruncatesAndFlattens(t *testing.T) {
 	got := quoteForLog("line1\nline2")
 	if strings.Contains(got, "\n") {

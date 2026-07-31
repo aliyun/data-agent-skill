@@ -86,11 +86,12 @@ type dataAgentClient interface {
 }
 
 func New(mgr *session.Manager, client *dataagent.Client, version string) *Server {
+	standalone := isRemoteTransport(os.Getenv("MCP_TRANSPORT"))
 	s := &Server{
 		mgr: mgr, client: client, version: version,
 		hdrUser: "x-aily-user", hdrEmail: "x-aily-email", hdrToken: "x-aily-token",
-		remoteCaller: isRemoteTransport(os.Getenv("MCP_TRANSPORT")),
-		reqLog:       RequestLogBasic,
+		remoteCaller: standalone,
+		reqLog:       defaultRequestLogLevel(standalone),
 	}
 
 	mcpServer := server.NewMCPServer(

@@ -36,7 +36,7 @@ Lookup order: `$DATA_AGENT_CONFIG` > `./config.yaml` > `~/.data-agent/config.yam
 | `api_key_endpoint` | `dataagent-{region}.aliyuncs.com` | API Key control-plane host (ignored with AK/SK auth) |
 | `api_key_stream_endpoint` | `dataagent-stream-{region}.aliyuncs.com` | API Key streaming-plane host (ignored with AK/SK auth) |
 | `upload.allowed_dirs` | `[]` (empty) | Directories `data_agent_upload_file` may read. HTTP transports refuse every upload while empty (fail-closed); stdio stays unrestricted until the list is set |
-| `log.requests` | `basic` | Per-tool-call logging: `basic` (tool, caller, outcome, duration) \| `full` (adds redacted arguments) \| `off`. The identity token is never logged |
+| `log.requests` | `basic` on HTTP transports, `off` on stdio | Per-tool-call logging: `basic` (tool, caller, outcome, duration) \| `full` (adds redacted arguments) \| `off`. A standalone deployment logs by default; stdio stays quiet because the host agent owns the console. The identity token is never logged |
 | `sts.endpoint` | `sts.{region}.aliyuncs.com` | STS endpoint used for AssumeRole |
 | `sts.session_expiration` | `3600` | Temporary credential lifetime in seconds |
 | `identity.enabled` | `false` | Turn on multi-tenant identity mapping (HTTP/SSE transports only; legacy section name `aily` still accepted) |
@@ -64,7 +64,7 @@ The `.env` file (path: `$DATA_AGENT_ENV_FILE`, else `./.env`) is loaded into the
 | `AILY_SHARED_SECRET` / `IDENTITY_SHARED_SECRET` / `IDENTITY_AUTH_TOKEN` | Overrides `identity.auth_token` |
 | `MCP_TRANSPORT` / `MCP_PORT` | `stdio` (default) \| `streamable-http` \| `sse`; port is required for HTTP transports |
 | `DATA_AGENT_UPLOAD_DIRS` | Path list (`:`-separated) confining `data_agent_upload_file`; overrides `upload.allowed_dirs`. Required on HTTP transports, which otherwise refuse uploads |
-| `DATA_AGENT_LOG_REQUESTS` | `basic` (default) \| `full` \| `off`; overrides `log.requests` |
+| `DATA_AGENT_LOG_REQUESTS` | `basic` \| `full` \| `off`; overrides `log.requests`. Unset = `basic` on HTTP transports, `off` on stdio |
 | `DATA_AGENT_DEBUG_SSE` | `1` = log raw SSE traffic (debugging) |
 
 ## Identity & RAM Role Assumption (how 角色扮演 works)

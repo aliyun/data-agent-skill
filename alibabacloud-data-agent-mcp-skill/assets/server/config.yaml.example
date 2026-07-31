@@ -50,14 +50,16 @@ upload:
 # the HTTP transports the supervisor (systemd, container runtime) does.
 log:
   # Per-tool-call logging:
-  #   basic (default) — tool name, caller identity, outcome, duration
-  #   full            — adds arguments with sensitive values redacted; these
-  #                     carry user questions and table names, so prefer it for
-  #                     troubleshooting rather than steady-state operation
-  #   off             — no per-call logging
-  # The identity token is never logged at any level.
+  #   basic — tool name, caller identity, outcome, duration
+  #   full  — adds arguments with sensitive values redacted; these carry user
+  #           questions and table names, so prefer it for troubleshooting
+  #           rather than steady-state operation
+  #   off   — no per-call logging
+  # Empty keeps the transport default: basic for a standalone deployment
+  # (streamable-http / sse), off under stdio where the host agent owns the
+  # console. The identity token is never logged at any level.
   # Env override: DATA_AGENT_LOG_REQUESTS.
-  requests: basic
+  requests: ""
 
 # Multi-tenant identity mode (generic; legacy section name "aily" still works).
 # The upstream caller (Feishu Aily, a gateway, a portal, ...) forwards the
