@@ -110,7 +110,7 @@ func (s *Server) startToolCall(ctx context.Context, req mcp.CallToolRequest) *ca
 		srv:    s,
 		id:     newRequestID(),
 		tool:   req.Params.Name,
-		caller: callerFromContext(ctx),
+		caller: callerFromContext(ctx, s.jwtIdentity),
 		start:  time.Now(),
 	}
 
@@ -145,8 +145,27 @@ func (r *callRecord) finish(res *mcp.CallToolResult, err error) {
 // callerFromContext describes who issued the call. On the HTTP transports the
 // identity headers are in the context; stdio has no identity, so the caller is
 // the local process. The identity token is deliberately never included.
-func callerFromContext(ctx context.Context) string {
+//
+// jwtMode reports whether identity comes from a signed token. In that mode the
+// plain headers are not trustworthy and verification has not run yet when this
+// line is written, so the header values are deliberately not presented as the
+// caller — doing so would attribute a rejected request to whoever the sender
+// claimed to be.
+func callerFromContext(ctx context.Context, jwtMode bool) string {
+	if c := tenant.ClaimsFromContext(ctx); c != nil {
+		return identityLabel(c.UserID, c.Email)
+	}
+	if jwtMode {
+		if tenant.JWTFromContext(ctx) != "" {
+			return "jwt(unverified)"
+		}
+		return "-"
+	}
 	user, email, _ := tenant.IdentityFromContext(ctx)
+	return identityLabel(user, email)
+}
+
+func identityLabel(user, email string) string {
 	switch {
 	case user != "" && email != "":
 		return user + "/" + email

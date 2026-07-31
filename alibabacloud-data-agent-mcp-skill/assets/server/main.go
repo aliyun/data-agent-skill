@@ -86,6 +86,9 @@ func main() {
 	if cfg.Identity.Enabled {
 		registry := tenant.NewRegistry(ctx, cfg, cred)
 		srv.SetIdentityHeaders(cfg.Identity.Headers.User, cfg.Identity.Headers.Email, cfg.Identity.Headers.Token)
+		if cfg.Identity.JWT.Enabled {
+			srv.EnableJWTIdentity(cfg.Identity.JWT.Header)
+		}
 		srv.SetResolver(func(reqCtx context.Context) (*session.Manager, *dataagent.Client, mcpserver.SessionDefaults, error) {
 			t, err := registry.Resolve(reqCtx)
 			if err != nil {
@@ -100,9 +103,15 @@ func main() {
 			}
 			return t.Manager, t.Client, defaults, nil
 		})
-		log.Printf("identity multi-tenant mode enabled (default_group=%v, groups=%d, require_identity=%v, headers=%s/%s)",
-			cfg.Identity.Default != nil && cfg.Identity.Default.RoleArn != "", len(cfg.Identity.Groups),
-			cfg.Identity.RequireIdentity, cfg.Identity.Headers.User, cfg.Identity.Headers.Email)
+		if cfg.Identity.JWT.Enabled {
+			log.Printf("identity multi-tenant mode enabled (jwt=%s, session_name_claim=%s, default_group=%v, groups=%d)",
+				cfg.Identity.JWT.Header, cfg.Identity.SessionNameClaim,
+				cfg.Identity.Default != nil && cfg.Identity.Default.RoleArn != "", len(cfg.Identity.Groups))
+		} else {
+			log.Printf("identity multi-tenant mode enabled (default_group=%v, groups=%d, require_identity=%v, headers=%s/%s)",
+				cfg.Identity.Default != nil && cfg.Identity.Default.RoleArn != "", len(cfg.Identity.Groups),
+				cfg.Identity.RequireIdentity, cfg.Identity.Headers.User, cfg.Identity.Headers.Email)
+		}
 	}
 
 	if err := srv.Run(ctx); err != nil {

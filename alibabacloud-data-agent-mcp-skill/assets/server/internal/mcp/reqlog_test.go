@@ -239,6 +239,60 @@ func TestApplyRequestLogConfig(t *testing.T) {
 	}
 }
 
+// In JWT mode the plain headers are unverified, so a rejected request must not
+// be attributed in the log to whoever the sender claimed to be.
+func TestRequestLogDoesNotTrustHeadersInJWTMode(t *testing.T) {
+	const spoofed = "7620774801438674448"
+
+	s := &Server{reqLog: RequestLogBasic, jwtIdentity: true}
+	ctx := tenant.WithIdentity(context.Background(), spoofed, "victim@example.com", "")
+	out := captureLog(t, func() {
+		rec := s.startToolCall(ctx, callReq("data_agent_list_workspaces", nil))
+		rec.finish(mcp.NewToolResultError("identity request rejected"), nil)
+	})
+	if strings.Contains(out, spoofed) {
+		t.Errorf("unverified header identity was logged as the caller: %q", out)
+	}
+	if !strings.Contains(out, "caller=-") {
+		t.Errorf("expected an anonymous caller, got %q", out)
+	}
+
+	// A token present but not yet verified is reported as such.
+	ctx = tenant.WithJWT(tenant.WithIdentity(context.Background(), spoofed, "", ""), "some.jwt.token")
+	out = captureLog(t, func() {
+		rec := s.startToolCall(ctx, callReq("data_agent_list_workspaces", nil))
+		rec.finish(mcp.NewToolResultError("rejected"), nil)
+	})
+	if strings.Contains(out, spoofed) {
+		t.Errorf("unverified header identity leaked: %q", out)
+	}
+	if !strings.Contains(out, "jwt(unverified)") {
+		t.Errorf("expected jwt(unverified) caller, got %q", out)
+	}
+
+	// Verified claims are what gets attributed.
+	ctx = tenant.WithClaims(context.Background(), &tenant.Claims{UserID: spoofed, Email: "real@example.com"})
+	out = captureLog(t, func() {
+		rec := s.startToolCall(ctx, callReq("data_agent_list_workspaces", nil))
+		rec.finish(mcp.NewToolResultText("ok"), nil)
+	})
+	if !strings.Contains(out, spoofed+"/real@example.com") {
+		t.Errorf("verified claims should be logged as the caller: %q", out)
+	}
+
+	// Header mode keeps its existing behaviour: auth_token is what vouches
+	// for those headers, so they are the caller.
+	s = &Server{reqLog: RequestLogBasic}
+	ctx = tenant.WithIdentity(context.Background(), "ou_alice", "", "")
+	out = captureLog(t, func() {
+		rec := s.startToolCall(ctx, callReq("t", nil))
+		rec.finish(mcp.NewToolResultText("ok"), nil)
+	})
+	if !strings.Contains(out, "caller=ou_alice") {
+		t.Errorf("header mode should still report the header identity: %q", out)
+	}
+}
+
 func TestQuoteForLogTruncatesAndFlattens(t *testing.T) {
 	got := quoteForLog("line1\nline2")
 	if strings.Contains(got, "\n") {

@@ -31,6 +31,10 @@ type Server struct {
 	hdrUser  string
 	hdrEmail string
 	hdrToken string
+	hdrJWT   string
+	// jwtIdentity is true when identity comes from a signed token, so the
+	// plain identity headers must not be treated as the caller.
+	jwtIdentity bool
 
 	// uploadRoots confines data_agent_upload_file to these directories
 	// (empty = no allowlist configured).
@@ -90,6 +94,7 @@ func New(mgr *session.Manager, client *dataagent.Client, version string) *Server
 	s := &Server{
 		mgr: mgr, client: client, version: version,
 		hdrUser: "x-aily-user", hdrEmail: "x-aily-email", hdrToken: "x-aily-token",
+		hdrJWT:       tenant.DefaultJWTHeader,
 		remoteCaller: standalone,
 		reqLog:       defaultRequestLogLevel(standalone),
 	}
@@ -137,6 +142,15 @@ func (s *Server) SetIdentityHeaders(user, email, token string) {
 	}
 	if token != "" {
 		s.hdrToken = token
+	}
+}
+
+// EnableJWTIdentity switches identity intake to the upstream-signed token and
+// names the header carrying it (empty keeps the x-aily-jwt default).
+func (s *Server) EnableJWTIdentity(header string) {
+	s.jwtIdentity = true
+	if header != "" {
+		s.hdrJWT = header
 	}
 }
 
@@ -250,8 +264,10 @@ func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest
 }
 
 // identityHTTPContext copies the identity headers into the request context
-// so tool handlers can resolve the per-user tenant.
+// so tool handlers can resolve the per-user tenant. The JWT is passed through
+// unverified; the tenant registry owns the secret and does the verification.
 func (s *Server) identityHTTPContext(ctx context.Context, r *http.Request) context.Context {
+	ctx = tenant.WithJWT(ctx, strings.TrimSpace(r.Header.Get(s.hdrJWT)))
 	return tenant.WithIdentity(ctx,
 		r.Header.Get(s.hdrUser),
 		r.Header.Get(s.hdrEmail),

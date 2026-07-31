@@ -4,6 +4,7 @@ go 1.23
 
 require (
 	github.com/aliyun/credentials-go v1.3.10
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/mark3labs/mcp-go v0.32.0
 	gopkg.in/yaml.v3 v3.0.1
 )

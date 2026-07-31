@@ -75,6 +75,23 @@ log:
 #      defaults, and lists its member users.
 identity:
   enabled: false
+  # Upstream-signed identity (Feishu Aily "JWT 身份验签"). The platform signs
+  # the end-user identity with an HS256 secret shown in its MCP editor and
+  # sends it on every request, so the signature both identifies the user and
+  # proves the request came from the platform — identity headers alone are
+  # forgeable, a verified token is not. Once enabled, a request without a
+  # valid token is always rejected and auth_token is not needed.
+  jwt:
+    enabled: false
+    secret: ""            # HMAC key, used as-is (no base64). Prefer .env / env IDENTITY_JWT_SECRET
+    header: ""            # default: x-aily-jwt (bare token, no "Bearer " prefix)
+  # Which identity field becomes the STS RoleSessionName segment
+  # ("<session_name_prefix>-<value>"), i.e. what ActionTrail records:
+  #   user_id (default) | email | enterprise_email | employee_no
+  #   | tenant_id | agent_id
+  # Group membership is always matched on user_id and email, independent of
+  # this setting, so changing it does not affect role mapping.
+  session_name_claim: user_id
   # Reject requests without identity headers instead of using the server identity.
   require_identity: true
   # Caller authentication: must equal the token header on every request, so

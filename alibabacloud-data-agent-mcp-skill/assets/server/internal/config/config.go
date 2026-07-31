@@ -45,10 +45,27 @@ type IdentityHeaders struct {
 	Token string `yaml:"token"` // default: x-aily-token
 }
 
+// JWT configures verification of the upstream-signed identity token.
+//
+// Feishu Aily signs the end-user identity with a platform-generated HS256
+// secret and sends it as a header on every MCP request. A verified token
+// authenticates the caller by itself, so auth_token is not needed alongside it.
+type JWT struct {
+	Enabled bool `yaml:"enabled"`
+	// Secret is the HMAC key shown in the platform's MCP editor, used as-is
+	// (no base64 decoding). Keep it in .env, not here.
+	// Env override: IDENTITY_JWT_SECRET.
+	Secret string `yaml:"secret"`
+	// Header names the request header carrying the token.
+	// Default: x-aily-jwt.
+	Header string `yaml:"header"`
+}
+
 // Identity configures multi-tenant identity resolution. The upstream caller
 // (e.g. Feishu Aily) forwards the end-user identity on every MCP HTTP
-// request through the configured headers; the server maps that identity to a
-// RAM role via STS AssumeRole and executes all calls under it.
+// request — either as a signed JWT (identity.jwt) or through the configured
+// headers — and the server maps that identity to a RAM role via STS AssumeRole
+// and executes all calls under it.
 //
 // Two ways to map users to RAM roles:
 //  1. Default (global sharing): identity.default carries one role plus
@@ -57,6 +74,14 @@ type IdentityHeaders struct {
 //     own role and defaults. Group membership wins over the default.
 type Identity struct {
 	Enabled bool `yaml:"enabled"`
+	// JWT enables verification of the upstream-signed identity token.
+	JWT JWT `yaml:"jwt"`
+	// SessionNameClaim selects which identity field becomes the STS
+	// RoleSessionName segment: user_id (default), email, enterprise_email,
+	// employee_no, tenant_id or agent_id. The name shows up in ActionTrail,
+	// so pick the field your audit process recognises. Group membership is
+	// always matched on user_id and email, independent of this setting.
+	SessionNameClaim string `yaml:"session_name_claim"`
 	// RequireIdentity rejects requests without identity headers instead of
 	// falling back to the default (server) identity.
 	RequireIdentity bool `yaml:"require_identity"`
@@ -288,6 +313,9 @@ func Load() (Config, string, error) {
 	if v := os.Getenv("IDENTITY_AUTH_TOKEN"); v != "" {
 		cfg.Identity.AuthToken = v
 	}
+	if v := os.Getenv("IDENTITY_JWT_SECRET"); v != "" {
+		cfg.Identity.JWT.Secret = v
+	}
 	// Colon-separated on Unix, semicolon-separated on Windows (os.PathListSeparator).
 	if v := os.Getenv("DATA_AGENT_UPLOAD_DIRS"); v != "" {
 		cfg.Upload.AllowedDirs = filepath.SplitList(v)
@@ -338,6 +366,34 @@ func (c *Config) ApplyDefaults() {
 	if c.Identity.SessionNamePrefix == "" {
 		c.Identity.SessionNamePrefix = "aily" // keeps historical "aily-<user>" RoleSessionName
 	}
+	if c.Identity.JWT.Header == "" {
+		c.Identity.JWT.Header = "x-aily-jwt"
+	}
+	if c.Identity.SessionNameClaim == "" {
+		c.Identity.SessionNameClaim = "user_id"
+	}
+}
+
+// validSessionNameClaims are the identity fields that may be used as the STS
+// RoleSessionName segment. Kept in sync with tenant.Claims.Field.
+var validSessionNameClaims = []string{
+	"user_id", "email", "enterprise_email", "employee_no", "tenant_id", "agent_id",
+}
+
+// isValidSessionNameClaim reports whether the configured claim name is usable.
+// An empty name is accepted: ApplyDefaults fills it with user_id, and
+// tenant.Claims.Field treats "" the same way, so validate() does not depend on
+// having been called after ApplyDefaults.
+func isValidSessionNameClaim(name string) bool {
+	if name == "" {
+		return true
+	}
+	for _, v := range validSessionNameClaims {
+		if name == v {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Config) validate() error {
@@ -347,6 +403,13 @@ func (c *Config) validate() error {
 		}
 		if (c.Identity.Default == nil || c.Identity.Default.RoleArn == "") && len(c.Identity.Groups) == 0 {
 			return fmt.Errorf("identity.enabled requires identity.default.role_arn or at least one identity.groups entry")
+		}
+		if c.Identity.JWT.Enabled && c.Identity.JWT.Secret == "" {
+			return fmt.Errorf("identity.jwt.enabled requires identity.jwt.secret (or env IDENTITY_JWT_SECRET)")
+		}
+		if !isValidSessionNameClaim(c.Identity.SessionNameClaim) {
+			return fmt.Errorf("identity.session_name_claim %q is not one of %s",
+				c.Identity.SessionNameClaim, strings.Join(validSessionNameClaims, ", "))
 		}
 		seen := map[string]string{}
 		for name, g := range c.Identity.Groups {

@@ -40,9 +40,13 @@ Lookup order: `$DATA_AGENT_CONFIG` > `./config.yaml` > `~/.data-agent/config.yam
 | `sts.endpoint` | `sts.{region}.aliyuncs.com` | STS endpoint used for AssumeRole |
 | `sts.session_expiration` | `3600` | Temporary credential lifetime in seconds |
 | `identity.enabled` | `false` | Turn on multi-tenant identity mapping (HTTP/SSE transports only; legacy section name `aily` still accepted) |
+| `identity.jwt.enabled` | `false` | Verify the upstream-signed identity token (Feishu Aily JWT). Once on, a request without a valid token is rejected and `auth_token` is unnecessary |
+| `identity.jwt.secret` | — | HS256 key from the platform's MCP editor, used as-is (no base64). Prefer `IDENTITY_JWT_SECRET` in `.env` |
+| `identity.jwt.header` | `x-aily-jwt` | Header carrying the bare token (no `Bearer ` prefix) |
+| `identity.session_name_claim` | `user_id` | Identity field used as the STS RoleSessionName segment: `user_id` \| `email` \| `enterprise_email` \| `employee_no` \| `tenant_id` \| `agent_id`. Group matching always uses `user_id`/`email` regardless |
 | `identity.require_identity` | `false` | Reject requests without identity headers instead of using the server identity |
 | `identity.auth_token` | — | Caller authentication token; must equal the token header on every request (legacy name `shared_secret` still accepted) |
-| `identity.session_name_prefix` | `aily` | STS RoleSessionName = `<prefix>-<user_id>` |
+| `identity.session_name_prefix` | `aily` | STS RoleSessionName = `<prefix>-<session_name_claim value>` |
 | `identity.headers.user/email/token` | `x-aily-user` / `x-aily-email` / `x-aily-token` | Identity header names (rename for non-Aily upstreams) |
 | `identity.default` | — | **Style 1 — global sharing**: one role (+ optional `workspace_id` / `custom_agent_id` / `mode` defaults) for every identified user |
 | `identity.groups.<name>` | — | **Style 2 — groups**: per-group `role_arn` + session defaults + `users` list (user id or email; one group per user; wins over default) |
@@ -62,6 +66,7 @@ The `.env` file (path: `$DATA_AGENT_ENV_FILE`, else `./.env`) is loaded into the
 | `DATA_AGENT_API_KEY_ENDPOINT` / `DATA_AGENT_API_KEY_STREAM_ENDPOINT` | API Key control/streaming hosts; override `api_key_endpoint` / `api_key_stream_endpoint` |
 | `DATA_AGENT_CONFIG` / `DATA_AGENT_ENV_FILE` | Explicit config / .env file paths |
 | `AILY_SHARED_SECRET` / `IDENTITY_SHARED_SECRET` / `IDENTITY_AUTH_TOKEN` | Overrides `identity.auth_token` |
+| `IDENTITY_JWT_SECRET` | Overrides `identity.jwt.secret` (HS256 key for the upstream-signed identity token) |
 | `MCP_TRANSPORT` / `MCP_PORT` | `stdio` (default) \| `streamable-http` \| `sse`; port is required for HTTP transports |
 | `DATA_AGENT_UPLOAD_DIRS` | Path list (`:`-separated) confining `data_agent_upload_file`; overrides `upload.allowed_dirs`. Required on HTTP transports, which otherwise refuse uploads |
 | `DATA_AGENT_LOG_REQUESTS` | `basic` \| `full` \| `off`; overrides `log.requests`. Unset = `basic` on HTTP transports, `off` on stdio |
@@ -94,14 +99,16 @@ The server does no login of its own — it trusts the upstream platform to say *
 
 For Feishu Aily nothing needs to be configured — the defaults match. To integrate another upstream (an internal gateway sending `x-gateway-uid`, a portal, a bot platform), just rename the headers here; no code changes are needed.
 
+**`identity.jwt` — the identity Aily signs for you.** Feishu Aily can sign the end-user identity into a JWT (HS256) and send it as `x-aily-jwt` on every request, using a secret shown in its MCP editor. Because only the platform holds that secret, a verified token both identifies the user and proves the request came from the platform — so `auth_token` becomes unnecessary. Verification pins the algorithm to HS256 and requires `exp`, and once `identity.jwt.enabled` is on a request without a valid token is **always** rejected (even with `require_identity: false`), because falling back to the server identity would hand the server's own permissions to an unauthenticated caller. Claims consumed: `user_id`, `tenant_id`, `email`, `enterprise_email`, `employee_no`, `department_ids`, `agent_id`.
+
 **`identity.auth_token` — why the identity can be trusted.** Identity headers are plain HTTP headers: anyone who can reach the endpoint could forge `x-aily-user: <someone else>`. When `auth_token` is set, the token header must match it **before any group resolution happens**, so only the upstream platform that knows the token can act on behalf of users. Set the same value as a custom header in the upstream MCP registration (env override: `IDENTITY_AUTH_TOKEN`; legacy `shared_secret` yaml key and `AILY_SHARED_SECRET` env still work).
 
-1. **Identity intake** — the upstream adds the user id / email headers (names configurable via `identity.headers`; defaults `x-aily-user` / `x-aily-email`); the server copies them into the request context. stdio transport has no headers, so identity mode applies to HTTP/SSE only.
-2. **Legitimacy check** — if `auth_token` is set, the token header must match, otherwise the request is rejected before any group resolution.
+1. **Identity intake** — either a signed `x-aily-jwt` (when `identity.jwt.enabled`) or the plain user id / email headers (names configurable via `identity.headers`; defaults `x-aily-user` / `x-aily-email`). stdio transport has no headers, so identity mode applies to HTTP/SSE only.
+2. **Legitimacy check** — with JWT enabled the signature and `exp` are verified (missing/invalid → rejected); otherwise, if `auth_token` is set, the token header must match. Either way this happens before any group resolution.
 3. **Group resolution (first match wins)** — membership in a named `identity.groups.<name>` (matched by user id or email) → `identity.default` (catch-all) → **reject** (fail-closed; never silently falls back to the server identity). Missing identity headers are rejected too when `require_identity: true`.
-4. **AssumeRole** — the base AK/SK calls STS AssumeRole on the group's role with `RoleSessionName = <session_name_prefix>-<user_id>` (default prefix `aily`; sanitized, ≤64 chars). Temporary credentials are cached and **auto-refreshed before expiry** (credentials-go `ram_role_arn` provider); long-running SSE watchers pick up rotated tokens transparently.
+4. **AssumeRole** — the base AK/SK calls STS AssumeRole on the group's role with `RoleSessionName = <session_name_prefix>-<value of identity.session_name_claim>` (default `aily-<user_id>`; sanitized, ≤64 chars). Temporary credentials are cached and **auto-refreshed before expiry** (credentials-go `ram_role_arn` provider); long-running SSE watchers pick up rotated tokens transparently.
 5. **Per-user tenant isolation** — every identified user gets a dedicated API client and session store at `sessions_dir/identity/<user>/`, even when many users share one role (default group). Session listing/status/results never leak across users. The group's `workspace_id` / `custom_agent_id` / `mode` become session defaults when `data_agent_create_session` omits them.
-6. **Authorization & audit** — what a user can query is decided entirely by the RAM policies and DMS data permissions attached to the group's role; the MCP server does no data-level authorization itself. In ActionTrail every call shows as `assumed-role/<role>/<prefix>-<user_id>`, so per-user attribution survives shared roles.
+6. **Authorization & audit** — what a user can query is decided entirely by the RAM policies and DMS data permissions attached to the group's role; the MCP server does no data-level authorization itself. In ActionTrail every call shows as `assumed-role/<role>/<prefix>-<session_name_claim value>`, so per-user attribution survives shared roles.
 
 RAM prerequisites:
 

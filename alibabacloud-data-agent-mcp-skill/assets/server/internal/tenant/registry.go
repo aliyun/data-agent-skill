@@ -143,14 +143,26 @@ func NewRegistry(baseCtx context.Context, cfg config.Config, base *dataagent.Cre
 
 // Resolve returns the tenant for the identity carried in ctx.
 //
+// Two identity sources, in order of trust:
+//   - identity.jwt.enabled: the upstream platform signs the identity, so the
+//     signature both identifies the user and authenticates the caller. The
+//     token is mandatory once enabled.
+//   - identity headers: plain text, so identity.auth_token is what proves the
+//     request came from the trusted upstream.
+//
 // Fail-closed rules when identity mode is enabled:
-//   - shared_secret configured but header missing/mismatched → error
-//   - identity headers absent and require_identity=true → error
+//   - JWT enabled but missing or unverifiable → error
+//   - auth_token configured but header missing/mismatched → error
+//   - identity absent and require_identity=true → error
 //   - identity present but no role mapping → error
 //
-// When identity headers are absent and require_identity=false, (nil, nil) is
-// returned and the caller falls back to the default server identity.
+// When identity is absent and require_identity=false, (nil, nil) is returned
+// and the caller falls back to the default server identity.
 func (r *Registry) Resolve(ctx context.Context) (*Tenant, error) {
+	if r.cfg.Identity.JWT.Enabled {
+		return r.resolveFromJWT(ctx)
+	}
+
 	user, email, token := IdentityFromContext(ctx)
 
 	if r.cfg.Identity.AuthToken != "" && token != r.cfg.Identity.AuthToken {
@@ -174,16 +186,61 @@ func (r *Registry) Resolve(ctx context.Context) (*Tenant, error) {
 	if key == "" {
 		key = email
 	}
-	return r.tenant(key, groupName, mapped)
+	return r.tenant(key, groupName, mapped, key)
+}
+
+// resolveFromJWT verifies the signed identity token and resolves its tenant.
+//
+// A missing token is always rejected here, regardless of require_identity:
+// turning JWT on is an explicit statement that every caller presents one, so
+// falling back to the server's own identity would silently hand the server's
+// permissions to an unauthenticated caller.
+func (r *Registry) resolveFromJWT(ctx context.Context) (*Tenant, error) {
+	raw := JWTFromContext(ctx)
+	if raw == "" {
+		return nil, fmt.Errorf("identity request rejected: %s header required", r.cfg.Identity.JWT.Header)
+	}
+
+	claims, err := VerifyJWT(raw, r.cfg.Identity.JWT.Secret)
+	if err != nil {
+		return nil, fmt.Errorf("identity request rejected: %w", err)
+	}
+
+	// Groups list members by user id or email, so match on those regardless of
+	// which claim was chosen for the session name.
+	groupName, mapped, err := r.cfg.ResolveGroup(claims.UserID, claims.Email)
+	if err != nil {
+		return nil, err
+	}
+
+	key := claims.UserID
+	if key == "" {
+		key = claims.Email
+	}
+
+	sessionValue, err := claims.Field(r.cfg.Identity.SessionNameClaim)
+	if err != nil {
+		return nil, fmt.Errorf("identity request rejected: %w", err)
+	}
+	if sessionValue == "" {
+		return nil, fmt.Errorf("identity request rejected: claim %q selected for the role session name is empty in the token",
+			r.cfg.Identity.SessionNameClaim)
+	}
+
+	return r.tenant(key, groupName, mapped, sessionValue)
 }
 
 // tenant returns the cached tenant for the user or creates it.
 //
 // The cache is keyed by user identity, not group/role: several users may
 // share one RAM role, but each must get its own STS provider so AssumeRole
-// carries that user's RoleSessionName (<prefix>-<user id>) in ActionTrail
-// audit logs, and its own session manager/directory for isolation.
-func (r *Registry) tenant(key, groupName string, mapped config.IdentityGroup) (*Tenant, error) {
+// carries that user's RoleSessionName in ActionTrail audit logs, and its own
+// session manager/directory for isolation.
+//
+// sessionValue is the identity field chosen for the RoleSessionName, which is
+// not necessarily the cache key: identity.session_name_claim may select e.g.
+// the employee number while grouping and isolation still key on the user id.
+func (r *Registry) tenant(key, groupName string, mapped config.IdentityGroup, sessionValue string) (*Tenant, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -191,7 +248,7 @@ func (r *Registry) tenant(key, groupName string, mapped config.IdentityGroup) (*
 		return t, nil
 	}
 
-	provider, err := r.newProviderFn(key, mapped.RoleArn)
+	provider, err := r.newProviderFn(sessionValue, mapped.RoleArn)
 	if err != nil {
 		return nil, fmt.Errorf("assume role %s for user %s: %w", mapped.RoleArn, key, err)
 	}
@@ -231,7 +288,7 @@ func (r *Registry) tenant(key, groupName string, mapped config.IdentityGroup) (*
 
 	r.tenants[key] = t
 	log.Printf("tenant created: user=%s group=%s role=%s session_name=%s sessions=%s",
-		key, groupName, mapped.RoleArn, sessionName(r.cfg.Identity.SessionNamePrefix, key), sessDir)
+		key, groupName, mapped.RoleArn, sessionName(r.cfg.Identity.SessionNamePrefix, sessionValue), sessDir)
 	return t, nil
 }
 
@@ -239,13 +296,15 @@ func (r *Registry) tenant(key, groupName string, mapped config.IdentityGroup) (*
 // STS AssumeRole with the base AK/SK and transparently refreshes the
 // temporary credential before expiry (same mechanism as the Java demo's
 // AgentAssumeRoleLoginHelper.assumeRole, minus the manual refresh).
-func (r *Registry) newRoleProvider(key, roleArn string) (credential.Credential, error) {
+//
+// sessionValue is the identity field selected by identity.session_name_claim.
+func (r *Registry) newRoleProvider(sessionValue, roleArn string) (credential.Credential, error) {
 	conf := new(credential.Config).
 		SetType("ram_role_arn").
 		SetAccessKeyId(r.base.AccessKeyID).
 		SetAccessKeySecret(r.base.AccessKeySecret).
 		SetRoleArn(roleArn).
-		SetRoleSessionName(sessionName(r.cfg.Identity.SessionNamePrefix, key)).
+		SetRoleSessionName(sessionName(r.cfg.Identity.SessionNamePrefix, sessionValue)).
 		SetRoleSessionExpiration(r.cfg.STS.SessionExpiration).
 		SetSTSEndpoint(r.cfg.STSEndpoint())
 	if r.base.SecurityToken != "" {

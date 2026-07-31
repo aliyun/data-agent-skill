@@ -188,6 +188,7 @@ upload:
 | `DATA_AGENT_CONFIG` | auto-discovered | YAML config file path |
 | `DATA_AGENT_ENV_FILE` | `./.env` | .env file path |
 | `AILY_SHARED_SECRET` / `IDENTITY_SHARED_SECRET` / `IDENTITY_AUTH_TOKEN` | — | Overrides `identity.auth_token` for caller authentication |
+| `IDENTITY_JWT_SECRET` | — | Overrides `identity.jwt.secret`, the HS256 key verifying the upstream-signed identity token |
 | `MCP_TRANSPORT` / `MCP_PORT` | `stdio` / — | Transport (`stdio` \| `streamable-http` \| `sse`); port required for HTTP transports |
 | `DATA_AGENT_UPLOAD_DIRS` | — | `:`-separated directories `data_agent_upload_file` may read; overrides `upload.allowed_dirs`. HTTP transports refuse uploads while unset |
 | `DATA_AGENT_LOG_REQUESTS` | `basic` on HTTP, `off` on stdio | Per-call logging: `basic` \| `full` (adds redacted arguments) \| `off`; overrides `log.requests` |
@@ -197,14 +198,19 @@ upload:
 
 ## Multi-Tenant Identity Mode (optional)
 
-Upstream callers that forward per-user identity headers (Feishu Aily by default — it sends `x-aily-user` / `x-aily-email` on every MCP HTTP request; gateways or portals work the same way) can enable `identity` in `config.yaml`. The server maps each end user to a RAM role, obtains temporary credentials via STS AssumeRole (auto-refreshed before expiry), and executes **all Data Agent calls under the end user's role**. RAM access policies and DMS data permissions attached to each role decide what that user can query — the MCP server performs no data-level authorization itself.
+Upstream callers that forward per-user identity (Feishu Aily either signs it into an `x-aily-jwt` token or sends `x-aily-user` / `x-aily-email` headers; gateways or portals work the same way) can enable `identity` in `config.yaml`. The server maps each end user to a RAM role, obtains temporary credentials via STS AssumeRole (auto-refreshed before expiry), and executes **all Data Agent calls under the end user's role**. RAM access policies and DMS data permissions attached to each role decide what that user can query — the MCP server performs no data-level authorization itself.
 
 ```yaml
 identity:                           # legacy section name "aily" still accepted
   enabled: true
   require_identity: true            # fail-closed: reject requests without identity headers
-  auth_token: ""                    # caller authentication (legacy yaml name "shared_secret"; IDENTITY_AUTH_TOKEN env)
-  session_name_prefix: ""           # RoleSessionName "<prefix>-<user_id>"; default prefix "aily"
+  jwt:                              # upstream-signed identity; supersedes auth_token
+    enabled: true
+    secret: ""                      # HS256 key from the Aily MCP editor (IDENTITY_JWT_SECRET env)
+    header: ""                      # default: x-aily-jwt (bare token, no "Bearer " prefix)
+  session_name_claim: user_id       # user_id | email | enterprise_email | employee_no | tenant_id | agent_id
+  auth_token: ""                    # caller authentication when JWT is off (legacy yaml name "shared_secret"; IDENTITY_AUTH_TOKEN env)
+  session_name_prefix: ""           # RoleSessionName "<prefix>-<session_name_claim value>"; default prefix "aily"
   headers: {user: "", email: "", token: ""}  # defaults: x-aily-user / x-aily-email / x-aily-token
   default:                          # style 1: global sharing — catch-all role + session defaults
     role_arn: acs:ram::<account-id>:role/da-default
