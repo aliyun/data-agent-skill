@@ -78,6 +78,7 @@ func main() {
 
 	srv := mcpserver.New(mgr, client, version)
 	srv.SetUploadRoots(cfg.Upload.AllowedDirs)
+	srv.SetCustomAgentID(cfg.CustomAgentID)
 	srv.ApplyRequestLogConfig(cfg.Log.Requests)
 
 	// Identity multi-tenant mode: map upstream identity headers (e.g. Feishu

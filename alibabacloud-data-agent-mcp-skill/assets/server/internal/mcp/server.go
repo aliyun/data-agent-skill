@@ -25,6 +25,9 @@ type Server struct {
 	mcp      *server.MCPServer
 	resolve  Resolver
 	defaults SessionDefaults // tenant group defaults for the current request
+	// customAgentID is the server-wide default custom agent, below any
+	// identity group default.
+	customAgentID string
 
 	// identity header names copied into the request context on HTTP/SSE
 	// transports; default to the Feishu Aily convention (x-aily-*).
@@ -51,6 +54,26 @@ type Server struct {
 type SessionDefaults struct {
 	Mode          string // default session mode (auto / lite / pro / ultra)
 	CustomAgentID string // default custom agent
+}
+
+// SetCustomAgentID sets the server-wide default custom agent, used when
+// neither the tool call nor the caller's identity group names one.
+func (s *Server) SetCustomAgentID(id string) { s.customAgentID = id }
+
+// resolveCustomAgentID picks the custom agent for a new session: the explicit
+// tool argument, else the caller's identity group default, else the
+// server-wide default. Empty means the backend's built-in agent.
+//
+// This mirrors how workspace_id resolves, except there is no auto-discovery
+// step — no agent is a valid state, so an empty result is not an error.
+func (s *Server) resolveCustomAgentID(arg string) string {
+	if arg != "" {
+		return arg
+	}
+	if s.defaults.CustomAgentID != "" {
+		return s.defaults.CustomAgentID
+	}
+	return s.customAgentID
 }
 
 // Resolver maps a request context to a tenant-scoped session manager, client,

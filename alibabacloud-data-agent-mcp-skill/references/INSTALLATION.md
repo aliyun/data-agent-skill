@@ -153,6 +153,7 @@ ALIBABA_CLOUD_ACCESS_KEY_SECRET=your-sk
 region: cn-hangzhou
 dms_unit: cn-hangzhou
 workspace_id: your-workspace-id
+custom_agent_id: ""               # default custom agent; empty = backend built-in
 sessions_dir: ~/.data-agent/sessions
 # Optional: VPC endpoint for the dms-enterprise metadata APIs when the host
 # has no public egress. Empty = dms-enterprise.{region}.aliyuncs.com.
@@ -183,6 +184,7 @@ upload:
 | `DATA_AGENT_API_KEY_ENDPOINT` | `dataagent-{region}.aliyuncs.com` | API Key control-plane host; overrides `api_key_endpoint` (ignored with AK/SK) |
 | `DATA_AGENT_API_KEY_STREAM_ENDPOINT` | `dataagent-stream-{region}.aliyuncs.com` | API Key streaming host; overrides `api_key_stream_endpoint` (ignored with AK/SK) |
 | `DATA_AGENT_WORKSPACE_ID` | auto-resolved | Workspace ID override (skip auto-resolution) |
+| `DATA_AGENT_CUSTOM_AGENT_ID` | — | Default custom agent; overrides `custom_agent_id` (identity group defaults and tool arguments win over it) |
 | `DATA_AGENT_API_KEY` | — | API Key (alternative to AK/SK, some tools unavailable) |
 | `DATA_AGENT_SESSIONS_DIR` | `~/.data-agent/sessions` | Session data directory |
 | `DATA_AGENT_CONFIG` | auto-discovered | YAML config file path |

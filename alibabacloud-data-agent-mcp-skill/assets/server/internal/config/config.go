@@ -145,8 +145,12 @@ type Config struct {
 	Region      string `yaml:"region"`
 	DMSUnit     string `yaml:"dms_unit"`
 	WorkspaceID string `yaml:"workspace_id"`
-	SessionsDir string `yaml:"sessions_dir"`
-	APIKey      string `yaml:"api_key"`
+	// CustomAgentID is the default custom agent for sessions that do not name
+	// one, mirroring workspace_id. An identity group's custom_agent_id wins
+	// over this, and an explicit tool argument wins over both.
+	CustomAgentID string `yaml:"custom_agent_id"`
+	SessionsDir   string `yaml:"sessions_dir"`
+	APIKey        string `yaml:"api_key"`
 	// DMSEnterpriseEndpoint overrides the dms-enterprise host used by the
 	// 2018-11-01 metadata APIs (database/table/instance discovery, import
 	// tagging, GetActiveRouteUnit). Empty = dms-enterprise.{region}.aliyuncs.com.
@@ -297,6 +301,9 @@ func Load() (Config, string, error) {
 	}
 	if v := os.Getenv("DATA_AGENT_WORKSPACE_ID"); v != "" {
 		cfg.WorkspaceID = v
+	}
+	if v := os.Getenv("DATA_AGENT_CUSTOM_AGENT_ID"); v != "" {
+		cfg.CustomAgentID = v
 	}
 	if v := os.Getenv("DATA_AGENT_SESSIONS_DIR"); v != "" {
 		cfg.SessionsDir = v

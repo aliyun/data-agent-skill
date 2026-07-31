@@ -147,10 +147,7 @@ func (s *Server) handleCreateSession(ctx context.Context, req mcp.CallToolReques
 		engine = "mysql"
 	}
 
-	customAgentID := argStr(req, "custom_agent_id")
-	if customAgentID == "" {
-		customAgentID = s.defaults.CustomAgentID // aily group default, if any
-	}
+	customAgentID := s.resolveCustomAgentID(argStr(req, "custom_agent_id"))
 
 	planMode := strings.ToLower(strings.TrimSpace(argStr(req, "plan_mode")))
 	if planMode != "" && planMode != "force" && planMode != "disable" {
