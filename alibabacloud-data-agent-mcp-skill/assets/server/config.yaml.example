@@ -46,6 +46,19 @@ upload:
   #  - ~/data-agent-uploads
   #  - /srv/data-agent/inbox
 
+# Logging. Everything goes to stderr: on stdio the host agent captures it, on
+# the HTTP transports the supervisor (systemd, container runtime) does.
+log:
+  # Per-tool-call logging:
+  #   basic (default) — tool name, caller identity, outcome, duration
+  #   full            — adds arguments with sensitive values redacted; these
+  #                     carry user questions and table names, so prefer it for
+  #                     troubleshooting rather than steady-state operation
+  #   off             — no per-call logging
+  # The identity token is never logged at any level.
+  # Env override: DATA_AGENT_LOG_REQUESTS.
+  requests: basic
+
 # Multi-tenant identity mode (generic; legacy section name "aily" still works).
 # The upstream caller (Feishu Aily, a gateway, a portal, ...) forwards the
 # end-user identity as HTTP headers on every MCP request. The server maps the

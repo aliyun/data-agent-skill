@@ -199,3 +199,24 @@ func TestUsersSharingRoleGetSeparateTenants(t *testing.T) {
 		t.Fatalf("provider rebuilt on cache hit: %v", sessionNames)
 	}
 }
+
+// The STS AssumeRole API signs through the query string, so provider errors
+// embed the caller's AccessKeyId and signature. Those must not reach the log.
+func TestRedactCredentials(t *testing.T) {
+	in := `Post "https://sts.cn-hangzhou.aliyuncs.com?AccessKeyId=LTAI5tSecret123&Action=AssumeRole&Signature=abc%3D&SignatureNonce=xyz&Version=2015-04-01": dial tcp: timeout`
+	got := redactCredentials(in)
+
+	for _, leak := range []string{"LTAI5tSecret123", "abc%3D"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("value %q survived redaction: %s", leak, got)
+		}
+	}
+	for _, keep := range []string{"AssumeRole", "SignatureNonce=xyz", "2015-04-01", "dial tcp: timeout"} {
+		if !strings.Contains(got, keep) {
+			t.Errorf("diagnostic detail %q was lost: %s", keep, got)
+		}
+	}
+	if !strings.Contains(got, "AccessKeyId=<redacted>") {
+		t.Errorf("expected redaction marker: %s", got)
+	}
+}

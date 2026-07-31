@@ -102,6 +102,19 @@ type Upload struct {
 	AllowedDirs []string `yaml:"allowed_dirs"`
 }
 
+// Log configures server logging. Everything goes to stderr, so on stdio the
+// host agent captures it and on the HTTP transports the process supervisor
+// (systemd, container runtime) does.
+type Log struct {
+	// Requests selects how much of every tool call is logged:
+	//   basic (default) — tool name, caller, outcome, duration
+	//   full            — adds arguments with sensitive values redacted;
+	//                     arguments carry user questions, so prefer it for
+	//                     troubleshooting rather than steady-state operation
+	//   off             — no per-call logging
+	Requests string `yaml:"requests"`
+}
+
 // Config holds all server configuration.
 type Config struct {
 	Region      string `yaml:"region"`
@@ -125,6 +138,7 @@ type Config struct {
 	APIKeyStreamEndpoint string `yaml:"api_key_stream_endpoint"`
 	STS                  STS    `yaml:"sts"`
 	Upload               Upload `yaml:"upload"`
+	Log                  Log    `yaml:"log"`
 	// Identity is the multi-tenant identity section. The legacy section
 	// name "aily" is still accepted as an alias.
 	Identity       Identity  `yaml:"identity"`
@@ -277,6 +291,9 @@ func Load() (Config, string, error) {
 	// Colon-separated on Unix, semicolon-separated on Windows (os.PathListSeparator).
 	if v := os.Getenv("DATA_AGENT_UPLOAD_DIRS"); v != "" {
 		cfg.Upload.AllowedDirs = filepath.SplitList(v)
+	}
+	if v := os.Getenv("DATA_AGENT_LOG_REQUESTS"); v != "" {
+		cfg.Log.Requests = v
 	}
 
 	cfg.SessionsDir = expandHome(cfg.SessionsDir)

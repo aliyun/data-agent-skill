@@ -38,6 +38,8 @@ type Server struct {
 	// remoteCaller is true on the HTTP transports, where the caller is not
 	// the local user and uploads must be confined to uploadRoots.
 	remoteCaller bool
+	// reqLog controls how much of each tool call reaches the log.
+	reqLog RequestLogLevel
 }
 
 // SessionDefaults are group-level fallbacks applied when a tool call omits
@@ -88,6 +90,7 @@ func New(mgr *session.Manager, client *dataagent.Client, version string) *Server
 		mgr: mgr, client: client, version: version,
 		hdrUser: "x-aily-user", hdrEmail: "x-aily-email", hdrToken: "x-aily-token",
 		remoteCaller: isRemoteTransport(os.Getenv("MCP_TRANSPORT")),
+		reqLog:       RequestLogBasic,
 	}
 
 	mcpServer := server.NewMCPServer(
@@ -223,7 +226,10 @@ func withinRoot(root, path string) bool {
 // client, and session defaults swapped in, keeping the handlers themselves
 // tenant-agnostic.
 func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error)) server.ToolHandlerFunc {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, err error) {
+		rec := s.startToolCall(ctx, req)
+		defer func() { rec.finish(res, err) }()
+
 		if s.resolve == nil {
 			return h(s, ctx, req)
 		}

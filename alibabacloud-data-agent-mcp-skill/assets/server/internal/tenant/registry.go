@@ -80,7 +80,7 @@ func (t *Tenant) currentCredential() *dataagent.Credential {
 
 	model, err := t.provider.GetCredential()
 	if err != nil {
-		log.Printf("tenant %s: refresh STS credential: %v (using last snapshot)", t.Key, err)
+		log.Printf("tenant %s: refresh STS credential: %v (using last snapshot)", t.Key, redactCredentials(err.Error()))
 		return t.snapshot
 	}
 	ak, sk, token := strVal(model.AccessKeyId), strVal(model.AccessKeySecret), strVal(model.SecurityToken)
@@ -99,6 +99,23 @@ func strVal(p *string) string {
 		return ""
 	}
 	return *p
+}
+
+// credentialQueryParams matches query-string parameters that must never reach
+// the log. STS AssumeRole (2015-04-01) signs through the query string, so an
+// error from the credentials provider embeds the full URL — including the
+// caller's AccessKeyId and request signature.
+var credentialQueryParams = regexp.MustCompile(`(?i)(AccessKeyId|AccessKeySecret|SecurityToken|Signature)=[^&"\s]*`)
+
+// redactCredentials strips credential-bearing query parameters from text that
+// is about to be logged.
+func redactCredentials(s string) string {
+	return credentialQueryParams.ReplaceAllStringFunc(s, func(m string) string {
+		if i := strings.Index(m, "="); i > 0 {
+			return m[:i+1] + "<redacted>"
+		}
+		return m
+	})
 }
 
 // Registry resolves request identities to tenants, creating them lazily.
