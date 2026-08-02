@@ -102,17 +102,26 @@ func (s *Server) handleCreateSession(ctx context.Context, req mcp.CallToolReques
 	if query == "" {
 		return mcp.NewToolResultError("query is required"), nil
 	}
-	if dbID == "" && fileID == "" {
-		return mcp.NewToolResultError("either database_id or file_id is required"), nil
+
+	// A custom agent already carries its own data source, so the caller need
+	// not name one. Resolved rather than read straight from the arguments, so a
+	// server-wide or identity-group default relaxes the requirement too.
+	customAgentID := s.resolveCustomAgentID(argStr(req, "custom_agent_id"))
+	if customAgentID == "" {
+		if dbID == "" && fileID == "" {
+			return mcp.NewToolResultError("either database_id or file_id is required (or configure a custom agent, which brings its own data source)"), nil
+		}
+		if dbID != "" && dbName == "" {
+			return mcp.NewToolResultError("db_name is required for database analysis"), nil
+		}
+		if dbID != "" && tablesStr == "" {
+			return mcp.NewToolResultError("tables is required for database analysis; call data_agent_list_imported_tables first to get available table names"), nil
+		}
 	}
+	// These stay unconditional: they catch a malformed call rather than a
+	// missing data source.
 	if dbID != "" && fileID != "" {
 		return mcp.NewToolResultError("database_id and file_id are mutually exclusive"), nil
-	}
-	if dbID != "" && dbName == "" {
-		return mcp.NewToolResultError("db_name is required for database analysis"), nil
-	}
-	if dbID != "" && tablesStr == "" {
-		return mcp.NewToolResultError("tables is required for database analysis; call data_agent_list_imported_tables first to get available table names"), nil
 	}
 	if fileID != "" && fileName == "" {
 		return mcp.NewToolResultError("file_name is required for file analysis"), nil
@@ -146,8 +155,6 @@ func (s *Server) handleCreateSession(ctx context.Context, req mcp.CallToolReques
 	if engine == "" {
 		engine = "mysql"
 	}
-
-	customAgentID := s.resolveCustomAgentID(argStr(req, "custom_agent_id"))
 
 	planMode := strings.ToLower(strings.TrimSpace(argStr(req, "plan_mode")))
 	if planMode != "" && planMode != "force" && planMode != "disable" {

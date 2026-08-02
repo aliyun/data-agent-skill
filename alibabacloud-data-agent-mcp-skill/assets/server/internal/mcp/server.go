@@ -353,9 +353,9 @@ var listWorkspaceDatabasesTool = mcp.NewTool(
 var createSessionTool = mcp.NewTool(
 	"data_agent_create_session",
 	mcp.WithDescription("Create a Data Agent analysis session. Supports database analysis (database_id) or file analysis (file_id from upload_file). MANDATORY: before calling this tool for database analysis, you MUST call data_agent_list_workspace_databases in this same turn and use its returned values — never guess or reuse database_id/instance_id/engine from memory or prior conversations. For pro/ultra mode with auto_confirm=true, all plan/SQL/report confirmations are handled automatically."),
-	mcp.WithString("database_id", mcp.Description("DMS database ID — MUST come from a data_agent_list_workspace_databases call in this turn (required for database analysis, or use file_id for file analysis)")),
-	mcp.WithString("db_name", mcp.Description("Database schema name from data_agent_list_workspace_databases (required for database analysis)")),
-	mcp.WithString("tables", mcp.Description("Comma-separated table names to analyze (for database analysis)")),
+	mcp.WithString("database_id", mcp.Description("DMS database ID — MUST come from a data_agent_list_workspace_databases call in this turn (required for database analysis, or use file_id for file analysis; not needed when a custom agent supplies the data source)")),
+	mcp.WithString("db_name", mcp.Description("Database schema name from data_agent_list_workspace_databases (required for database analysis, unless a custom agent supplies the data source)")),
+	mcp.WithString("tables", mcp.Description("Comma-separated table names to analyze (required for database analysis, unless a custom agent supplies the data source)")),
 	mcp.WithString("query", mcp.Required(), mcp.Description("Natural language analysis query")),
 	mcp.WithString("file_id", mcp.Description("Uploaded file ID from upload_file (alternative to database_id). File analysis defaults to pro mode.")),
 	mcp.WithString("file_name", mcp.Description("Original filename (e.g. sales.csv). Required when using file_id.")),
@@ -366,7 +366,7 @@ var createSessionTool = mcp.NewTool(
 	mcp.WithString("instance_name", mcp.Description("Instance resource ID from data_agent_list_workspace_databases.instance_resource_id (e.g. rm-xxx)")),
 	mcp.WithString("engine", mcp.Description("Database engine from data_agent_list_workspace_databases.db_type (default mysql)")),
 	mcp.WithString("workspace_id", mcp.Description("Workspace ID for team collaboration")),
-	mcp.WithString("custom_agent_id", mcp.Description("Custom agent ID")),
+	mcp.WithString("custom_agent_id", mcp.Description("Custom agent ID. A custom agent carries its own data source, so database_id/db_name/tables and file_id are not required when one is used. Falls back to the identity group default, then the server default.")),
 )
 
 var statusTool = mcp.NewTool(
