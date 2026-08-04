@@ -41,12 +41,13 @@ Lookup order: `$DATA_AGENT_CONFIG` > `./config.yaml` > `~/.data-agent/config.yam
 | `sts.endpoint` | `sts.{region}.aliyuncs.com` | STS endpoint used for AssumeRole |
 | `sts.session_expiration` | `3600` | Temporary credential lifetime in seconds |
 | `identity.enabled` | `false` | Turn on multi-tenant identity mapping (HTTP/SSE transports only; legacy section name `aily` still accepted) |
-| `identity.jwt.enabled` | `false` | Verify the upstream-signed identity token (Feishu Aily JWT). Once on, the token is mandatory — a request without a valid one is rejected instead of falling back to the headers, and `auth_token` is unnecessary |
+| `identity.jwt.enabled` | `false` | Verify the upstream-signed identity token (Feishu Aily JWT). A JWT is used when the caller sends one; without one the request falls back to the identity headers. A token that is present but invalid is always rejected, never retried against the headers |
 | `identity.jwt.secret` | — | HS256 key from the platform's MCP editor, used as-is (no base64). Prefer `IDENTITY_JWT_SECRET` in `.env` |
+| `identity.jwt.secrets` | `[]` | Additional HS256 keys so several upstream agents can share one server, each signing with its own key; a token passes if `secret` or any of these verifies it. Prefer `IDENTITY_JWT_SECRETS` (comma-separated) in `.env` |
 | `identity.jwt.header` | `x-aily-jwt` | Header carrying the bare token (no `Bearer ` prefix) |
 | `identity.session_name_claim` | `user_id` | Identity field used as the STS RoleSessionName segment: `user_id` \| `email` \| `enterprise_email` \| `employee_no` \| `tenant_id` \| `agent_id`. Applies to whichever path is active; the header path only carries `user_id`/`email`, so any other choice falls back to the user id there. Group matching always uses `user_id`/`email` regardless |
 | `identity.require_identity` | `false` | Reject requests without identity headers instead of using the server identity |
-| `identity.auth_token` | — | Caller authentication token; must equal the token header on every request (legacy name `shared_secret` still accepted) |
+| `identity.auth_token` | — | Caller authentication token; **required whenever `identity.enabled`** and checked first on every request (both the JWT and header paths), since without a JWT the request falls back to the forgeable headers. Legacy name `shared_secret` still accepted |
 | `identity.session_name_prefix` | `aily` | STS RoleSessionName = `<prefix>-<session_name_claim value>` |
 | `identity.headers.user/email/token` | `x-aily-user` / `x-aily-email` / `x-aily-token` | Identity header names (rename for non-Aily upstreams) |
 | `identity.default` | — | **Style 1 — global sharing**: one role (+ optional `workspace_id` / `custom_agent_id` / `mode` defaults) for every identified user |
@@ -68,6 +69,7 @@ The `.env` file (path: `$DATA_AGENT_ENV_FILE`, else `./.env`) is loaded into the
 | `DATA_AGENT_CONFIG` / `DATA_AGENT_ENV_FILE` | Explicit config / .env file paths |
 | `AILY_SHARED_SECRET` / `IDENTITY_SHARED_SECRET` / `IDENTITY_AUTH_TOKEN` | Overrides `identity.auth_token` |
 | `IDENTITY_JWT_SECRET` | Overrides `identity.jwt.secret` (HS256 key for the upstream-signed identity token) |
+| `IDENTITY_JWT_SECRETS` | Comma-separated extra HS256 keys, merged with `identity.jwt.secret` for multiple upstream agents |
 | `MCP_TRANSPORT` / `MCP_PORT` | `stdio` (default) \| `streamable-http` \| `sse`; port is required for HTTP transports |
 | `DATA_AGENT_UPLOAD_DIRS` | Path list (`:`-separated) confining `data_agent_upload_file`; overrides `upload.allowed_dirs`. Required on HTTP transports, which otherwise refuse uploads |
 | `DATA_AGENT_LOG_REQUESTS` | `basic` \| `full` \| `off`; overrides `log.requests`. Unset = `basic` on HTTP transports, `off` on stdio |
@@ -116,6 +118,18 @@ RAM prerequisites:
 - Each group role trusts the base account and carries `AliyunDMSDataAgentFullAccess` (or a narrower DMS policy) plus the intended DMS data permissions
 - The base AK/SK RAM user needs `sts:AssumeRole` on **every** group/default role
 - `api_key` auth cannot be combined with identity mode (DMS Enterprise + STS require AK/SK)
+
+### What changed from the earlier identity config
+
+If you configured identity mode before, three things changed:
+
+| Behavior | Before | Now |
+|----------|--------|-----|
+| `identity.jwt.enabled: true` | JWT **mandatory** — the header path was closed, a request without a token was rejected | **JWT-first with header fallback** — a token is used when present (and wins over headers), otherwise the request falls back to the identity headers |
+| `identity.auth_token` | Optional; only guarded the header path, and was considered unnecessary once JWT was on | **Required whenever `identity.enabled`**, checked first on both paths — the server refuses to start without it |
+| JWT verification keys | Single `identity.jwt.secret` | `secret` **plus** `identity.jwt.secrets` / `IDENTITY_JWT_SECRETS`; a token passes if any key verifies it |
+
+**Migration — breaking:** an existing `identity.enabled: true` deployment with **no** `auth_token` now fails to start (`identity.enabled requires identity.auth_token`). Set `identity.auth_token` (or `IDENTITY_AUTH_TOKEN`) to the same value the upstream sends in its token header before upgrading. Existing single-`secret` and header-only setups keep working unchanged otherwise.
 
 ## Deployment
 
