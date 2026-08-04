@@ -18,21 +18,25 @@ import (
 // STS.
 func jwtRegistry(t *testing.T, sessionClaim string, groups map[string]config.IdentityGroup) (*Registry, *[]string) {
 	t.Helper()
-
-	cfg := config.Config{
-		Region: "cn-hangzhou",
-		Identity: config.Identity{
-			Enabled:          true,
-			SessionNameClaim: sessionClaim,
-			JWT: config.JWT{
-				Enabled: true,
-				Secret:  testSecret,
-				Header:  DefaultJWTHeader,
-			},
-			Default: &config.IdentityGroup{RoleArn: "acs:ram::123:role/da-default"},
-			Groups:  groups,
+	return identityRegistry(t, config.Identity{
+		Enabled:          true,
+		SessionNameClaim: sessionClaim,
+		JWT: config.JWT{
+			Enabled: true,
+			Secret:  testSecret,
+			Header:  DefaultJWTHeader,
 		},
-	}
+		Default: &config.IdentityGroup{RoleArn: "acs:ram::123:role/da-default"},
+		Groups:  groups,
+	})
+}
+
+// identityRegistry builds a registry from a full identity config, so tests can
+// vary auth_token and require_identity alongside the JWT settings.
+func identityRegistry(t *testing.T, id config.Identity) (*Registry, *[]string) {
+	t.Helper()
+
+	cfg := config.Config{Region: "cn-hangzhou", Identity: id}
 	cfg.ApplyDefaults()
 	if err := cfgValidate(t, &cfg); err != nil {
 		t.Fatalf("config invalid: %v", err)
@@ -132,20 +136,19 @@ func TestResolveGroupMatchingIndependentOfSessionNameClaim(t *testing.T) {
 	}
 }
 
-// Enabling JWT means every caller presents one; a missing or bad token must
-// never fall through to the server's own identity.
-func TestResolveJWTFailClosed(t *testing.T) {
+// A token that is present but unverifiable must never be retried against the
+// headers: that would let an attacker downgrade to the forgeable path by
+// sending a deliberately broken token.
+func TestResolveRejectsUnverifiableTokenWithoutFallback(t *testing.T) {
 	r, asked := jwtRegistry(t, "user_id", nil)
 
-	for name, ctx := range map[string]context.Context{
-		"no token":      context.Background(),
-		"empty token":   WithJWT(context.Background(), ""),
-		"garbage token": WithJWT(context.Background(), "not-a-jwt"),
-		"wrong secret": WithJWT(context.Background(),
-			signToken(t, "other-secret", ailyClaims(), time.Now().Add(time.Hour))),
-		"expired": WithJWT(context.Background(),
-			signToken(t, testSecret, ailyClaims(), time.Now().Add(-time.Minute))),
+	for name, raw := range map[string]string{
+		"garbage":      "not-a-jwt",
+		"wrong secret": signToken(t, "other-secret", ailyClaims(), time.Now().Add(time.Hour)),
+		"expired":      signToken(t, testSecret, ailyClaims(), time.Now().Add(-time.Minute)),
 	} {
+		// Forged headers accompany the bad token, so a fallback would succeed.
+		ctx := WithIdentity(WithJWT(context.Background(), raw), bigUserID, "user@example.com", "")
 		tn, err := r.Resolve(ctx)
 		if err == nil {
 			t.Errorf("%s: expected rejection, got tenant %+v", name, tn)
@@ -157,11 +160,96 @@ func TestResolveJWTFailClosed(t *testing.T) {
 	if len(*asked) != 0 {
 		t.Errorf("rejected requests still triggered AssumeRole: %v", *asked)
 	}
+}
 
-	// Identity headers must not be a way around JWT verification.
-	spoofed := WithIdentity(context.Background(), bigUserID, "user@example.com", "anything")
-	if _, err := r.Resolve(spoofed); err == nil {
-		t.Error("plain identity headers were accepted while JWT is enabled")
+// With no token at all the headers take over, so an upstream that has not
+// enabled JWT signing yet keeps working.
+func TestResolveFallsBackToHeadersWhenTokenAbsent(t *testing.T) {
+	r, asked := jwtRegistry(t, "user_id", nil)
+
+	for name, ctx := range map[string]context.Context{
+		"no token":    WithIdentity(context.Background(), "ou_alice", "alice@example.com", ""),
+		"empty token": WithIdentity(WithJWT(context.Background(), ""), "ou_alice", "alice@example.com", ""),
+	} {
+		tn, err := r.Resolve(ctx)
+		if err != nil {
+			t.Fatalf("%s: unexpected rejection: %v", name, err)
+		}
+		if tn == nil || tn.Key != "ou_alice" {
+			t.Errorf("%s: tenant = %+v, want key ou_alice", name, tn)
+		}
+	}
+	if len(*asked) == 0 || (*asked)[0] != "aily-ou_alice" {
+		t.Errorf("RoleSessionName = %v, want aily-ou_alice", *asked)
+	}
+}
+
+// The fallback is only as safe as the header path's own guard, so auth_token
+// still has to match once configured.
+func TestResolveFallbackStillEnforcesAuthToken(t *testing.T) {
+	r, asked := identityRegistry(t, config.Identity{
+		Enabled:   true,
+		AuthToken: "upstream-secret",
+		JWT:       config.JWT{Enabled: true, Secret: testSecret, Header: DefaultJWTHeader},
+		Default:   &config.IdentityGroup{RoleArn: "acs:ram::123:role/da-default"},
+	})
+
+	// No token, wrong auth_token → rejected.
+	ctx := WithIdentity(context.Background(), "ou_alice", "", "wrong")
+	if _, err := r.Resolve(ctx); err == nil {
+		t.Error("header fallback accepted a mismatched auth_token")
+	}
+	// No token, correct auth_token → accepted.
+	ctx = WithIdentity(context.Background(), "ou_alice", "", "upstream-secret")
+	if _, err := r.Resolve(ctx); err != nil {
+		t.Errorf("header fallback rejected a valid auth_token: %v", err)
+	}
+	if len(*asked) != 1 {
+		t.Errorf("expected exactly one AssumeRole, got %v", *asked)
+	}
+}
+
+// A signed token wins over whatever the headers claim, so a caller cannot
+// impersonate someone else by adding headers alongside a valid token.
+func TestResolvePrefersTokenOverHeaders(t *testing.T) {
+	r, asked := jwtRegistry(t, "user_id", nil)
+
+	ctx := WithIdentity(jwtCtx(t, ailyClaims()), "ou_attacker", "attacker@example.com", "")
+	tn, err := r.Resolve(ctx)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if tn.Key != bigUserID {
+		t.Errorf("tenant key = %q, want the token's user %q", tn.Key, bigUserID)
+	}
+	if (*asked)[0] != "aily-"+bigUserID {
+		t.Errorf("RoleSessionName = %q, want the token's user", (*asked)[0])
+	}
+}
+
+// session_name_claim applies to the header path too, so switching between
+// user id and email does not depend on JWT being in use.
+func TestResolveSessionNameClaimOnHeaderPath(t *testing.T) {
+	for _, tc := range []struct {
+		claim string
+		want  string
+	}{
+		{"user_id", "aily-ou_alice"},
+		{"email", "aily-alice@example.com"},
+		// Only a user id and an email arrive in headers, so a JWT-only claim
+		// falls back to the tenant key instead of producing an empty name.
+		{"employee_no", "aily-ou_alice"},
+	} {
+		t.Run(tc.claim, func(t *testing.T) {
+			r, asked := jwtRegistry(t, tc.claim, nil)
+			ctx := WithIdentity(context.Background(), "ou_alice", "alice@example.com", "")
+			if _, err := r.Resolve(ctx); err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if (*asked)[0] != tc.want {
+				t.Errorf("RoleSessionName = %q, want %q", (*asked)[0], tc.want)
+			}
+		})
 	}
 }
 

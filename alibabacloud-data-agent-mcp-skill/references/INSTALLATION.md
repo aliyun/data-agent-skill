@@ -206,12 +206,12 @@ Upstream callers that forward per-user identity (Feishu Aily either signs it int
 identity:                           # legacy section name "aily" still accepted
   enabled: true
   require_identity: true            # fail-closed: reject requests without identity headers
-  jwt:                              # upstream-signed identity; supersedes auth_token
+  jwt:                              # upstream-signed identity; used when present, else headers
     enabled: true
     secret: ""                      # HS256 key from the Aily MCP editor (IDENTITY_JWT_SECRET env)
     header: ""                      # default: x-aily-jwt (bare token, no "Bearer " prefix)
   session_name_claim: user_id       # user_id | email | enterprise_email | employee_no | tenant_id | agent_id
-  auth_token: ""                    # caller authentication when JWT is off (legacy yaml name "shared_secret"; IDENTITY_AUTH_TOKEN env)
+  auth_token: ""                    # authenticates the header path; keep set even with JWT on (legacy yaml name "shared_secret"; IDENTITY_AUTH_TOKEN env)
   session_name_prefix: ""           # RoleSessionName "<prefix>-<session_name_claim value>"; default prefix "aily"
   headers: {user: "", email: "", token: ""}  # defaults: x-aily-user / x-aily-email / x-aily-token
   default:                          # style 1: global sharing — catch-all role + session defaults

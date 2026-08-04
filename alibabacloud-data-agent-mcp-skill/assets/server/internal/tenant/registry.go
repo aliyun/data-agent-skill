@@ -143,15 +143,16 @@ func NewRegistry(baseCtx context.Context, cfg config.Config, base *dataagent.Cre
 
 // Resolve returns the tenant for the identity carried in ctx.
 //
-// Two identity sources, in order of trust:
-//   - identity.jwt.enabled: the upstream platform signs the identity, so the
-//     signature both identifies the user and authenticates the caller. The
-//     token is mandatory once enabled.
-//   - identity headers: plain text, so identity.auth_token is what proves the
-//     request came from the trusted upstream.
+// Two identity sources, tried in order:
+//   - identity.jwt: when the caller sends a signed token it is used, and the
+//     signature both identifies the user and authenticates the caller.
+//   - identity headers: used when no token is present. They are plain text, so
+//     identity.auth_token is what proves the request came from the trusted
+//     upstream.
 //
 // Fail-closed rules when identity mode is enabled:
-//   - JWT enabled but missing or unverifiable → error
+//   - a token that is present but unverifiable → error (never retried against
+//     the headers, which would allow a downgrade)
 //   - auth_token configured but header missing/mismatched → error
 //   - identity absent and require_identity=true → error
 //   - identity present but no role mapping → error
@@ -159,10 +160,46 @@ func NewRegistry(baseCtx context.Context, cfg config.Config, base *dataagent.Cre
 // When identity is absent and require_identity=false, (nil, nil) is returned
 // and the caller falls back to the default server identity.
 func (r *Registry) Resolve(ctx context.Context) (*Tenant, error) {
+	// A signed token is preferred whenever the caller sends one: it names the
+	// user and proves the request came from the platform in one step. Only its
+	// absence falls through to the headers — a token that is present but
+	// unverifiable is rejected inside resolveFromJWT, so a deliberately broken
+	// token cannot be used to downgrade to the weaker header path.
 	if r.cfg.Identity.JWT.Enabled {
-		return r.resolveFromJWT(ctx)
+		if raw := JWTFromContext(ctx); raw != "" {
+			return r.resolveFromJWT(raw)
+		}
+	}
+	return r.resolveFromHeaders(ctx)
+}
+
+// resolveFromJWT verifies the signed identity token and resolves its tenant.
+func (r *Registry) resolveFromJWT(raw string) (*Tenant, error) {
+	claims, err := VerifyJWT(raw, r.cfg.Identity.JWT.Secret)
+	if err != nil {
+		return nil, fmt.Errorf("identity request rejected: %w", err)
 	}
 
+	sessionValue, err := claims.Field(r.cfg.Identity.SessionNameClaim)
+	if err != nil {
+		return nil, fmt.Errorf("identity request rejected: %w", err)
+	}
+	// The token is expected to carry whichever claim was configured, so an
+	// empty one is a misconfiguration worth surfacing rather than silently
+	// auditing every user under the same name.
+	if sessionValue == "" {
+		return nil, fmt.Errorf("identity request rejected: claim %q selected for the role session name is empty in the token",
+			r.cfg.Identity.SessionNameClaim)
+	}
+	return r.tenantFor(claims, sessionValue)
+}
+
+// resolveFromHeaders resolves the tenant from the plain identity headers.
+//
+// These are forgeable by anyone who can reach the endpoint, so auth_token is
+// what vouches for them; require_identity decides whether an anonymous request
+// falls back to the server's own identity.
+func (r *Registry) resolveFromHeaders(ctx context.Context) (*Tenant, error) {
 	user, email, token := IdentityFromContext(ctx)
 
 	if r.cfg.Identity.AuthToken != "" && token != r.cfg.Identity.AuthToken {
@@ -177,57 +214,40 @@ func (r *Registry) Resolve(ctx context.Context) (*Tenant, error) {
 		return nil, nil // default identity
 	}
 
-	groupName, mapped, err := r.cfg.ResolveGroup(user, email)
-	if err != nil {
-		return nil, err
-	}
-
-	key := user
-	if key == "" {
-		key = email
-	}
-	return r.tenant(key, groupName, mapped, key)
-}
-
-// resolveFromJWT verifies the signed identity token and resolves its tenant.
-//
-// A missing token is always rejected here, regardless of require_identity:
-// turning JWT on is an explicit statement that every caller presents one, so
-// falling back to the server's own identity would silently hand the server's
-// permissions to an unauthenticated caller.
-func (r *Registry) resolveFromJWT(ctx context.Context) (*Tenant, error) {
-	raw := JWTFromContext(ctx)
-	if raw == "" {
-		return nil, fmt.Errorf("identity request rejected: %s header required", r.cfg.Identity.JWT.Header)
-	}
-
-	claims, err := VerifyJWT(raw, r.cfg.Identity.JWT.Secret)
+	claims := &Claims{UserID: user, Email: email}
+	sessionValue, err := claims.Field(r.cfg.Identity.SessionNameClaim)
 	if err != nil {
 		return nil, fmt.Errorf("identity request rejected: %w", err)
 	}
+	// The headers only carry a user id and an email, so a claim such as
+	// employee_no has no source here. Fall back to the tenant key rather than
+	// rejecting, which would make this path unusable for a deployment that
+	// picked a JWT-only claim.
+	if sessionValue == "" {
+		sessionValue = identityKey(claims)
+	}
+	return r.tenantFor(claims, sessionValue)
+}
 
+// tenantFor maps a resolved identity to its group and tenant. sessionValue is
+// the already-selected role session name.
+func (r *Registry) tenantFor(claims *Claims, sessionValue string) (*Tenant, error) {
 	// Groups list members by user id or email, so match on those regardless of
 	// which claim was chosen for the session name.
 	groupName, mapped, err := r.cfg.ResolveGroup(claims.UserID, claims.Email)
 	if err != nil {
 		return nil, err
 	}
+	return r.tenant(identityKey(claims), groupName, mapped, sessionValue)
+}
 
-	key := claims.UserID
-	if key == "" {
-		key = claims.Email
+// identityKey is the value tenants are cached and isolated by: the user id,
+// falling back to the email when the upstream sends only that.
+func identityKey(claims *Claims) string {
+	if claims.UserID != "" {
+		return claims.UserID
 	}
-
-	sessionValue, err := claims.Field(r.cfg.Identity.SessionNameClaim)
-	if err != nil {
-		return nil, fmt.Errorf("identity request rejected: %w", err)
-	}
-	if sessionValue == "" {
-		return nil, fmt.Errorf("identity request rejected: claim %q selected for the role session name is empty in the token",
-			r.cfg.Identity.SessionNameClaim)
-	}
-
-	return r.tenant(key, groupName, mapped, sessionValue)
+	return claims.Email
 }
 
 // tenant returns the cached tenant for the user or creates it.

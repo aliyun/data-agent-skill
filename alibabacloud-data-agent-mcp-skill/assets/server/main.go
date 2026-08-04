@@ -108,6 +108,14 @@ func main() {
 			log.Printf("identity multi-tenant mode enabled (jwt=%s, session_name_claim=%s, default_group=%v, groups=%d)",
 				cfg.Identity.JWT.Header, cfg.Identity.SessionNameClaim,
 				cfg.Identity.Default != nil && cfg.Identity.Default.RoleArn != "", len(cfg.Identity.Groups))
+			// Requests without a token fall through to the identity headers,
+			// which anyone reaching the endpoint can forge. auth_token is what
+			// stops a caller from skipping the token to get the weaker path.
+			if cfg.Identity.AuthToken == "" {
+				log.Printf("WARNING: identity.jwt is enabled without identity.auth_token; " +
+					"a caller that omits the token falls back to the forgeable identity headers. " +
+					"Set identity.auth_token (env IDENTITY_AUTH_TOKEN) to close that path.")
+			}
 		} else {
 			log.Printf("identity multi-tenant mode enabled (default_group=%v, groups=%d, require_identity=%v, headers=%s/%s)",
 				cfg.Identity.Default != nil && cfg.Identity.Default.RoleArn != "", len(cfg.Identity.Groups),
