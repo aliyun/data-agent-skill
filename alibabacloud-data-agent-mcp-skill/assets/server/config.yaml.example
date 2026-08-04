@@ -81,10 +81,9 @@ identity:
   # sends it on every request, so the signature both identifies the user and
   # proves the request came from the platform — identity headers alone are
   # forgeable, a verified token is not.
-  # A token is used whenever the caller sends one; a request without one falls
-  # back to the identity headers below. A token that is present but invalid is
-  # always rejected, never retried against the headers. Keep auth_token set so
-  # a caller cannot skip the token to reach the weaker header path.
+  # Once enabled the token is mandatory: a request without a valid one is
+  # rejected rather than falling back to the identity headers below, so
+  # auth_token is not needed alongside it.
   jwt:
     enabled: false
     secret: ""            # HMAC key, used as-is (no base64). Prefer .env / env IDENTITY_JWT_SECRET

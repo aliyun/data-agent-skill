@@ -143,16 +143,15 @@ func NewRegistry(baseCtx context.Context, cfg config.Config, base *dataagent.Cre
 
 // Resolve returns the tenant for the identity carried in ctx.
 //
-// Two identity sources, tried in order:
-//   - identity.jwt: when the caller sends a signed token it is used, and the
-//     signature both identifies the user and authenticates the caller.
-//   - identity headers: used when no token is present. They are plain text, so
-//     identity.auth_token is what proves the request came from the trusted
-//     upstream.
+// Two identity sources, selected by configuration rather than per request:
+//   - identity.jwt.enabled: the upstream platform signs the identity, so the
+//     signature both identifies the user and authenticates the caller. The
+//     token is then mandatory — the headers are not a fallback.
+//   - identity headers: plain text, so identity.auth_token is what proves the
+//     request came from the trusted upstream.
 //
 // Fail-closed rules when identity mode is enabled:
-//   - a token that is present but unverifiable → error (never retried against
-//     the headers, which would allow a downgrade)
+//   - JWT enabled but the token is missing or unverifiable → error
 //   - auth_token configured but header missing/mismatched → error
 //   - identity absent and require_identity=true → error
 //   - identity present but no role mapping → error
@@ -160,21 +159,25 @@ func NewRegistry(baseCtx context.Context, cfg config.Config, base *dataagent.Cre
 // When identity is absent and require_identity=false, (nil, nil) is returned
 // and the caller falls back to the default server identity.
 func (r *Registry) Resolve(ctx context.Context) (*Tenant, error) {
-	// A signed token is preferred whenever the caller sends one: it names the
-	// user and proves the request came from the platform in one step. Only its
-	// absence falls through to the headers — a token that is present but
-	// unverifiable is rejected inside resolveFromJWT, so a deliberately broken
-	// token cannot be used to downgrade to the weaker header path.
+	// Turning JWT on is an explicit statement that every caller presents a
+	// signed token, so the header path is closed off entirely: accepting
+	// headers as a fallback would let a caller omit the token to reach the
+	// forgeable path, and accepting no identity at all would hand the server's
+	// own permissions to an unauthenticated caller.
 	if r.cfg.Identity.JWT.Enabled {
-		if raw := JWTFromContext(ctx); raw != "" {
-			return r.resolveFromJWT(raw)
-		}
+		return r.resolveFromJWT(ctx)
 	}
 	return r.resolveFromHeaders(ctx)
 }
 
 // resolveFromJWT verifies the signed identity token and resolves its tenant.
-func (r *Registry) resolveFromJWT(raw string) (*Tenant, error) {
+// A missing token is rejected regardless of require_identity.
+func (r *Registry) resolveFromJWT(ctx context.Context) (*Tenant, error) {
+	raw := JWTFromContext(ctx)
+	if raw == "" {
+		return nil, fmt.Errorf("identity request rejected: %s header required", r.cfg.Identity.JWT.Header)
+	}
+
 	claims, err := VerifyJWT(raw, r.cfg.Identity.JWT.Secret)
 	if err != nil {
 		return nil, fmt.Errorf("identity request rejected: %w", err)
@@ -194,7 +197,8 @@ func (r *Registry) resolveFromJWT(raw string) (*Tenant, error) {
 	return r.tenantFor(claims, sessionValue)
 }
 
-// resolveFromHeaders resolves the tenant from the plain identity headers.
+// resolveFromHeaders resolves the tenant from the plain identity headers, used
+// when identity.jwt is off.
 //
 // These are forgeable by anyone who can reach the endpoint, so auth_token is
 // what vouches for them; require_identity decides whether an anonymous request
