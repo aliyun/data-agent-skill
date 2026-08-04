@@ -51,7 +51,7 @@ func identityRegistry(t *testing.T, id config.Identity) (*Registry, *[]string) {
 
 	var asked []string
 	r.newProviderFn = func(sessionValue, roleArn string) (credential.Credential, error) {
-		asked = append(asked, sessionName(cfg.Identity.SessionNamePrefix, sessionValue))
+		asked = append(asked, sessionName(cfg.Identity.Prefix(), sessionValue))
 		// A static credential keeps currentCredential from calling STS.
 		return credential.NewCredential(new(credential.Config).
 			SetType("access_key").SetAccessKeyId("ak").SetAccessKeySecret("sk"))
@@ -303,5 +303,37 @@ func TestResolveSessionNameKeepsIDPrecision(t *testing.T) {
 	}
 	if want := "aily-" + bigUserID; (*asked)[0] != want {
 		t.Errorf("RoleSessionName = %q, want %q", (*asked)[0], want)
+	}
+}
+
+// End-to-end through Resolve: the RoleSessionName actually handed to
+// AssumeRole follows the configured prefix, including dropping it entirely.
+func TestResolveRoleSessionNamePrefixVariants(t *testing.T) {
+	strPtr := func(s string) *string { return &s }
+
+	for _, tc := range []struct {
+		name   string
+		prefix *string
+		want   string
+	}{
+		{"absent keeps the historical prefix", nil, "aily-ou_alice"},
+		{"explicitly empty drops the prefix", strPtr(""), "ou_alice"},
+		{"custom prefix", strPtr("prod"), "prod-ou_alice"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, asked := identityRegistry(t, config.Identity{
+				Enabled:           true,
+				AuthToken:         testAuthToken,
+				SessionNamePrefix: tc.prefix,
+				Default:           &config.IdentityGroup{RoleArn: "acs:ram::123:role/da-default"},
+			})
+			ctx := WithIdentity(context.Background(), "ou_alice", "", testAuthToken)
+			if _, err := r.Resolve(ctx); err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if len(*asked) == 0 || (*asked)[0] != tc.want {
+				t.Errorf("RoleSessionName = %v, want %q", *asked, tc.want)
+			}
+		})
 	}
 }

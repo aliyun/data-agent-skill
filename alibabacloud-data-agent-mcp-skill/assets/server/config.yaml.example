@@ -105,9 +105,12 @@ identity:
   # the same value as a custom header in the upstream MCP registration.
   # Env override: IDENTITY_AUTH_TOKEN (legacy: shared_secret / AILY_SHARED_SECRET).
   auth_token: ""
-  # STS RoleSessionName: "<prefix>-<user_id>". Default "aily" keeps the
-  # historical "aily-<user_id>" form in ActionTrail audit logs.
-  session_name_prefix: ""
+  # STS RoleSessionName: "<prefix>-<user_id>", what ActionTrail records.
+  # Leave the key out to keep the historical "aily-<user_id>"; set it to an
+  # empty string to drop the prefix entirely ("<user_id>" alone); or set any
+  # other value for "<value>-<user_id>".
+  # Env override: IDENTITY_SESSION_NAME_PREFIX (empty value = no prefix).
+  #session_name_prefix: ""
   # Identity header names; defaults are Feishu Aily compatible.
   headers:
     user: ""              # default: x-aily-user

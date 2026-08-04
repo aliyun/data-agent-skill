@@ -85,6 +85,21 @@ func (j JWT) AllSecrets() []string {
 	return out
 }
 
+// ptr returns a pointer to v, for the optional string fields whose zero value
+// is meaningful.
+func ptr(v string) *string { return &v }
+
+// Prefix returns the configured RoleSessionName prefix. An empty string means
+// no prefix, so the RoleSessionName is the session-name value alone. Callers
+// must not treat empty as "use the default" — ApplyDefaults has already
+// resolved an absent setting to "aily".
+func (i Identity) Prefix() string {
+	if i.SessionNamePrefix == nil {
+		return "aily" // ApplyDefaults was skipped (hand-built Config in tests)
+	}
+	return *i.SessionNamePrefix
+}
+
 // Identity configures multi-tenant identity resolution. The upstream caller
 // (e.g. Feishu Aily) forwards the end-user identity on every MCP HTTP
 // request — either as a signed JWT (identity.jwt) or through the configured
@@ -118,9 +133,13 @@ type Identity struct {
 	// LegacySharedSecret is the deprecated alias for AuthToken.
 	LegacySharedSecret string `yaml:"shared_secret"`
 	// SessionNamePrefix is the leading segment of the STS RoleSessionName:
-	// "<prefix>-<user_id>". Default "aily" keeps the historical
-	// "aily-<user_id>" form; set e.g. "prod" for "prod-<user_id>".
-	SessionNamePrefix string `yaml:"session_name_prefix"`
+	// "<prefix>-<user_id>". A pointer so an explicitly empty value is
+	// distinguishable from an absent one:
+	//   absent                     -> "aily", the historical default
+	//   session_name_prefix: ""    -> no prefix, RoleSessionName is the bare value
+	//   session_name_prefix: prod  -> "prod-<user_id>"
+	// Env override: IDENTITY_SESSION_NAME_PREFIX (set it empty to drop the prefix).
+	SessionNamePrefix *string `yaml:"session_name_prefix"`
 	// Headers overrides the identity header names (defaults: x-aily-*).
 	Headers IdentityHeaders `yaml:"headers"`
 	// Default is the global-sharing group: identified users that belong to
@@ -347,6 +366,11 @@ func Load() (Config, string, error) {
 	if v := os.Getenv("IDENTITY_JWT_SECRET"); v != "" {
 		cfg.Identity.JWT.Secret = v
 	}
+	// LookupEnv, not Getenv: an explicitly empty value means "no prefix", which
+	// is different from leaving the variable unset.
+	if v, ok := os.LookupEnv("IDENTITY_SESSION_NAME_PREFIX"); ok {
+		cfg.Identity.SessionNamePrefix = ptr(v)
+	}
 	if v := os.Getenv("IDENTITY_JWT_SECRETS"); v != "" {
 		for _, s := range strings.Split(v, ",") {
 			if s = strings.TrimSpace(s); s != "" {
@@ -401,8 +425,10 @@ func (c *Config) ApplyDefaults() {
 	if c.Identity.Headers.Token == "" {
 		c.Identity.Headers.Token = "x-aily-token"
 	}
-	if c.Identity.SessionNamePrefix == "" {
-		c.Identity.SessionNamePrefix = "aily" // keeps historical "aily-<user>" RoleSessionName
+	if c.Identity.SessionNamePrefix == nil {
+		// Absent (not an explicit ""), so keep the historical
+		// "aily-<user>" RoleSessionName.
+		c.Identity.SessionNamePrefix = ptr("aily")
 	}
 	if c.Identity.JWT.Header == "" {
 		c.Identity.JWT.Header = "x-aily-jwt"

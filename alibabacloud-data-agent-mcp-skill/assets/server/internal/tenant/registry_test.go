@@ -84,7 +84,7 @@ func TestResolveRejectsUnmappedUser(t *testing.T) {
 }
 
 func TestSessionNameSanitization(t *testing.T) {
-	got := sessionName("", "ou_张三/([)] weird")
+	got := sessionName("aily", "ou_张三/([)] weird")
 	if strings.ContainsAny(got, "/([)] ") {
 		t.Fatalf("sessionName not sanitized: %q", got)
 	}
@@ -95,16 +95,17 @@ func TestSessionNameSanitization(t *testing.T) {
 		t.Fatalf("sessionName length out of STS bounds: %q", got)
 	}
 
-	long := sessionName("", strings.Repeat("a", 100))
+	long := sessionName("aily", strings.Repeat("a", 100))
 	if len(long) != 64 {
 		t.Fatalf("long sessionName not truncated: %d", len(long))
 	}
 }
 
 func TestSessionNamePrefix(t *testing.T) {
-	// Empty prefix falls back to the historical "aily-<user>" form.
-	if got := sessionName("", "ou_alice"); got != "aily-ou_alice" {
-		t.Fatalf("empty prefix changed legacy form: %q", got)
+	// An empty prefix is deliberate (config resolves an unset one to "aily"),
+	// so the RoleSessionName is the bare identity value.
+	if got := sessionName("", "ou_alice"); got != "ou_alice" {
+		t.Fatalf("empty prefix should drop the prefix, got %q", got)
 	}
 	// Configured prefix yields "<prefix>-<user>".
 	if got := sessionName("prod", "ou_alice"); got != "prod-ou_alice" {
@@ -117,6 +118,21 @@ func TestSessionNamePrefix(t *testing.T) {
 	// Combined length still bounded to 64.
 	if got := sessionName(strings.Repeat("p", 40), strings.Repeat("u", 40)); len(got) != 64 {
 		t.Fatalf("prefixed sessionName not truncated: %d", len(got))
+	}
+}
+
+// STS rejects a RoleSessionName shorter than 2 characters, which only becomes
+// reachable once the prefix can be dropped.
+func TestSessionNameMeetsStsMinimumWithoutPrefix(t *testing.T) {
+	for _, key := range []string{"a", ""} {
+		got := sessionName("", key)
+		if len(got) < 2 {
+			t.Errorf("sessionName(%q) = %q, shorter than the STS minimum of 2", key, got)
+		}
+	}
+	// A value already long enough is left untouched.
+	if got := sessionName("", "ab"); got != "ab" {
+		t.Errorf("sessionName padded a long-enough value: %q", got)
 	}
 }
 
@@ -164,7 +180,7 @@ func TestUsersSharingRoleGetSeparateTenants(t *testing.T) {
 		if roleArn != sharedRole {
 			t.Fatalf("unexpected role arn %q", roleArn)
 		}
-		sessionNames = append(sessionNames, sessionName(r.cfg.Identity.SessionNamePrefix, key))
+		sessionNames = append(sessionNames, sessionName(r.cfg.Identity.Prefix(), key))
 		return fakeProvider{}, nil
 	}
 

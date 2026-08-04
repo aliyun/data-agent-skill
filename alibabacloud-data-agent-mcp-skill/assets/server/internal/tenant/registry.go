@@ -308,7 +308,7 @@ func (r *Registry) tenant(key, groupName string, mapped config.IdentityGroup, se
 
 	r.tenants[key] = t
 	log.Printf("tenant created: user=%s group=%s role=%s session_name=%s sessions=%s",
-		key, groupName, mapped.RoleArn, sessionName(r.cfg.Identity.SessionNamePrefix, sessionValue), sessDir)
+		key, groupName, mapped.RoleArn, sessionName(r.cfg.Identity.Prefix(), sessionValue), sessDir)
 	return t, nil
 }
 
@@ -324,7 +324,7 @@ func (r *Registry) newRoleProvider(sessionValue, roleArn string) (credential.Cre
 		SetAccessKeyId(r.base.AccessKeyID).
 		SetAccessKeySecret(r.base.AccessKeySecret).
 		SetRoleArn(roleArn).
-		SetRoleSessionName(sessionName(r.cfg.Identity.SessionNamePrefix, sessionValue)).
+		SetRoleSessionName(sessionName(r.cfg.Identity.Prefix(), sessionValue)).
 		SetRoleSessionExpiration(r.cfg.STS.SessionExpiration).
 		SetSTSEndpoint(r.cfg.STSEndpoint())
 	if r.base.SecurityToken != "" {
@@ -335,20 +335,25 @@ func (r *Registry) newRoleProvider(sessionValue, roleArn string) (credential.Cre
 
 var sessionNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9._@-]`)
 
-// sessionName builds the STS RoleSessionName as "<prefix>-<user id>". The
-// prefix defaults to "aily" (config fills it), which keeps the historical
-// "aily-<user_id>" form. It shows up in ActionTrail audit logs, so keep it
-// recognizable per user.
+// sessionName builds the STS RoleSessionName, which shows up in ActionTrail
+// audit logs and must stay recognizable per user.
+//
+// An empty prefix is honoured as "no prefix" and yields the bare identity
+// value; config resolves an unset setting to "aily" before this point, so
+// empty here is always deliberate. STS requires 2-64 characters, so a value
+// too short to stand alone is padded rather than rejected — losing the audit
+// trail over a one-character user id would be worse than a padded name.
 func sessionName(prefix, key string) string {
-	if prefix == "" {
-		prefix = "aily" // historical default
+	name := sessionNameSanitizer.ReplaceAllString(key, "_")
+	if prefix != "" {
+		name = sessionNameSanitizer.ReplaceAllString(prefix, "_") + "-" + name
 	}
-	name := sessionNameSanitizer.ReplaceAllString(prefix, "_") + "-" +
-		sessionNameSanitizer.ReplaceAllString(key, "_")
 	if len(name) > 64 {
 		name = name[:64]
 	}
-	// STS requires RoleSessionName length >= 2; the prefix segment guarantees it.
+	for len(name) < 2 {
+		name += "_"
+	}
 	return name
 }
 

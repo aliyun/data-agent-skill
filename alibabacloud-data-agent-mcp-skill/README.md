@@ -105,7 +105,7 @@ Lookup order: `$DATA_AGENT_CONFIG` > `./config.yaml` > `~/.data-agent/config.yam
 | `identity.session_name_claim` | `user_id` | Identity field used as the STS RoleSessionName segment: `user_id` \| `email` \| `enterprise_email` \| `employee_no` \| `tenant_id` \| `agent_id`. Applies to whichever path is active; the header path only carries `user_id`/`email`, so any other choice falls back to the user id there. Group matching always uses `user_id`/`email` regardless |
 | `identity.require_identity` | `false` | Reject requests without identity headers instead of using the server identity |
 | `identity.auth_token` | — | Caller authentication token; **required whenever `identity.enabled`** and checked first on every request (both the JWT and header paths), since without a JWT the request falls back to the forgeable headers. Legacy name `shared_secret` still accepted |
-| `identity.session_name_prefix` | `aily` | STS RoleSessionName = `<prefix>-<session_name_claim value>` |
+| `identity.session_name_prefix` | `aily` when the key is absent | STS RoleSessionName = `<prefix>-<session_name_claim value>`. Set it to an **empty string** to drop the prefix and use the bare value; omit the key to keep the historical `aily-` form. Env: `IDENTITY_SESSION_NAME_PREFIX` (empty = no prefix) |
 | `identity.headers.user/email/token` | `x-aily-user` / `x-aily-email` / `x-aily-token` | Identity header names (rename for non-Aily upstreams) |
 | `identity.default` | — | **Style 1 — global sharing**: one role (+ optional `workspace_id` / `custom_agent_id` / `mode` defaults) for every identified user |
 | `identity.groups.<name>` | — | **Style 2 — groups**: per-group `role_arn` + session defaults + `users` list (user id or email; one group per user; wins over default) |
@@ -127,6 +127,7 @@ The `.env` file (path: `$DATA_AGENT_ENV_FILE`, else `./.env`) is loaded into the
 | `AILY_SHARED_SECRET` / `IDENTITY_SHARED_SECRET` / `IDENTITY_AUTH_TOKEN` | Overrides `identity.auth_token` |
 | `IDENTITY_JWT_SECRET` | Overrides `identity.jwt.secret` (HS256 key for the upstream-signed identity token) |
 | `IDENTITY_JWT_SECRETS` | Comma-separated extra HS256 keys, merged with `identity.jwt.secret` for multiple upstream agents |
+| `IDENTITY_SESSION_NAME_PREFIX` | Overrides `identity.session_name_prefix`; an **empty** value means no prefix (unset keeps the config/default) |
 | `MCP_TRANSPORT` / `MCP_PORT` | `stdio` (default) \| `streamable-http` \| `sse`; port is required for HTTP transports |
 | `DATA_AGENT_UPLOAD_DIRS` | Path list (`:`-separated) confining `data_agent_upload_file`; overrides `upload.allowed_dirs`. Required on HTTP transports, which otherwise refuse uploads |
 | `DATA_AGENT_LOG_REQUESTS` | `basic` \| `full` \| `off`; overrides `log.requests`. Unset = `basic` on HTTP transports, `off` on stdio |

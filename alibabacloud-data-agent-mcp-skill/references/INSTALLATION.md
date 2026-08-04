@@ -212,7 +212,7 @@ identity:                           # legacy section name "aily" still accepted
     header: ""                      # default: x-aily-jwt (bare token, no "Bearer " prefix)
   session_name_claim: user_id       # user_id | email | enterprise_email | employee_no | tenant_id | agent_id
   auth_token: ""                    # required in identity mode; checked first on both paths (legacy yaml name "shared_secret"; IDENTITY_AUTH_TOKEN env)
-  session_name_prefix: ""           # RoleSessionName "<prefix>-<session_name_claim value>"; default prefix "aily"
+  #session_name_prefix: ""          # omit = "aily-<value>"; empty string = no prefix; or set your own
   headers: {user: "", email: "", token: ""}  # defaults: x-aily-user / x-aily-email / x-aily-token
   default:                          # style 1: global sharing — catch-all role + session defaults
     role_arn: acs:ram::<account-id>:role/da-default
@@ -232,7 +232,7 @@ Behavior and isolation guarantees:
 - Resolution order: named group membership (user id or email) → `identity.default` → **reject** (fail-closed; never silently falls back to the server identity). A user may belong to exactly one group (validated at startup).
 - Group `workspace_id` / `custom_agent_id` / `mode` act as defaults for `data_agent_create_session` when the call omits them; explicit tool arguments always win.
 - Every identified user gets its own tenant even on a shared/default role: isolated client, session store under `sessions_dir/identity/<user>/`, and its own `RoleSessionName` — so `data_agent_list_sessions`, status, and results never leak across users.
-- `RoleSessionName` is `<session_name_prefix>-<user_id>` (default `aily-<user_id>`), making per-user calls traceable in ActionTrail audit logs.
+- `RoleSessionName` is `<session_name_prefix>-<user_id>` (`aily-<user_id>` unless `session_name_prefix` is set; an empty prefix yields the bare `<user_id>`), making per-user calls traceable in ActionTrail audit logs.
 - Requires AK/SK base credentials with `sts:AssumeRole` permission on every group/default role; API Key auth cannot be combined with this mode.
 - stdio transport has no HTTP headers, so identity mode only takes effect on the Streamable HTTP / SSE transports.
 

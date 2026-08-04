@@ -95,8 +95,8 @@ aily:
 		t.Fatal("aily flags not parsed")
 	}
 	// legacy "shared_secret" yaml key must feed AuthToken.
-	if cfg.Identity.AuthToken != "topsecret" || cfg.Identity.SessionNamePrefix != "prod" {
-		t.Fatalf("auth_token/prefix = %q/%q", cfg.Identity.AuthToken, cfg.Identity.SessionNamePrefix)
+	if cfg.Identity.AuthToken != "topsecret" || cfg.Identity.Prefix() != "prod" {
+		t.Fatalf("auth_token/prefix = %q/%q", cfg.Identity.AuthToken, cfg.Identity.Prefix())
 	}
 	if cfg.STS.SessionExpiration != 7200 {
 		t.Fatalf("sts.session_expiration = %d, want 7200", cfg.STS.SessionExpiration)
@@ -266,5 +266,62 @@ func TestValidateIdentityRequiresAuthToken(t *testing.T) {
 	cfg.Identity.AuthToken = "upstream-secret"
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
+	}
+}
+
+// The prefix must distinguish "not configured" from "configured empty", so a
+// deployment can drop the historical "aily-" segment entirely.
+func TestSessionNamePrefixAbsentVsExplicitlyEmpty(t *testing.T) {
+	write := func(t *testing.T, body string) Config {
+		t.Helper()
+		clearEnv(t)
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("DATA_AGENT_CONFIG", path)
+		cfg, _, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		return cfg
+	}
+
+	// Absent: keep the historical prefix so existing deployments are unchanged.
+	cfg := write(t, "region: cn-hangzhou\nidentity:\n  enabled: false\n")
+	if got := cfg.Identity.Prefix(); got != "aily" {
+		t.Errorf("absent prefix = %q, want aily", got)
+	}
+
+	// Explicitly empty: no prefix.
+	cfg = write(t, "region: cn-hangzhou\nidentity:\n  enabled: false\n  session_name_prefix: \"\"\n")
+	if got := cfg.Identity.Prefix(); got != "" {
+		t.Errorf("explicit empty prefix = %q, want no prefix", got)
+	}
+
+	// Explicit value wins.
+	cfg = write(t, "region: cn-hangzhou\nidentity:\n  enabled: false\n  session_name_prefix: prod\n")
+	if got := cfg.Identity.Prefix(); got != "prod" {
+		t.Errorf("prefix = %q, want prod", got)
+	}
+}
+
+// An empty environment override must mean "no prefix", not "unset" — otherwise
+// the prefix could not be dropped without editing config.yaml.
+func TestSessionNamePrefixEnvOverrideEmpty(t *testing.T) {
+	clearEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("region: cn-hangzhou\nidentity:\n  session_name_prefix: prod\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DATA_AGENT_CONFIG", path)
+	t.Setenv("IDENTITY_SESSION_NAME_PREFIX", "")
+
+	cfg, _, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Identity.Prefix(); got != "" {
+		t.Errorf("empty env override = %q, want no prefix", got)
 	}
 }
