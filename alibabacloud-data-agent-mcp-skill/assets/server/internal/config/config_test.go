@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -135,19 +136,19 @@ func TestLoadLegacyJSONConfig(t *testing.T) {
 }
 
 func TestValidateIdentityRequiresMapping(t *testing.T) {
-	cfg := Config{Identity: Identity{Enabled: true}}
+	cfg := Config{Identity: Identity{Enabled: true, AuthToken: "t"}}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected error when aily enabled without default/groups")
 	}
 
 	// default group alone is a valid mapping source.
-	cfg = Config{Identity: Identity{Enabled: true, Default: &IdentityGroup{RoleArn: "acs:ram::1:role/da-default"}}}
+	cfg = Config{Identity: Identity{Enabled: true, AuthToken: "t", Default: &IdentityGroup{RoleArn: "acs:ram::1:role/da-default"}}}
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("unexpected error with default only: %v", err)
 	}
 
 	// groups alone are valid too.
-	cfg = Config{Identity: Identity{Enabled: true, Groups: map[string]IdentityGroup{
+	cfg = Config{Identity: Identity{Enabled: true, AuthToken: "t", Groups: map[string]IdentityGroup{
 		"g1": {RoleArn: "acs:ram::1:role/g1", Users: []string{"ou_a"}},
 	}}}
 	if err := cfg.validate(); err != nil {
@@ -176,7 +177,7 @@ func TestValidateIdentityRequiresMapping(t *testing.T) {
 
 func TestValidateIdentityRejectsAPIKey(t *testing.T) {
 	cfg := Config{
-		APIKey: "dms-da-xxx",
+		APIKey:   "dms-da-xxx",
 		Identity: Identity{Enabled: true, Default: &IdentityGroup{RoleArn: "acs:ram::1:role/da-default"}},
 	}
 	if err := cfg.validate(); err == nil {
@@ -247,5 +248,23 @@ func TestLoadDotEnv(t *testing.T) {
 	LoadDotEnv()
 	if got := os.Getenv("DATA_AGENT_REGION"); got != "cn-hangzhou" {
 		t.Fatalf("DATA_AGENT_REGION overridden to %q", got)
+	}
+}
+
+func TestValidateIdentityRequiresAuthToken(t *testing.T) {
+	// Identity mode always falls back to the forgeable headers, so auth_token
+	// is mandatory once identity is enabled.
+	cfg := Config{Identity: Identity{
+		Enabled: true,
+		Default: &IdentityGroup{RoleArn: "acs:ram::1:role/da-default"},
+	}}
+	err := cfg.validate()
+	if err == nil || !strings.Contains(err.Error(), "auth_token") {
+		t.Fatalf("expected auth_token requirement, got %v", err)
+	}
+
+	cfg.Identity.AuthToken = "upstream-secret"
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("valid config rejected: %v", err)
 	}
 }

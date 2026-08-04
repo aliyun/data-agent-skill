@@ -201,3 +201,42 @@ func TestJWTContextRoundTrip(t *testing.T) {
 		t.Errorf("empty context should yield no claims, got %+v", got)
 	}
 }
+
+// Multiple secrets let several upstream agents share one server; a token is
+// accepted if any configured key verifies it.
+func TestVerifyJWTMultipleSecrets(t *testing.T) {
+	claims := ailyClaims()
+	tokA := signToken(t, "secret-a", claims, time.Now().Add(time.Hour))
+	tokB := signToken(t, "secret-b", claims, time.Now().Add(time.Hour))
+
+	// Either agent's token verifies against the shared key set, in any order.
+	for _, tok := range []string{tokA, tokB} {
+		if _, err := VerifyJWT(tok, "secret-a", "secret-b"); err != nil {
+			t.Errorf("token rejected by the multi-secret set: %v", err)
+		}
+	}
+
+	// A token signed with an unlisted key is still rejected.
+	tokC := signToken(t, "secret-c", claims, time.Now().Add(time.Hour))
+	if _, err := VerifyJWT(tokC, "secret-a", "secret-b"); err == nil {
+		t.Error("token signed with an unconfigured secret was accepted")
+	}
+
+	// Empty entries are skipped, not treated as a valid key.
+	if _, err := VerifyJWT(tokA, "", "secret-a"); err != nil {
+		t.Errorf("empty secret entry broke verification: %v", err)
+	}
+	if _, err := VerifyJWT(tokA); err == nil {
+		t.Error("verification succeeded with no secrets")
+	}
+}
+
+// A non-signature failure (expiry) must be reported as such even with several
+// secrets, rather than masked as a signature mismatch after trying them all.
+func TestVerifyJWTMultipleSecretsReportsExpiry(t *testing.T) {
+	expired := signToken(t, "secret-a", ailyClaims(), time.Now().Add(-time.Minute))
+	_, err := VerifyJWT(expired, "secret-a", "secret-b")
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expected an expiry error, got %v", err)
+	}
+}

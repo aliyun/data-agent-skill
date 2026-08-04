@@ -48,17 +48,41 @@ type IdentityHeaders struct {
 // JWT configures verification of the upstream-signed identity token.
 //
 // Feishu Aily signs the end-user identity with a platform-generated HS256
-// secret and sends it as a header on every MCP request. A verified token
-// authenticates the caller by itself, so auth_token is not needed alongside it.
+// secret and sends it as a header on every MCP request. Several upstream
+// agents can share one MCP Server while each signs with its own secret, so
+// more than one key may be accepted — a token is valid if any configured
+// secret verifies it.
 type JWT struct {
 	Enabled bool `yaml:"enabled"`
-	// Secret is the HMAC key shown in the platform's MCP editor, used as-is
-	// (no base64 decoding). Keep it in .env, not here.
-	// Env override: IDENTITY_JWT_SECRET.
+	// Secret is a single HMAC key, shown in the platform's MCP editor and used
+	// as-is (no base64 decoding). Kept for the common single-agent case and as
+	// the target of the IDENTITY_JWT_SECRET env override. Merged with Secrets.
 	Secret string `yaml:"secret"`
+	// Secrets lists additional HMAC keys for multiple upstream agents that each
+	// sign with their own key. A token is accepted if any of Secret plus these
+	// verifies it. Env override: IDENTITY_JWT_SECRETS (comma-separated).
+	Secrets []string `yaml:"secrets"`
 	// Header names the request header carrying the token.
 	// Default: x-aily-jwt.
 	Header string `yaml:"header"`
+}
+
+// AllSecrets returns every configured verification key, de-duplicated, with
+// the single Secret first. Verification tries each until one succeeds.
+func (j JWT) AllSecrets() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	add(j.Secret)
+	for _, s := range j.Secrets {
+		add(s)
+	}
+	return out
 }
 
 // Identity configures multi-tenant identity resolution. The upstream caller
@@ -323,6 +347,13 @@ func Load() (Config, string, error) {
 	if v := os.Getenv("IDENTITY_JWT_SECRET"); v != "" {
 		cfg.Identity.JWT.Secret = v
 	}
+	if v := os.Getenv("IDENTITY_JWT_SECRETS"); v != "" {
+		for _, s := range strings.Split(v, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				cfg.Identity.JWT.Secrets = append(cfg.Identity.JWT.Secrets, s)
+			}
+		}
+	}
 	// Colon-separated on Unix, semicolon-separated on Windows (os.PathListSeparator).
 	if v := os.Getenv("DATA_AGENT_UPLOAD_DIRS"); v != "" {
 		cfg.Upload.AllowedDirs = filepath.SplitList(v)
@@ -411,8 +442,14 @@ func (c *Config) validate() error {
 		if (c.Identity.Default == nil || c.Identity.Default.RoleArn == "") && len(c.Identity.Groups) == 0 {
 			return fmt.Errorf("identity.enabled requires identity.default.role_arn or at least one identity.groups entry")
 		}
-		if c.Identity.JWT.Enabled && c.Identity.JWT.Secret == "" {
-			return fmt.Errorf("identity.jwt.enabled requires identity.jwt.secret (or env IDENTITY_JWT_SECRET)")
+		if c.Identity.JWT.Enabled && len(c.Identity.JWT.AllSecrets()) == 0 {
+			return fmt.Errorf("identity.jwt.enabled requires identity.jwt.secret or identity.jwt.secrets (or env IDENTITY_JWT_SECRET / IDENTITY_JWT_SECRETS)")
+		}
+		// A request without a JWT falls back to the forgeable identity headers,
+		// so auth_token is what keeps a caller from skipping the token to reach
+		// that path. Require it whenever identity mode is on.
+		if c.Identity.AuthToken == "" {
+			return fmt.Errorf("identity.enabled requires identity.auth_token (or env IDENTITY_AUTH_TOKEN) to authenticate the upstream; the identity headers are otherwise forgeable")
 		}
 		if !isValidSessionNameClaim(c.Identity.SessionNameClaim) {
 			return fmt.Errorf("identity.session_name_claim %q is not one of %s",

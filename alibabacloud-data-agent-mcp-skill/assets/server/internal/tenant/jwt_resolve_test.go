@@ -13,6 +13,8 @@ import (
 	"github.com/alibabacloud/data-agent-mcp-server/internal/dataagent"
 )
 
+const testAuthToken = "upstream-secret"
+
 // jwtRegistry builds a registry whose credential provider records the
 // RoleSessionName it was asked for, so tests can assert on it without calling
 // STS.
@@ -20,6 +22,7 @@ func jwtRegistry(t *testing.T, sessionClaim string, groups map[string]config.Ide
 	t.Helper()
 	return identityRegistry(t, config.Identity{
 		Enabled:          true,
+		AuthToken:        testAuthToken,
 		SessionNameClaim: sessionClaim,
 		JWT: config.JWT{
 			Enabled: true,
@@ -70,7 +73,8 @@ func cfgValidate(t *testing.T, c *config.Config) error {
 func jwtCtx(t *testing.T, claims map[string]any) context.Context {
 	t.Helper()
 	token := signToken(t, testSecret, claims, time.Now().Add(time.Hour))
-	return WithJWT(context.Background(), token)
+	// auth_token now guards every request, so carry it alongside the JWT.
+	return WithIdentity(WithJWT(context.Background(), token), "", "", testAuthToken)
 }
 
 // The claim named by identity.session_name_claim is what ends up in the
@@ -136,43 +140,66 @@ func TestResolveGroupMatchingIndependentOfSessionNameClaim(t *testing.T) {
 	}
 }
 
-// Enabling JWT closes the header path: a request without a valid token is
-// rejected rather than falling back to forgeable headers or to the server's own
-// identity.
-func TestResolveJWTFailClosed(t *testing.T) {
+// auth_token guards every request first: a wrong or missing token header is
+// rejected before any identity is read, on both the JWT and header paths.
+func TestResolveAuthTokenGuardsBothPaths(t *testing.T) {
+	r, asked := jwtRegistry(t, "user_id", nil)
+
+	// JWT path: valid token but wrong auth_token.
+	badAuth := WithIdentity(jwtCtx(t, ailyClaims()), "", "", "wrong")
+	if _, err := r.Resolve(badAuth); err == nil {
+		t.Error("valid JWT was accepted with a wrong auth_token")
+	}
+	// Header path: headers present but wrong auth_token.
+	badAuthHdr := WithIdentity(context.Background(), "ou_alice", "", "wrong")
+	if _, err := r.Resolve(badAuthHdr); err == nil {
+		t.Error("headers were accepted with a wrong auth_token")
+	}
+	if len(*asked) != 0 {
+		t.Errorf("auth failures still triggered AssumeRole: %v", *asked)
+	}
+}
+
+// A token that is present but unverifiable is rejected outright and never
+// retried against the headers, so a broken token cannot downgrade the path.
+func TestResolveRejectsUnverifiableTokenNoDowngrade(t *testing.T) {
+	r, asked := jwtRegistry(t, "user_id", nil)
+
+	for name, raw := range map[string]string{
+		"garbage":      "not-a-jwt",
+		"wrong secret": signToken(t, "other-secret", ailyClaims(), time.Now().Add(time.Hour)),
+		"expired":      signToken(t, testSecret, ailyClaims(), time.Now().Add(-time.Minute)),
+	} {
+		// Correct auth_token plus forged headers: a downgrade would succeed.
+		ctx := WithIdentity(WithJWT(context.Background(), raw), bigUserID, "u@example.com", testAuthToken)
+		if _, err := r.Resolve(ctx); err == nil {
+			t.Errorf("%s: broken token was accepted", name)
+		}
+	}
+	if len(*asked) != 0 {
+		t.Errorf("rejected tokens still triggered AssumeRole: %v", *asked)
+	}
+}
+
+// With no token the request falls back to the header identity, so an upstream
+// that has not turned on JWT signing keeps working.
+func TestResolveFallsBackToHeadersWhenTokenAbsent(t *testing.T) {
 	r, asked := jwtRegistry(t, "user_id", nil)
 
 	for name, ctx := range map[string]context.Context{
-		"no token":    context.Background(),
-		"empty token": WithJWT(context.Background(), ""),
-		"garbage":     WithJWT(context.Background(), "not-a-jwt"),
-		"wrong secret": WithJWT(context.Background(),
-			signToken(t, "other-secret", ailyClaims(), time.Now().Add(time.Hour))),
-		"expired": WithJWT(context.Background(),
-			signToken(t, testSecret, ailyClaims(), time.Now().Add(-time.Minute))),
+		"no token":    WithIdentity(context.Background(), "ou_alice", "a@example.com", testAuthToken),
+		"empty token": WithIdentity(WithJWT(context.Background(), ""), "ou_alice", "a@example.com", testAuthToken),
 	} {
 		tn, err := r.Resolve(ctx)
-		if err == nil {
-			t.Errorf("%s: expected rejection, got tenant %+v", name, tn)
+		if err != nil {
+			t.Fatalf("%s: unexpected rejection: %v", name, err)
 		}
-		if tn != nil {
-			t.Errorf("%s: tenant returned alongside error", name)
-		}
-	}
-
-	// Identity headers are not a way around the token requirement, with or
-	// without a matching auth_token.
-	for name, ctx := range map[string]context.Context{
-		"headers only":            WithIdentity(context.Background(), bigUserID, "user@example.com", ""),
-		"headers with auth token": WithIdentity(context.Background(), bigUserID, "user@example.com", "anything"),
-	} {
-		if _, err := r.Resolve(ctx); err == nil {
-			t.Errorf("%s: plain identity headers were accepted while JWT is enabled", name)
+		if tn == nil || tn.Key != "ou_alice" {
+			t.Errorf("%s: tenant = %+v, want key ou_alice", name, tn)
 		}
 	}
-
-	if len(*asked) != 0 {
-		t.Errorf("rejected requests still triggered AssumeRole: %v", *asked)
+	if len(*asked) == 0 || (*asked)[0] != "aily-ou_alice" {
+		t.Errorf("RoleSessionName = %v, want aily-ou_alice", *asked)
 	}
 }
 
@@ -180,7 +207,7 @@ func TestResolveJWTFailClosed(t *testing.T) {
 func TestResolveIgnoresHeadersWhenJWTEnabled(t *testing.T) {
 	r, asked := jwtRegistry(t, "user_id", nil)
 
-	ctx := WithIdentity(jwtCtx(t, ailyClaims()), "ou_attacker", "attacker@example.com", "")
+	ctx := WithIdentity(jwtCtx(t, ailyClaims()), "ou_attacker", "attacker@example.com", testAuthToken)
 	tn, err := r.Resolve(ctx)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -209,10 +236,11 @@ func TestResolveSessionNameClaimOnHeaderPath(t *testing.T) {
 		t.Run(tc.claim, func(t *testing.T) {
 			r, asked := identityRegistry(t, config.Identity{
 				Enabled:          true,
+				AuthToken:        testAuthToken,
 				SessionNameClaim: tc.claim,
 				Default:          &config.IdentityGroup{RoleArn: "acs:ram::123:role/da-default"},
 			})
-			ctx := WithIdentity(context.Background(), "ou_alice", "alice@example.com", "")
+			ctx := WithIdentity(context.Background(), "ou_alice", "alice@example.com", testAuthToken)
 			if _, err := r.Resolve(ctx); err != nil {
 				t.Fatalf("Resolve: %v", err)
 			}

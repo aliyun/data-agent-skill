@@ -10,6 +10,7 @@ package tenant
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -65,18 +66,21 @@ var ValidSessionNameClaims = []string{
 	"user_id", "email", "enterprise_email", "employee_no", "tenant_id", "agent_id",
 }
 
-// VerifyJWT checks an Aily identity token and returns its claims.
+// VerifyJWT checks an Aily identity token against one or more HMAC secrets and
+// returns its claims. Multiple secrets let several upstream agents, each
+// signing with its own key, share one server: the token is accepted if any
+// secret verifies it.
 //
 // The signing method is pinned to HS256: accepting whatever the token's own
 // "alg" header asks for is the classic algorithm-confusion flaw, where an
 // attacker downgrades to "none" or has the HMAC key verified as an RSA public
 // key. Expiry is required, so a leaked token cannot be replayed indefinitely.
-func VerifyJWT(token, secret string) (*Claims, error) {
+func VerifyJWT(token string, secrets ...string) (*Claims, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, fmt.Errorf("missing identity token")
 	}
-	if secret == "" {
-		return nil, fmt.Errorf("identity.jwt.secret is not configured")
+	if len(secrets) == 0 {
+		return nil, fmt.Errorf("identity.jwt secret is not configured")
 	}
 
 	parser := jwt.NewParser(
@@ -86,15 +90,32 @@ func VerifyJWT(token, secret string) (*Claims, error) {
 		jwt.WithJSONNumber(),
 	)
 
-	parsed, err := parser.Parse(token, func(*jwt.Token) (interface{}, error) {
-		// The platform hands out the secret as a plain string; it is the HMAC
-		// key as-is, with no base64 decoding.
-		return []byte(secret), nil
-	})
-	if err != nil {
-		// The error text describes the failure (bad signature, expired, wrong
-		// alg) without echoing the token.
-		return nil, fmt.Errorf("identity token rejected: %w", err)
+	var parsed *jwt.Token
+	var lastErr error
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
+		tok, err := parser.Parse(token, func(*jwt.Token) (interface{}, error) {
+			// The platform hands out the secret as a plain string; it is the
+			// HMAC key as-is, with no base64 decoding.
+			return []byte(secret), nil
+		})
+		if err == nil {
+			parsed = tok
+			break
+		}
+		lastErr = err
+		// Only a signature mismatch is worth trying the next key. Anything else
+		// (expired, malformed, wrong alg) fails identically for every key, so
+		// stop and report it instead of masking it as a signature failure.
+		if !errors.Is(err, jwt.ErrSignatureInvalid) {
+			break
+		}
+	}
+	if parsed == nil {
+		// The error text describes the failure without echoing the token.
+		return nil, fmt.Errorf("identity token rejected: %w", lastErr)
 	}
 
 	mc, ok := parsed.Claims.(jwt.MapClaims)
