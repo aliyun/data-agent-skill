@@ -20,6 +20,63 @@ cp .env.example .env               # secrets: AK/SK (never commit; gitignored)
 cp config.yaml.example config.yaml # non-secret settings (gitignored)
 ```
 
+### config.yaml — examples
+
+**Minimal — single tenant, no identity mode.** The server acts as one Alibaba
+Cloud identity (AK/SK from `.env`); every caller shares it.
+
+```yaml
+region: cn-hangzhou
+sessions_dir: ~/.data-agent/sessions
+# workspace_id / custom_agent_id optional; empty = auto workspace + built-in agent
+```
+
+**Multi-tenant — Feishu Aily with JWT, groups, and per-user RAM roles.** Every
+request carries a signed identity; the server assumes a per-group RAM role via
+STS so RAM/DMS permissions apply per end user. Secrets stay in `.env`.
+
+```yaml
+region: cn-hangzhou
+sessions_dir: ~/.data-agent/sessions
+
+upload:
+  allowed_dirs: [/srv/data-agent/inbox]   # HTTP transports refuse uploads while empty
+log:
+  requests: full                          # basic | full | off
+
+identity:
+  enabled: true
+  jwt:
+    enabled: true
+    # secret / secrets live in .env (IDENTITY_JWT_SECRET / IDENTITY_JWT_SECRETS)
+  auth_token: ""                # required; set via IDENTITY_AUTH_TOKEN in .env
+  session_name_claim: email     # what ActionTrail records: user_id | email | ...
+  require_identity: true        # reject anonymous requests (fail-closed)
+
+  default:                      # catch-all for identified users in no group
+    role_arn: acs:ram::<account-id>:role/da-default
+    mode: lite
+  groups:
+    analysts:
+      role_arn: acs:ram::<account-id>:role/da-analysts
+      workspace_id: ws-analysts
+      custom_agent_id: ca-xxxx
+      mode: pro
+      users: [ou_alice, bob@example.com]   # user id or email; one group per user
+```
+
+Matching `.env` for the multi-tenant example (secrets never go in `config.yaml`):
+
+```bash
+ALIBABA_CLOUD_ACCESS_KEY_ID=EXAMPLE_b41d7b88eb4fce42      # base AK/SK for STS AssumeRole
+ALIBABA_CLOUD_ACCESS_KEY_SECRET=********
+IDENTITY_AUTH_TOKEN=a-long-random-shared-secret # checked first on every request
+IDENTITY_JWT_SECRET=agent-a-hmac-secret         # HS256 key from Aily's MCP editor
+IDENTITY_JWT_SECRETS=agent-b-secret,agent-c-secret  # optional: more upstream agents
+```
+
+Then start with `MCP_TRANSPORT=streamable-http MCP_PORT=61026 ./data-agent-mcp-server`. See [Identity & RAM Role Assumption](#identity--ram-role-assumption-how-角色扮演-works) for how resolution works and the RAM prerequisites.
+
 ### config.yaml (full reference)
 
 Lookup order: `$DATA_AGENT_CONFIG` > `./config.yaml` > `~/.data-agent/config.yaml` > legacy `~/.data-agent/config.json` (JSON still parsed).
