@@ -274,7 +274,12 @@ func withinRoot(root, path string) bool {
 func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error)) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, err error) {
 		rec := s.startToolCall(ctx, req)
-		defer func() { rec.finish(res, err) }()
+		defer func() {
+			rec.finish(res, err)
+			// After logging: stamp tool errors with the request id so the
+			// caller-visible message links back to the server log.
+			rec.tagError(res)
+		}()
 
 		if s.resolve == nil {
 			return h(s, ctx, req)

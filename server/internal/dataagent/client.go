@@ -1264,8 +1264,8 @@ func (c *Client) doAPIKeyPost(action, version string, params map[string]string) 
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf(
-			"%s returned HTTP %d: %s",
-			action, resp.StatusCode, truncate(string(respBody), 500),
+			"%s returned HTTP %d (request-id: %s): %s",
+			action, resp.StatusCode, resp.Header.Get("x-acs-request-id"), truncate(string(respBody), 500),
 		)
 	}
 
@@ -1276,15 +1276,18 @@ func (c *Client) doAPIKeyPost(action, version string, params map[string]string) 
 
 	// The API Key gateway returns errors with HTTP 200 but success=false (or a
 	// raw {HttpStatusCode, Code, Message} body on the stream endpoint). Surface
-	// these as errors so callers don't silently see empty results.
+	// these as errors so callers don't silently see empty results. Carry the
+	// gateway requestId so backend failures can be traced in support tickets.
 	if success, ok := result["success"].(bool); ok && !success {
 		code := firstStr(result, "code", "Code")
 		msg := firstStr(result, "msg", "Message", "message")
-		return nil, fmt.Errorf("%s failed (%s): %s", action, code, msg)
+		return nil, fmt.Errorf("%s failed (%s, request-id: %s): %s",
+			action, code, apiKeyRequestID(result, resp), msg)
 	}
 	if httpCode := firstInt64(result, "HttpStatusCode", "httpStatusCode"); httpCode >= 400 {
 		msg := firstStr(result, "Message", "message", "msg")
-		return nil, fmt.Errorf("%s failed (HTTP %d): %s", action, httpCode, msg)
+		return nil, fmt.Errorf("%s failed (HTTP %d, request-id: %s): %s",
+			action, httpCode, apiKeyRequestID(result, resp), msg)
 	}
 
 	// The API Key gateway wraps successful responses in an envelope:
@@ -1527,6 +1530,16 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// apiKeyRequestID extracts the backend request id from an API Key gateway
+// response for error attribution: the envelope carries requestId in the body;
+// fall back to the x-acs-request-id header.
+func apiKeyRequestID(body map[string]interface{}, resp *http.Response) string {
+	if id := firstStr(body, "requestId", "RequestId"); id != "" {
+		return id
+	}
+	return resp.Header.Get("x-acs-request-id")
 }
 
 // firstStr tries multiple keys and returns the first non-empty string value.

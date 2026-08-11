@@ -308,3 +308,38 @@ func TestQuoteForLogTruncatesAndFlattens(t *testing.T) {
 		t.Errorf("truncated value still too long: %d", len(got))
 	}
 }
+
+// Tool errors must carry the server-side request id so a caller-reported
+// failure can be matched to the [req:...] lines in the server log.
+func TestTagErrorStampsRequestID(t *testing.T) {
+	s := &Server{reqLog: RequestLogBasic}
+
+	t.Run("error result is stamped", func(t *testing.T) {
+		var rec *callRecord
+		captureLog(t, func() {
+			rec = s.startToolCall(context.Background(), callReq("data_agent_status", nil))
+		})
+		res := mcp.NewToolResultError("failed to get status: boom")
+		rec.tagError(res)
+		if got := resultText(res); !strings.Contains(got, "[req:"+rec.id+"]") {
+			t.Fatalf("error text missing request id: %q", got)
+		}
+	})
+
+	t.Run("success result untouched", func(t *testing.T) {
+		var rec *callRecord
+		captureLog(t, func() {
+			rec = s.startToolCall(context.Background(), callReq("data_agent_status", nil))
+		})
+		res := mcp.NewToolResultText(`{"status":"completed"}`)
+		rec.tagError(res)
+		if got := resultText(res); strings.Contains(got, "[req:") {
+			t.Fatalf("success text must not be stamped: %q", got)
+		}
+	})
+
+	t.Run("nil record is safe", func(t *testing.T) {
+		var rec *callRecord
+		rec.tagError(mcp.NewToolResultError("x")) // must not panic
+	})
+}

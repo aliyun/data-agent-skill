@@ -232,6 +232,22 @@ func quoteForLog(s string) string {
 	return strconv.Quote(s)
 }
 
+// tagError appends the server-side request id to a tool error's text so a
+// failure reported by the caller can be correlated with the matching
+// [req:...] lines in the server log.
+func (r *callRecord) tagError(res *mcp.CallToolResult) {
+	if r == nil || res == nil || !res.IsError {
+		return
+	}
+	for i, c := range res.Content {
+		if tc, ok := c.(mcp.TextContent); ok {
+			tc.Text += " [req:" + r.id + "]"
+			res.Content[i] = tc
+			return
+		}
+	}
+}
+
 // resultText extracts the textual payload of a tool result for the log line.
 func resultText(res *mcp.CallToolResult) string {
 	for _, c := range res.Content {
