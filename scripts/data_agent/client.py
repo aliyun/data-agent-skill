@@ -12,6 +12,7 @@ import functools
 import json
 import os
 import inspect
+import re
 import uuid
 from typing import Optional, Any, Callable, TypeVar
 import requests
@@ -60,6 +61,15 @@ def _is_sensitive_field(key: Any) -> bool:
     return any(marker in normalized for marker in _SENSITIVE_FIELD_MARKERS)
 
 
+# Matches credential-bearing query parameters embedded in URL/string values.
+# Signed OSS/STS URLs carry the caller's AccessKeyId, temporary security token
+# and request signature inside the value of a key like ``url``, so key-name
+# redaction alone would leak them into debug logs.
+_CREDENTIAL_IN_VALUE = re.compile(
+    r"(?i)(AccessKeyId|OSSAccessKeyId|AccessKeySecret|SecurityToken|security-token|Signature)=[^&\"'\s]*"
+)
+
+
 def _redact_sensitive_values(value: Any) -> Any:
     """Return a copy of ``value`` with credentials redacted for debug logs."""
     if isinstance(value, dict):
@@ -71,6 +81,10 @@ def _redact_sensitive_values(value: Any) -> Any:
         return [_redact_sensitive_values(item) for item in value]
     if isinstance(value, tuple):
         return tuple(_redact_sensitive_values(item) for item in value)
+    if isinstance(value, str):
+        return _CREDENTIAL_IN_VALUE.sub(
+            lambda m: m.group(0)[: m.group(0).index("=") + 1] + "<redacted>", value
+        )
     return value
 
 

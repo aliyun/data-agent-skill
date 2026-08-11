@@ -3,6 +3,9 @@ bin/
 /dacli
 /data-agent-mcp-server
 
+# CLI analysis output (charts/reports produced from real business data)
+dacli-out/
+
 # Go build cache
 *.test
 
