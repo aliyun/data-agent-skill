@@ -1,10 +1,20 @@
 #!/bin/bash
-# Select the correct data-agent-mcp-server binary for the current platform.
-# Used by Claude Code mcpServers configuration.
+# Locate and exec the data-agent-mcp-server binary for the current platform.
+# Used by agent runtime mcpServers configurations (Claude Code, Qoder, ...).
+#
+# Deployment model: this skill ships WITHOUT server source code or binaries.
+# The deployer builds the server (or downloads a release binary) and places
+# it in one of the locations below. See references/INSTALLATION.md.
+#
+# Lookup order:
+#   1. $DATA_AGENT_SERVER_BIN                — explicit path (standalone deployments)
+#   2. <skill>/assets/bin/                   — binary placed inside the skill
+#   3. <repo>/server/bin/                    — monorepo development build
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BIN_DIR="${SCRIPT_DIR}/../assets/server/bin"
+SKILL_BIN_DIR="${SCRIPT_DIR}/../assets/bin"
+REPO_BIN_DIR="${SCRIPT_DIR}/../../server/bin"
 
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
@@ -13,30 +23,28 @@ case "$ARCH" in
     aarch64|arm64) ARCH="arm64" ;;
 esac
 
-BINARY="${BIN_DIR}/data-agent-mcp-server-${OS}-${ARCH}"
-
-if [ -f "$BINARY" ]; then
-    exec "$BINARY" "$@"
+# 1. Explicit override — points at a deployer-managed binary anywhere on disk.
+if [ -n "${DATA_AGENT_SERVER_BIN:-}" ]; then
+    if [ -x "$DATA_AGENT_SERVER_BIN" ]; then
+        exec "$DATA_AGENT_SERVER_BIN" "$@"
+    fi
+    echo "DATA_AGENT_SERVER_BIN is set but not executable: $DATA_AGENT_SERVER_BIN" >&2
+    exit 1
 fi
 
-# Fallback: try plain binary name (local dev build)
-FALLBACK="${BIN_DIR}/data-agent-mcp-server"
-if [ -f "$FALLBACK" ]; then
-    exec "$FALLBACK" "$@"
-fi
+# 2/3. Platform-suffixed binary first, then the plain name, in each location.
+for dir in "$SKILL_BIN_DIR" "$REPO_BIN_DIR"; do
+    for name in "data-agent-mcp-server-${OS}-${ARCH}" "data-agent-mcp-server"; do
+        if [ -x "${dir}/${name}" ]; then
+            exec "${dir}/${name}" "$@"
+        fi
+    done
+done
 
-# Auto-build from source if Go is available
-SERVER_DIR="${SCRIPT_DIR}/../assets/server"
-if command -v go >/dev/null 2>&1 && [ -f "${SERVER_DIR}/go.mod" ]; then
-    echo "Pre-compiled binary not found for ${OS}/${ARCH}, building from source..." >&2
-    (cd "$SERVER_DIR" && go build -trimpath -ldflags "-s -w" -o "${BIN_DIR}/data-agent-mcp-server" .) || {
-        echo "Build failed. Install Go 1.23+ from https://go.dev/dl/" >&2
-        exit 1
-    }
-    exec "${BIN_DIR}/data-agent-mcp-server" "$@"
-fi
-
-echo "No data-agent-mcp-server binary found for ${OS}/${ARCH}" >&2
-echo "  Pre-compiled binaries are provided for Linux amd64/arm64 only." >&2
-echo "  Install Go 1.23+ (https://go.dev/dl/) to build from source automatically." >&2
+echo "No data-agent-mcp-server binary found for ${OS}/${ARCH}." >&2
+echo "Build it from the server project and place it in one of:" >&2
+echo "  - \$DATA_AGENT_SERVER_BIN (explicit path)" >&2
+echo "  - ${SKILL_BIN_DIR}/" >&2
+echo "  - ${REPO_BIN_DIR}/ (monorepo development)" >&2
+echo "Build: cd <repo>/server && make build   (Go 1.23+, see references/INSTALLATION.md)" >&2
 exit 1

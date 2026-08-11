@@ -7,7 +7,7 @@ Human-oriented deployment walkthrough (systemd, dacli verification client): see 
 
 ## MCP Server Setup (Required for All Runtimes)
 
-The Skill does not ship pre-compiled binaries. On first launch, `scripts/select-binary.sh` builds the server from source — Go 1.23+ must be installed on the host (https://go.dev/dl/). Subsequent launches reuse the cached build in `assets/server/bin/`.
+The Skill ships neither server source nor pre-compiled binaries. Obtain a `data-agent-mcp-server` binary first — build it from the repository's top-level `server/` project (`cd server && make build`, Go 1.23+, https://go.dev/dl/) or use a release binary. `scripts/select-binary.sh` locates it in this order: `$DATA_AGENT_SERVER_BIN` (explicit path) → the skill's `assets/bin/` → the monorepo's `server/bin/`. Standalone server deployments (systemd, containers) run the binary directly and do not need the launcher.
 
 The server supports two transport modes. **Prefer the HTTP (Streamable HTTP) transport** — it runs the server as a standalone process that any MCP client can reach over a URL, and works uniformly across local, remote, and hosted runtimes. Use stdio only when the client must launch the binary itself.
 
@@ -142,13 +142,13 @@ RAM users need `AliyunDMSFullAccess` or `AliyunDMSDataAgentFullAccess` permissio
 
 The MCP Server supports configuration via **YAML config file**, **.env file**, and **environment variables**. Priority: env vars > .env file > YAML config > defaults.
 
-**.env file** (secrets; loaded from `$DATA_AGENT_ENV_FILE`, then `./.env`, without overriding already-set env vars — see `assets/server/.env.example`):
+**.env file** (secrets; loaded from `$DATA_AGENT_ENV_FILE`, then `./.env`, without overriding already-set env vars — see `server/.env.example`):
 ```bash
 ALIBABA_CLOUD_ACCESS_KEY_ID=your-ak
 ALIBABA_CLOUD_ACCESS_KEY_SECRET=your-sk
 ```
 
-**YAML config file** (non-secret settings; resolved from `$DATA_AGENT_CONFIG` > `./config.yaml` > `~/.data-agent/config.yaml` > legacy `~/.data-agent/config.json` — see `assets/server/config.yaml.example`):
+**YAML config file** (non-secret settings; resolved from `$DATA_AGENT_CONFIG` > `./config.yaml` > `~/.data-agent/config.yaml` > legacy `~/.data-agent/config.json` — see `server/config.yaml.example`):
 ```yaml
 region: cn-hangzhou
 dms_unit: cn-hangzhou

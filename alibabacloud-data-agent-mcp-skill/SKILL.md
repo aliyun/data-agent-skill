@@ -1,7 +1,7 @@
 ---
 name: alibabacloud-data-agent-mcp-skill
 description: Alibaba Cloud Data Agent MCP skill (alibabacloud-data-agent-mcp-skill, data-agent MCP) for enterprise database/file analysis. Use when the user asks (in any language, including Chinese) to query/analyze DMS-managed databases, run SQL/data analysis, start quick-query (lite) or deep-analysis (pro/ultra) sessions, generate reports/insights, upload CSV/XLSX/JSON/TXT files, manage Data Agent workspaces/custom agents/sessions/files, or mentions Data Agent, data-agent, DMS, Data Center, data analysis, database query, SQL analysis, report generation, data insight, file analysis, workspace, custom agent, session creation, session query, stop/delete session, or any data_agent_* MCP tool. Always call data_agent_* MCP tools directly; do not answer from memory or use aliyun CLI, Python SDK, curl, or API workarounds.
-compatibility: Server binary is built from source on first launch by select-binary.sh (requires Go 1.23+, all platforms); requires Alibaba Cloud credentials; data sources must be managed in Alibaba Cloud DMS Data Center.
+compatibility: Requires a data-agent-mcp-server binary built from the repository's server/ project (Go 1.23+) or deployed by the operator; select-binary.sh locates it via DATA_AGENT_SERVER_BIN, the skill's assets/bin/, or the monorepo's server/bin/. Requires Alibaba Cloud credentials; data sources must be managed in Alibaba Cloud DMS Data Center.
 domain: AIOps
 ---
 metadata:
@@ -57,7 +57,7 @@ Setup is an **install-time responsibility**, not part of task execution. This sk
 
 Facts the agent may need when the user asks setup questions (do not perform setup during analysis tasks):
 
-- The server is built from source on first launch by `scripts/select-binary.sh` (requires Go 1.23+). Transports: stdio (default), Streamable HTTP (`MCP_TRANSPORT=streamable-http` + `MCP_PORT`, endpoint `/mcp`), SSE.
+- The skill ships no server source or binaries. The operator builds `data-agent-mcp-server` from the repository's `server/` project (Go 1.23+) or deploys a release binary; `scripts/select-binary.sh` locates it (`$DATA_AGENT_SERVER_BIN` > skill `assets/bin/` > monorepo `server/bin/`). Transports: stdio (default), Streamable HTTP (`MCP_TRANSPORT=streamable-http` + `MCP_PORT`, endpoint `/mcp`), SSE.
 - Credentials come from the Alibaba Cloud default chain (AK/SK env vars, `~/.aliyun/config.json`, ECS role) or `DATA_AGENT_API_KEY`. **API Key mode disables** `data_agent_list_tables`, `data_agent_search_dms_databases`, `data_agent_search_instances`, and `data_agent_import_database`; `data_agent_list_workspace_databases` and `data_agent_list_imported_tables` still work and remain the mandatory metadata source.
 - Optional multi-tenant identity mode maps per-user identity headers (defaults `x-aily-*`) to RAM roles via STS AssumeRole; group config can inject `workspace_id` / `custom_agent_id` / `mode` as `data_agent_create_session` defaults — explicit tool arguments always win.
 

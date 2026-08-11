@@ -10,18 +10,18 @@ This repository contains the Data Agent Skill, an AI Agent Skill that enables AI
 
 The codebase consists of:
 
-1. **SDK Module** (`dms-data-agent/data_agent/`):
+1. **SDK Module** (`alibabacloud-data-agent-skill/scripts/data_agent/`):
    - `client.py`: Synchronous and asynchronous clients for Data Agent API
    - `session.py`: Session management for maintaining conversation state
    - `config.py`: Configuration management loading from environment variables
    - `models.py`, `message.py`, `sse_client.py`, `file_manager.py`, `mcp_tools.py`, `exceptions.py`: Supporting modules
 
-2. **CLI Module** (`dms-data-agent/cli/`):
+2. **CLI Module** (`alibabacloud-data-agent-skill/scripts/cli/`):
    - `parser.py`: Main argument parser defining all subcommands
    - Command modules: `cmd_db.py`, `cmd_file.py`, `cmd_attach.py`, `cmd_ls.py`, `cmd_dms.py`, `cmd_import.py`, `cmd_reports.py`
    - Helper modules: `formatters.py`, `streaming.py`, `notify.py`, `worker_lock.py`
 
-3. **Main Entry Point**: `dms-data-agent/data_agent_cli.py`
+3. **Main Entry Point**: `alibabacloud-data-agent-skill/scripts/data_agent_cli.py`
 
 > **Note**: A Go-based MCP Server integration exists as a **separate, standalone skill** in `alibabacloud-data-agent-mcp-skill/` (own SKILL.md, scripts, and assets). It is independent of this CLI skill — do not mix the two; see `alibabacloud-data-agent-mcp-skill/SKILL.md`.
 
@@ -70,10 +70,10 @@ cd data-agent-skill
 # 2. Create virtual environment and install dependencies
 python3 -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r dms-data-agent/requirements.txt
+pip install -r alibabacloud-data-agent-skill/scripts/requirements.txt
 
 # 3. Configure credentials
-cp dms-data-agent/.env.example dms-data-agent/.env
+cp alibabacloud-data-agent-skill/.env.example alibabacloud-data-agent-skill/.env
 # Edit .env with ALIBABA_CLOUD_ACCESS_KEY_ID, ALIBABA_CLOUD_ACCESS_KEY_SECRET, DATA_AGENT_REGION
 ```
 

@@ -8,10 +8,10 @@ Ask questions like *"Which department has the highest average salary?"* or *"Ana
 
 This repository contains **two standalone skills** for the same backend service. Choose the one that fits your agent runtime — they are independent and must not be mixed on the same session.
 
-| | [alibabacloud-data-agent-skill](SKILL.md) (CLI, repo root) | [alibabacloud-data-agent-mcp-skill](alibabacloud-data-agent-mcp-skill/SKILL.md) (MCP Server) |
+| | [alibabacloud-data-agent-skill](alibabacloud-data-agent-skill/SKILL.md) (CLI) | [alibabacloud-data-agent-mcp-skill](alibabacloud-data-agent-mcp-skill/SKILL.md) (MCP Server) |
 |---|---|---|
 | Integration | Python CLI — the agent runs shell commands | Go MCP Server — the agent calls native `data_agent_*` MCP tools |
-| Runtime requirement | Python 3.10+ with venv | Go 1.23+ (server auto-built from source on first launch) |
+| Runtime requirement | Python 3.10+ with venv | Go 1.23+ to build the server once (or a deployed binary) |
 | Session monitoring | Async worker + `sessions/<ID>/` progress files + `attach` | Built-in Session Daemon with background SSE monitoring |
 | Plan confirmation (deep analysis) | Manual via `attach -q "confirm"` | Automatic with `auto_confirm=true` |
 | Chart images | Saved under `sessions/<ID>/images/` | Returned inline as MCP ImageContent (base64) |
@@ -30,11 +30,13 @@ This repository contains **two standalone skills** for the same backend service.
 
 1. An Alibaba Cloud account with data sources managed in [DMS](https://dms.aliyun.com/) (or use the built-in demo database `internal_data_employees`)
 2. Credentials via the Alibaba Cloud default credential chain (env vars `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET`, `~/.aliyun/config.json`, or ECS instance role), or a `DATA_AGENT_API_KEY` from the [Data Agent Console](https://agent.dms.aliyun.com/cn-hangzhou/api-key)
-3. RAM permission: `AliyunDMSFullAccess` or `AliyunDMSDataAgentFullAccess` (see [references/RAM-POLICIES.md](references/RAM-POLICIES.md))
+3. RAM permission: `AliyunDMSFullAccess` or `AliyunDMSDataAgentFullAccess` (see [references/RAM-POLICIES.md](alibabacloud-data-agent-skill/references/RAM-POLICIES.md))
 
 ## Quick Start — CLI Skill
 
 ```bash
+cd alibabacloud-data-agent-skill
+
 # 1. Set up the Python environment (Python 3.10+ required)
 python3 -m venv venv
 source venv/bin/activate
@@ -57,12 +59,13 @@ python3 scripts/data_agent_cli.py db \
 python3 scripts/data_agent_cli.py attach --session-id abc123xyz -q "Break down by month"
 ```
 
-Full documentation: [SKILL.md](SKILL.md) · [references/COMMANDS.md](references/COMMANDS.md) · [references/WORKFLOWS.md](references/WORKFLOWS.md) · [references/ANALYSIS_MODE.md](references/ANALYSIS_MODE.md)
+Full documentation: [SKILL.md](alibabacloud-data-agent-skill/SKILL.md) · [references/COMMANDS.md](alibabacloud-data-agent-skill/references/COMMANDS.md) · [references/WORKFLOWS.md](alibabacloud-data-agent-skill/references/WORKFLOWS.md) · [references/ANALYSIS_MODE.md](alibabacloud-data-agent-skill/references/ANALYSIS_MODE.md)
 
 ## Quick Start — MCP Skill
 
 ```bash
-# Requires Go 1.23+ (https://go.dev/dl/) — the launcher builds the server on first run.
+# 1. Build the server once (Go 1.23+, https://go.dev/dl/)
+cd server && make build   # -> server/bin/data-agent-mcp-server
 ```
 
 Register the server in your MCP client (stdio mode shown; Streamable HTTP is also supported):
@@ -85,26 +88,31 @@ Restart the client and verify the `data-agent` server is connected — then the 
 
 Full documentation: [alibabacloud-data-agent-mcp-skill/README.md](alibabacloud-data-agent-mcp-skill/README.md) (deployment guide: stdio / Streamable HTTP / Aily multi-tenant) · [alibabacloud-data-agent-mcp-skill/SKILL.md](alibabacloud-data-agent-mcp-skill/SKILL.md) (tool reference & workflows)
 
-> **Note**: server binaries are not committed to this repository. `scripts/select-binary.sh` builds one from source on first launch and caches it under `assets/server/bin/` (gitignored).
+> **Note**: server binaries are not committed to this repository. Build the server once (`cd server && make build`) or point `DATA_AGENT_SERVER_BIN` at a deployed binary — `scripts/select-binary.sh` locates it (see the MCP skill's INSTALLATION.md).
 
 ## Repository Layout
 
 ```
-├── SKILL.md                              # CLI skill (repo root)
-├── scripts/                              # CLI source (SDK + CLI modules + entry point)
-├── references/                           # CLI skill reference docs
-├── assets/                               # Example data (example_game_data.csv)
-├── sessions/                             # CLI session data (gitignored)
-├── tests/                                # CLI test suite
-├── evals/                                # Eval scenarios
-└── alibabacloud-data-agent-mcp-skill/    # Standalone MCP skill
-    ├── SKILL.md                          # MCP skill instructions
-    ├── README.md                         # Deployment guide (stdio / HTTP / Aily)
-    ├── scripts/select-binary.sh          # Server launcher (auto-builds with Go)
-    ├── assets/server/                    # Go MCP Server source
-    └── references/ram-policies.md        # RAM permission requirements
+├── alibabacloud-data-agent-skill/        # CLI skill (Python)
+│   ├── SKILL.md                          # CLI skill instructions
+│   ├── scripts/                          # CLI source (SDK + CLI modules + entry point)
+│   ├── references/                       # CLI skill reference docs
+│   ├── assets/                           # Example data (example_game_data.csv)
+│   ├── sessions/                         # CLI session data (gitignored)
+│   ├── tests/                            # CLI test suite
+│   └── evals/                            # Eval scenarios
+├── alibabacloud-data-agent-mcp-skill/    # MCP skill (launcher + docs, no server source)
+│   ├── SKILL.md                          # MCP skill instructions
+│   ├── README.md                         # Deployment guide (stdio / HTTP / Aily)
+│   ├── scripts/select-binary.sh          # Server binary locator
+│   ├── assets/                           # Static assets (+ optional assets/bin/ for binaries)
+│   └── references/                       # INSTALLATION.md, ram-policies.md
+└── server/                               # Go MCP Server (standalone project)
+    ├── main.go / go.mod / Makefile
+    ├── cmd/dacli/                        # Manual verification CLI
+    └── internal/                         # Server implementation
 ```
 
 ## License
 
-Apache License 2.0 — see [assets/LICENSE](assets/LICENSE).
+Apache License 2.0 — see [alibabacloud-data-agent-skill/assets/LICENSE](alibabacloud-data-agent-skill/assets/LICENSE).

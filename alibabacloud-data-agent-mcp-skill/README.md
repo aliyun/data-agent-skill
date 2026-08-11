@@ -2,20 +2,28 @@
 
 A standalone Agent Skill that exposes **Alibaba Cloud Apsara Data Agent for Analytics** as a native MCP server (`data-agent`, 18 `data_agent_*` tools), built in Go. AI assistants call the tools directly to discover databases, run natural language analysis, track progress via server-side SSE monitoring, and fetch conclusions, charts, and file artifacts (reports / Excel exports).
 
-> Looking for the Python CLI integration instead? See the repository root [README](../README.md) and [SKILL.md](../SKILL.md).
+> Looking for the Python CLI integration instead? See the repository root [README](../README.md) and [SKILL.md](../alibabacloud-data-agent-skill/SKILL.md).
 
 ## Requirements
 
-- **Go 1.23+** (https://go.dev/dl/) — binaries are not committed; the launcher builds from source on first run and caches it under `assets/server/bin/` (gitignored)
+- A **data-agent-mcp-server binary**. This skill ships without server source or binaries — build once from the repository's [`server/`](../server) project (Go 1.23+, `cd server && make build`) or place a release binary where the launcher can find it (see Server Binary below)
 - Alibaba Cloud credentials with `AliyunDMSFullAccess` or `AliyunDMSDataAgentFullAccess` (see [references/ram-policies.md](references/ram-policies.md))
 - Data sources managed in Alibaba Cloud DMS / Data Agent Data Center
+
+## Server Binary
+
+`scripts/select-binary.sh` locates the binary in this order:
+
+1. **`$DATA_AGENT_SERVER_BIN`** — explicit path; use this for standalone deployments where the binary lives outside the skill (e.g. `/usr/local/bin/data-agent-mcp-server`)
+2. **`assets/bin/`** inside this skill — drop `data-agent-mcp-server` (or the platform-suffixed `data-agent-mcp-server-<os>-<arch>`) here when distributing the skill on its own
+3. **`../server/bin/`** — monorepo development build (`cd server && make build`)
 
 ## Configuration
 
 Sources and priority (highest wins): **env vars > `.env` file > `config.yaml` > defaults**.
 
 ```bash
-cd assets/server
+cd server                          # the Go server project at the repository root
 cp .env.example .env               # secrets: AK/SK (never commit; gitignored)
 cp config.yaml.example config.yaml # non-secret settings (gitignored)
 ```
@@ -238,14 +246,35 @@ Register in the client (endpoint path `/mcp`):
 
 For SSE-only clients, start with `MCP_TRANSPORT=sse` and connect to `http://<host>:8931/sse`.
 
-For production, run it under a supervisor (systemd / launchd / container). Example systemd unit:
+For production, run it under a supervisor (systemd / launchd / container). Deploy the binary directly — the skill launcher is not needed for standalone server deployments. Example systemd unit:
 
 ```ini
 [Service]
-WorkingDirectory=/opt/alibabacloud-data-agent-mcp-skill/assets/server
+# Config directory: contains config.yaml and .env (or use $DATA_AGENT_CONFIG)
+WorkingDirectory=/etc/data-agent-mcp-server
 Environment=MCP_TRANSPORT=streamable-http MCP_PORT=8931
-ExecStart=/usr/bin/bash /opt/alibabacloud-data-agent-mcp-skill/scripts/select-binary.sh
+ExecStart=/usr/local/bin/data-agent-mcp-server
 Restart=always
+```
+
+When fronting the server with a reverse proxy (nginx etc.), the proxy read
+timeout must exceed the server wait cap (110s by default, see
+`DATA_AGENT_WAIT_CAP`), long-poll timeouts must not count as upstream
+failures, and response buffering must be off for SSE:
+
+```nginx
+upstream data-agent-mcp {
+    server 10.0.0.1:8931 max_fails=0;   # blocking waits hit the cap by design
+    keepalive 32;
+}
+location / {
+    proxy_pass http://data-agent-mcp;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_connect_timeout 5s;
+    proxy_read_timeout    180s;         # > wait cap (110s)
+    proxy_buffering off;
+}
 ```
 
 ### Option 3: Multi-tenant deployment (e.g. Feishu Aily)
@@ -286,7 +315,7 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion
 `cmd/dacli` is a bundled CLI that calls the HTTP endpoint exactly like Aily does (identity headers on every request). Ideal for verifying an Option 2/3 deployment by hand:
 
 ```bash
-cd assets/server && make dacli   # -> bin/dacli (or: go build -o bin/dacli ./cmd/dacli)
+cd server && make dacli          # -> bin/dacli (or: go build -o bin/dacli ./cmd/dacli)
 
 # identity via flags (or env: AILY_MCP_URL / AILY_USER / AILY_EMAIL / AILY_TOKEN)
 ./bin/dacli --url http://localhost:8931/mcp \
@@ -310,13 +339,12 @@ Then from the AI client: `data_agent_list_workspaces` → `data_agent_list_works
 
 ## Build & Development
 
-All builds run from `assets/server/` and output to `assets/server/bin/` (gitignored — binaries are never committed). Go 1.23+ required.
+The Go server lives in the repository's top-level [`server/`](../server) project; builds output to `server/bin/` (gitignored — binaries are never committed). Go 1.23+ required.
 
 ```bash
-cd assets/server
+cd server
 
-# MCP server — normally you don't build it by hand:
-#   scripts/select-binary.sh builds it automatically on first launch.
+# MCP server
 make build            # -> bin/data-agent-mcp-server (current platform)
 make build-all        # -> bin/data-agent-mcp-server-linux-{amd64,arm64} (cross-compile)
 
@@ -337,15 +365,17 @@ DATA_AGENT_DEBUG_SSE=1 ...   # log raw SSE traffic when debugging event parsing
 ```
 ├── SKILL.md                     # Agent instructions (tools, workflows, troubleshooting)
 ├── README.md                    # This file — human deployment guide
-├── scripts/select-binary.sh     # Launcher: pick platform binary or build from source
+├── scripts/select-binary.sh     # Launcher: locate a deployed/built server binary
 ├── references/
 │   ├── INSTALLATION.md          # Setup reference (transports, credentials, config, identity mode)
 │   └── ram-policies.md          # RAM permission requirements
-└── assets/server/               # Go MCP Server source
-    ├── config.yaml.example      # Config template
-    ├── .env.example             # Secrets template
-    ├── cmd/dacli/               # Manual verification client (Aily-style HTTP calls)
-    └── internal/                # config / dataagent / mcp / session / tenant / event
+└── assets/                      # Static assets; optional assets/bin/ for a bundled binary
+
+../server/                       # Go MCP Server source (standalone project at the repo root)
+├── config.yaml.example          # Config template
+├── .env.example                 # Secrets template
+├── cmd/dacli/                   # Manual verification client (Aily-style HTTP calls)
+└── internal/                    # config / dataagent / mcp / session / tenant / event
 ```
 
 ## License
