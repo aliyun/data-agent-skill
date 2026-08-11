@@ -21,6 +21,7 @@ const (
 	userAgentPrefix            = "AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill"
 	dataAgentListPageSize      = 50
 	dataAgentListMaxPageScan   = 100
+	dmsTagMetaPageSize         = 200
 	defaultSessionLookbackDays = 7
 )
 
@@ -370,6 +371,79 @@ func (c *Client) ResolveWorkspaceID() string {
 	return ws
 }
 
+// listTagMetaAssetPages scans all ListTagMetaAsset pages on the dms-enterprise
+// endpoint and returns the raw items. baseParams must not contain paging keys.
+// Stops on an empty/short page, when TotalCount is reached, on a repeated
+// page (API ignoring PageNumber), or at the page-scan safety cap.
+func (c *Client) listTagMetaAssetPages(dmsEndpoint string, baseParams map[string]string) ([]map[string]interface{}, error) {
+	var items []map[string]interface{}
+	prevFirst := ""
+	for page := 1; page <= dataAgentListMaxPageScan; page++ {
+		params := map[string]string{
+			"PageNumber": strconv.Itoa(page),
+			"PageSize":   strconv.Itoa(dmsTagMetaPageSize),
+		}
+		for k, v := range baseParams {
+			params[k] = v
+		}
+
+		body, err := c.callDMSEnterprise(dmsEndpoint, "ListTagMetaAsset", "2018-11-01", params)
+		if err != nil {
+			return nil, err
+		}
+
+		// Response format: { "Data": [...], "TotalCount": N, "Success": true }
+		rawList, ok := body["Data"]
+		if !ok {
+			rawList, ok = body["data"]
+		}
+		if !ok {
+			break
+		}
+		listSlice, ok := rawList.([]interface{})
+		if !ok || len(listSlice) == 0 {
+			break
+		}
+
+		// Guard against an API that ignores PageNumber and repeats page 1.
+		if first, err := json.Marshal(listSlice[0]); err == nil {
+			if s := string(first); s == prevFirst {
+				break
+			} else {
+				prevFirst = s
+			}
+		}
+
+		for _, item := range listSlice {
+			if m, ok := item.(map[string]interface{}); ok {
+				items = append(items, m)
+			}
+		}
+
+		total := firstInt64(body, "TotalCount", "totalCount", "Total", "total")
+		if total > 0 && int64(len(items)) >= total {
+			break
+		}
+		if len(listSlice) < dmsTagMetaPageSize {
+			break
+		}
+	}
+	return items, nil
+}
+
+// tagMetaAttrs returns the attribute object of a ListTagMetaAsset item; fields
+// are nested inside MetaEntityAttrs, with the item itself as fallback.
+func tagMetaAttrs(m map[string]interface{}) map[string]interface{} {
+	attrs := jsonObj(m, "MetaEntityAttrs")
+	if attrs == nil {
+		attrs = jsonObj(m, "metaEntityAttrs")
+	}
+	if attrs == nil {
+		attrs = m
+	}
+	return attrs
+}
+
 // ListDatabases calls ListTagMetaAsset on the dms-enterprise endpoint to
 // list databases imported into a workspace's Data Center.
 // An empty workspaceID falls back to the configured/default workspace.
@@ -385,48 +459,21 @@ func (c *Client) ListDatabases(workspaceID string) ([]DatabaseInfo, error) {
 	tagName := fmt.Sprintf("sys::DMS-DA::%s::space:%s", c.region, ws)
 
 	params := map[string]string{
-		"TagName":    tagName,
-		"MetaType":   "META_DATABASE",
-		"PageNumber": "1",
-		"PageSize":   "50",
+		"TagName":  tagName,
+		"MetaType": "META_DATABASE",
 	}
 	if tid != "" {
 		params["Tid"] = tid
 	}
 
-	body, err := c.callDMSEnterprise(dmsEndpoint, "ListTagMetaAsset", "2018-11-01", params)
+	items, err := c.listTagMetaAssetPages(dmsEndpoint, params)
 	if err != nil {
 		return nil, fmt.Errorf("ListDatabases: %w", err)
 	}
 
-	// Response format: { "Data": [...], "TotalCount": N, "Success": true }
-	rawList, ok := body["Data"]
-	if !ok {
-		rawList, ok = body["data"]
-	}
-	if !ok {
-		return nil, nil
-	}
-
-	listSlice, ok := rawList.([]interface{})
-	if !ok {
-		return nil, nil
-	}
-
 	var result []DatabaseInfo
-	for _, item := range listSlice {
-		m, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		// Fields are nested inside MetaEntityAttrs
-		attrs := jsonObj(m, "MetaEntityAttrs")
-		if attrs == nil {
-			attrs = jsonObj(m, "metaEntityAttrs")
-		}
-		if attrs == nil {
-			attrs = m // fallback: try top-level
-		}
+	for _, m := range items {
+		attrs := tagMetaAttrs(m)
 		result = append(result, DatabaseInfo{
 			DbID:               firstInt64(attrs, "DbId", "dbId"),
 			InstanceID:         firstInt64(attrs, "InstanceId", "instanceId"),
@@ -555,10 +602,8 @@ func (c *Client) ListImportedTables(databaseID, workspaceID string) ([]TableInfo
 	tagName := fmt.Sprintf("sys::DMS-DA::%s::space:%s", c.region, ws)
 
 	params := map[string]string{
-		"TagName":    tagName,
-		"MetaType":   "META_TABLE",
-		"PageNumber": "1",
-		"PageSize":   "200",
+		"TagName":  tagName,
+		"MetaType": "META_TABLE",
 	}
 	if databaseID != "" {
 		params["MetaParentId"] = databaseID
@@ -567,36 +612,14 @@ func (c *Client) ListImportedTables(databaseID, workspaceID string) ([]TableInfo
 		params["Tid"] = tid
 	}
 
-	body, err := c.callDMSEnterprise(dmsEndpoint, "ListTagMetaAsset", "2018-11-01", params)
+	items, err := c.listTagMetaAssetPages(dmsEndpoint, params)
 	if err != nil {
 		return nil, fmt.Errorf("ListImportedTables: %w", err)
 	}
 
-	rawList, ok := body["Data"]
-	if !ok {
-		rawList, ok = body["data"]
-	}
-	if !ok {
-		return nil, nil
-	}
-	listSlice, ok := rawList.([]interface{})
-	if !ok {
-		return nil, nil
-	}
-
 	var result []TableInfo
-	for _, item := range listSlice {
-		m, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		attrs := jsonObj(m, "MetaEntityAttrs")
-		if attrs == nil {
-			attrs = jsonObj(m, "metaEntityAttrs")
-		}
-		if attrs == nil {
-			attrs = m
-		}
+	for _, m := range items {
+		attrs := tagMetaAttrs(m)
 		result = append(result, TableInfo{
 			TableName: firstStr(attrs, "TableName", "tableName"),
 			TableID:   firstStr(attrs, "TableId", "tableId"),
