@@ -53,10 +53,10 @@ metadata:
 
 ### Use Existing venv (Recommended)
 
-The project ships a pre-built `venv/` directory (all dependencies pre-installed). Use it whenever possible:
+Work from the skill directory (`alibabacloud-data-agent-skill/`). If a pre-built `venv/` exists (all dependencies pre-installed), use it whenever possible:
 
 ```bash
-cd data-agent-skill
+cd alibabacloud-data-agent-skill
 
 # Option A (recommended): activate the venv
 source venv/bin/activate

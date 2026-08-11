@@ -628,28 +628,29 @@ If a single `data_agent_status` call fails (network error, timeout), you may ret
 ```
 ├── SKILL.md                     # This document
 ├── README.md                    # Human-facing deployment guide (stdio / HTTP / Aily)
-├── .claude/settings.json        # MCP Server configuration (auto-loaded by Claude Code)
-├── assets/
-│   ├── example_game_data.csv    # Example data for evals
-│   └── server/                  # Go MCP Server (built from source, binaries not committed)
-│       ├── main.go              # Entry point
-│       ├── go.mod / Makefile    # Build config
-│       ├── config.yaml.example  # YAML config template (region/workspace/aily multi-tenant)
-│       ├── .env.example         # Secrets template (AK/SK, shared secret)
-│       ├── bin/                 # Build output (gitignored; created by select-binary.sh)
-│       └── internal/
-│           ├── mcp/             # MCP Server + 18 tool handlers
-│           ├── session/         # Session Manager + Watcher + Housekeeping
-│           ├── dataagent/       # Alibaba Cloud API client (V3 signing, SSE)
-│           ├── config/          # YAML + .env configuration loader
-│           ├── tenant/          # Aily identity → RAM role AssumeRole registry
-│           └── event/           # SSE event parser
 ├── scripts/
-│   └── select-binary.sh         # Platform binary selector
+│   └── select-binary.sh         # Server binary locator ($DATA_AGENT_SERVER_BIN > assets/bin/ > ../server/bin/)
 ├── references/
 │   ├── INSTALLATION.md          # Setup reference (transports, credentials, config, identity mode)
 │   └── ram-policies.md          # RAM permission requirements
-└── sessions/                    # Session data (status.json, progress.log)
+└── assets/
+    ├── example_game_data.csv    # Example data for evals
+    └── bin/                     # Optional: deployer-placed server binaries (gitignored)
+
+../server/                       # Go MCP Server source (standalone project at the repository root)
+├── main.go                      # Entry point
+├── go.mod / Makefile            # Build config (make build / build-all / dacli / test)
+├── config.yaml.example          # YAML config template (region/workspace/identity multi-tenant)
+├── .env.example                 # Secrets template (AK/SK, auth token)
+├── bin/                         # Build output (gitignored)
+├── cmd/dacli/                   # Manual verification client
+└── internal/
+    ├── mcp/                     # MCP Server + 18 tool handlers
+    ├── session/                 # Session Manager + Watcher + Housekeeping
+    ├── dataagent/               # Alibaba Cloud API client (V3 signing, SSE)
+    ├── config/                  # YAML + .env configuration loader
+    ├── tenant/                  # Identity → RAM role AssumeRole registry
+    └── event/                   # SSE event parser
 ```
 
 ---
@@ -659,7 +660,7 @@ If a single `data_agent_status` call fails (network error, timeout), you may ret
 | Problem | Cause | Solution |
 |---------|-------|----------|
 | MCP tools not available | MCP Server not registered in the agent runtime | Abort the task with "Data Agent MCP server is not registered in this agent runtime. Task aborted." Registration must be fixed in AgentHub/OpenClaw setup, then the runtime must be reloaded. Do not start `select-binary.sh`, edit runtime settings, probe localhost, curl `/mcp`, or fall back to CLI/SDK/API calls during the task |
-| `No data-agent-mcp-server binary found` | Server not built yet and Go not installed | Install Go 1.23+ (https://go.dev/dl/) — the launcher script will auto-build from source |
+| `No data-agent-mcp-server binary found` | No binary deployed yet | Build one from the repository's `server/` project (`cd server && make build`, Go 1.23+) or set `DATA_AGENT_SERVER_BIN` / place it in the skill's `assets/bin/` |
 | `failed to load credentials` | No AK/SK configured | Set env vars or create `~/.aliyun/config.json` (see Installation) |
 | `data_agent_list_workspace_databases` returns empty | Database not imported to Data Center | Use `data_agent_search_dms_databases` → `data_agent_import_database` to import first |
 | `Specified parameter InstanceId is not valid` / `database_None_<db>` | Session was created from DMS search output or missing instance metadata | Call `data_agent_list_workspace_databases()` in the target workspace and pass its `instance_id` plus `instance_resource_id` as `instance_name` to `create_session` |
