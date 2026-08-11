@@ -382,7 +382,7 @@ var statusTool = mcp.NewTool(
 	"data_agent_status",
 	mcp.WithDescription("Get current status of a Data Agent session including step progress, waiting state, and confirmations. Pass wait_timeout to block server-side until status changes — eliminates LLM roundtrip cost during polling."),
 	mcp.WithString("session_id", mcp.Required(), mcp.Description("Session ID to check")),
-	mcp.WithNumber("wait_timeout", mcp.Description("Seconds to block waiting for a status change (0=immediate snapshot). Recommended: 30. Capped server-side (default 110s) so the response beats the MCP transport timeout. Returns changed=true when status advances, changed=false on timeout. Never call in parallel for the same session.")),
+	mcp.WithNumber("wait_timeout", mcp.Description("Seconds to block waiting for a status change (0=immediate snapshot). Recommended: 30. Capped server-side (default 55s) so the response beats reverse-proxy read timeouts (nginx default 60s) and MCP transport timeouts. Returns changed=true when status advances, changed=false on timeout. Never call in parallel for the same session.")),
 	mcp.WithString("poll_hint", mcp.Description("Caller-supplied differentiation hint to avoid identical consecutive calls. Pass the current step or an incrementing counter (e.g. check-1, check-2). The server ignores this value.")),
 )
 
@@ -390,7 +390,7 @@ var waitResultTool = mcp.NewTool(
 	"data_agent_wait_result",
 	mcp.WithDescription("Block until the session needs LLM attention: completed, error, canceled, or waiting for manual input. For auto_confirm=true sessions this returns only on completion/error, eliminating all intermediate status polling. Returns reason: 'completed'|'error'|'canceled'|'waiting_input'|'timeout'. On reason=timeout the session is still running: report the returned progress (checkpoint_delta, new_conclusions) to the user, then call this tool again with the same session_id. Never call in parallel for the same session."),
 	mcp.WithString("session_id", mcp.Required(), mcp.Description("Session ID to wait for")),
-	mcp.WithNumber("timeout", mcp.Description("Max seconds to block. Default and ceiling: the server wait cap (110s unless DATA_AGENT_WAIT_CAP overrides it), chosen to finish before common MCP client transport timeouts (~120s); larger values are clamped. On reason=timeout just call again.")),
+	mcp.WithNumber("timeout", mcp.Description("Max seconds to block. Default and ceiling: the server wait cap (55s unless DATA_AGENT_WAIT_CAP overrides it), chosen to finish before nginx default proxy_read_timeout (60s) and MCP client transport timeouts (~120s); larger values are clamped. On reason=timeout just call again.")),
 )
 
 var watchSessionTool = mcp.NewTool(

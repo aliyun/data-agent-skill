@@ -49,10 +49,10 @@ upload:
 
 # Blocking-wait ceiling for data_agent_wait_result and data_agent_status
 # (wait_timeout), in seconds. Requests above the cap are clamped so the tool
-# response always beats the MCP client transport timeout (~120s in common
-# clients) — a graceful reason=timeout with progress info instead of a
+# response always beats reverse-proxy and client timeouts (~120s in common
+# clients and nginx default proxy_read_timeout 60s) — a graceful reason=timeout with progress info instead of a
 # "context canceled" error. Raise it only if every client's tool-call timeout
-# is known to be higher. Env override: DATA_AGENT_WAIT_CAP (default 110).
+# is known to be higher. Env override: DATA_AGENT_WAIT_CAP (default 55).
 
 # Logging. Everything goes to stderr: on stdio the host agent captures it, on
 # the HTTP transports the supervisor (systemd, container runtime) does.

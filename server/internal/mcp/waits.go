@@ -8,10 +8,11 @@ import (
 )
 
 // defaultWaitCap bounds every server-side blocking wait (data_agent_wait_result
-// and data_agent_status with wait_timeout). MCP clients commonly cancel tool
-// calls at ~120s; a wait that outlives the transport turns into a useless
-// "context canceled" error, so the server always answers before that.
-const defaultWaitCap = 110 * time.Second
+// and data_agent_status with wait_timeout). Reverse proxies commonly cut
+// upstream reads at 60s (nginx default proxy_read_timeout) and MCP clients
+// cancel tool calls at ~120s; a wait that outlives either turns into a useless
+// error, so the server always answers before the tightest common limit.
+const defaultWaitCap = 55 * time.Second
 
 // waitCapFromEnv returns the blocking-wait ceiling, overridable via the
 // DATA_AGENT_WAIT_CAP environment variable (seconds).

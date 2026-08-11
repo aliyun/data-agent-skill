@@ -263,7 +263,7 @@ func (c *client) ask(dbName, tables, query string) error {
 }
 
 // waitLoop calls data_agent_wait_result until a terminal reason or the total
-// deadline. The server caps each block (~110s by default) and returns
+// deadline. The server caps each block (~55s by default) and returns
 // reason=timeout while the session is still running, so a longer overall wait
 // is expressed as repeated calls.
 func (c *client) waitLoop(sessionID string, totalSeconds int) (string, error) {

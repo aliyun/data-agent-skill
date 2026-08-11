@@ -258,7 +258,7 @@ Restart=always
 ```
 
 When fronting the server with a reverse proxy (nginx etc.), the proxy read
-timeout must exceed the server wait cap (110s by default, see
+timeout must exceed the server wait cap (55s by default, see
 `DATA_AGENT_WAIT_CAP`), long-poll timeouts must not count as upstream
 failures, and response buffering must be off for SSE:
 
@@ -272,7 +272,7 @@ location / {
     proxy_http_version 1.1;
     proxy_set_header Connection "";
     proxy_connect_timeout 5s;
-    proxy_read_timeout    180s;         # > wait cap (110s)
+    proxy_read_timeout    120s;         # > wait cap (55s)
     proxy_buffering off;
 }
 ```
