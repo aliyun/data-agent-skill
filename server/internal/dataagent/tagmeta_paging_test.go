@@ -156,3 +156,53 @@ func TestListDatabasesSinglePageStops(t *testing.T) {
 		t.Fatalf("databases = %+v", got)
 	}
 }
+
+// API Key gateway errors must carry the backend request id in all three
+// failure shapes so tool errors are traceable to backend support tickets.
+func TestAPIKeyErrorsCarryRequestID(t *testing.T) {
+	newAPIKeyClient := func(handler roundTripFunc) *Client {
+		c := NewClient(&Credential{APIKey: "ak-test"}, "cn-hangzhou", WithWorkspaceID("ws-1"))
+		c.http = &http.Client{Transport: handler}
+		return c
+	}
+
+	t.Run("http error carries header request id", func(t *testing.T) {
+		c := newAPIKeyClient(func(req *http.Request) (*http.Response, error) {
+			resp := jsonHTTPResponse(t, map[string]any{"Message": "denied"})
+			resp.StatusCode = 403
+			resp.Header.Set("x-acs-request-id", "REQ-HTTP-403")
+			return resp, nil
+		})
+		_, err := c.ListDatabases("")
+		if err == nil || !strings.Contains(err.Error(), "REQ-HTTP-403") {
+			t.Fatalf("error missing request id: %v", err)
+		}
+	})
+
+	t.Run("success=false carries body requestId", func(t *testing.T) {
+		c := newAPIKeyClient(func(req *http.Request) (*http.Response, error) {
+			return jsonHTTPResponse(t, map[string]any{
+				"success": false, "code": "Forbidden", "msg": "no grant",
+				"requestId": "REQ-BODY-1",
+			}), nil
+		})
+		_, err := c.ListDatabases("")
+		if err == nil || !strings.Contains(err.Error(), "REQ-BODY-1") {
+			t.Fatalf("error missing body requestId: %v", err)
+		}
+	})
+
+	t.Run("HttpStatusCode>=400 falls back to header", func(t *testing.T) {
+		c := newAPIKeyClient(func(req *http.Request) (*http.Response, error) {
+			resp := jsonHTTPResponse(t, map[string]any{
+				"HttpStatusCode": 400, "Message": "bad param",
+			})
+			resp.Header.Set("x-acs-request-id", "REQ-HDR-400")
+			return resp, nil
+		})
+		_, err := c.ListDatabases("")
+		if err == nil || !strings.Contains(err.Error(), "REQ-HDR-400") {
+			t.Fatalf("error missing header fallback request id: %v", err)
+		}
+	})
+}
