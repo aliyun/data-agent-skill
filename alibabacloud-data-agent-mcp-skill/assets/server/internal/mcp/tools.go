@@ -64,8 +64,8 @@ func jsonResult(v any) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultText(string(b)), nil
 }
 
-func (s *Server) handleListDatabases(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	dbs, err := s.client.ListDatabases()
+func (s *Server) handleListDatabases(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	dbs, err := s.client.ListDatabases(argStr(req, "workspace_id"))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to list databases: %v", err)), nil
 	}
@@ -203,26 +203,38 @@ func (s *Server) handleStatus(ctx context.Context, req mcp.CallToolRequest) (*mc
 			waitTimeout = int(f)
 		}
 	}
+	// Cap the long-poll so the response beats the MCP transport timeout.
+	longPoll := waitTimeout > 0
+	wait := s.capWait(time.Duration(waitTimeout) * time.Second)
+
+	var dupWarning string
+	if longPoll {
+		if s.waits.enter(sid) {
+			defer s.waits.exit(sid)
+		} else {
+			// Duplicate parallel wait — degrade to an immediate snapshot.
+			dupWarning = duplicateWaitWarning
+			wait = 0
+		}
+	}
 
 	var state *session.StateSnapshot
 	changed := true
 	var err error
 
-	if waitTimeout > 0 {
+	if wait > 0 {
 		var cur *session.StateSnapshot
 		cur, err = s.mgr.GetStatus(sid)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("failed to get status: %v", err)), nil
 		}
-		state, changed, err = s.mgr.WaitForChange(ctx, sid, cur.Checkpoint, time.Duration(waitTimeout)*time.Second)
+		state, changed, err = s.mgr.WaitForChange(ctx, sid, cur.Checkpoint, wait)
 	} else {
 		state, err = s.mgr.GetStatus(sid)
 	}
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get status: %v", err)), nil
 	}
-
-	pollSeq := s.mgr.IncrPollSeq(sid)
 
 	result := map[string]any{
 		"session_id":    state.SessionID,
@@ -238,13 +250,21 @@ func (s *Server) handleStatus(ctx context.Context, req mcp.CallToolRequest) (*mc
 		"artifacts":     state.Artifacts,
 		"error_message": state.ErrorMessage,
 		"updated_at":    state.UpdatedAt,
-		"poll_seq":      pollSeq,
 	}
-	if waitTimeout > 0 {
+	if longPoll {
 		result["changed"] = changed
+	} else {
+		// Only bare snapshots count toward the anti-loop warning: a
+		// long-poll with wait_timeout is the recommended pattern and must
+		// never be scolded for "polling".
+		pollSeq := s.mgr.IncrPollSeq(sid)
+		result["poll_seq"] = pollSeq
+		if pollSeq > 2 {
+			result["warning"] = "You have polled status " + strconv.Itoa(pollSeq) + " times without progress. STOP bare polling. Use data_agent_wait_result (or data_agent_status with wait_timeout) so the server blocks for you. Repeated status calls will trigger 'Repetitive tool calls detected' errors."
+		}
 	}
-	if pollSeq > 2 {
-		result["warning"] = "You have polled status " + strconv.Itoa(pollSeq) + " times. STOP polling. Use data_agent_wait_result instead of calling data_agent_status repeatedly. Repeated status calls will trigger 'Repetitive tool calls detected' errors."
+	if dupWarning != "" {
+		result["warning"] = dupWarning
 	}
 	return jsonResult(result)
 }
@@ -255,11 +275,33 @@ func (s *Server) handleWaitResult(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError("session_id is required"), nil
 	}
 
-	timeout := 300 * time.Second
+	// Cap the block so the response beats the MCP transport timeout
+	// (~120s in common clients): a graceful reason=timeout with progress is
+	// useful, a transport-canceled request is not.
+	timeout := s.effectiveWaitCap()
 	if t, ok := req.GetArguments()["timeout"]; ok && t != nil {
 		if f, ok2 := t.(float64); ok2 && f > 0 {
-			timeout = time.Duration(f) * time.Second
+			timeout = s.capWait(time.Duration(f) * time.Second)
 		}
+	}
+
+	if !s.waits.enter(sid) {
+		// Duplicate parallel wait — degrade to an immediate snapshot.
+		snap, err := s.mgr.GetStatus(sid)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to wait: %v", err)), nil
+		}
+		result := waitResultPayload(snap, "duplicate_wait")
+		result["warning"] = duplicateWaitWarning
+		return jsonResult(result)
+	}
+	defer s.waits.exit(sid)
+
+	// Baseline for the progress delta reported on timeout.
+	baseCheckpoint, baseConclusions := 0, 0
+	if cur, err := s.mgr.GetStatus(sid); err == nil {
+		baseCheckpoint = cur.Checkpoint
+		baseConclusions = len(cur.Conclusions)
 	}
 
 	snap, reason, err := s.mgr.WaitForResult(ctx, sid, timeout)
@@ -267,7 +309,23 @@ func (s *Server) handleWaitResult(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError(fmt.Sprintf("failed to wait: %v", err)), nil
 	}
 
-	result := map[string]any{
+	result := waitResultPayload(snap, reason)
+	if reason == "timeout" || reason == "client_canceled" {
+		// The session is still running: hand the LLM the progress made
+		// during this wait plus an explicit continuation instruction, so
+		// the turn produces a user-visible update instead of a dead end.
+		result["checkpoint_delta"] = snap.Checkpoint - baseCheckpoint
+		if n := len(snap.Conclusions); n > baseConclusions {
+			result["new_conclusions"] = snap.Conclusions[baseConclusions:]
+		}
+		result["next_action"] = "Session still running. Briefly report progress to the user (step_name, checkpoint_delta, new_conclusions), then call data_agent_wait_result again with the same session_id."
+	}
+	return jsonResult(result)
+}
+
+// waitResultPayload builds the common response body for wait_result outcomes.
+func waitResultPayload(snap *session.StateSnapshot, reason string) map[string]any {
+	return map[string]any{
 		"session_id":     snap.SessionID,
 		"status":         snap.Status,
 		"reason":         reason,
@@ -284,7 +342,6 @@ func (s *Server) handleWaitResult(ctx context.Context, req mcp.CallToolRequest) 
 		"error_message":  snap.ErrorMessage,
 		"updated_at":     snap.UpdatedAt,
 	}
-	return jsonResult(result)
 }
 
 func (s *Server) handleWatchSession(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -530,11 +587,9 @@ func (s *Server) handleListTables(_ context.Context, req mcp.CallToolRequest) (*
 }
 
 func (s *Server) handleListImportedTables(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	dbID := argStr(req, "database_id")
-	if dbID == "" {
-		return mcp.NewToolResultError("database_id is required"), nil
-	}
-	tables, err := s.client.ListImportedTables(dbID)
+	// database_id is optional: when omitted, all imported tables in the
+	// workspace are returned (across databases).
+	tables, err := s.client.ListImportedTables(argStr(req, "database_id"), argStr(req, "workspace_id"))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to list imported tables: %v", err)), nil
 	}

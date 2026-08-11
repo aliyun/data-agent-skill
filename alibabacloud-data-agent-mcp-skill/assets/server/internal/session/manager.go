@@ -410,6 +410,13 @@ func (m *Manager) WaitForChange(ctx context.Context, sessionID string, fromCheck
 
 		select {
 		case <-ctx.Done():
+			// Transport canceled the request (client timeout/disconnect).
+			// Degrade to the last known snapshot instead of surfacing a
+			// "context canceled" tool error: if the response can still be
+			// written it carries usable progress.
+			if snap, err := m.GetStatus(sessionID); err == nil {
+				return snap, false, nil
+			}
 			return nil, false, ctx.Err()
 		case <-time.After(remaining):
 			snap, _ = m.GetStatus(sessionID)
@@ -428,7 +435,8 @@ func (m *Manager) WaitForChange(ctx context.Context, sessionID string, fromCheck
 // For auto_confirm=true sessions this typically fires only on completion/error,
 // eliminating all intermediate status polling by the LLM.
 // Returns (snapshot, reason, error) where reason is one of:
-// "completed", "error", "canceled", "waiting_input", "timeout".
+// "completed", "error", "canceled", "waiting_input", "timeout",
+// "client_canceled" (transport canceled the request mid-wait).
 func (m *Manager) WaitForResult(ctx context.Context, sessionID string, timeout time.Duration) (*StateSnapshot, string, error) {
 	m.mu.RLock()
 	entry, ok := m.watchers[sessionID]
@@ -461,6 +469,13 @@ func (m *Manager) WaitForResult(ctx context.Context, sessionID string, timeout t
 
 		select {
 		case <-ctx.Done():
+			// Transport canceled the request (client timeout/disconnect).
+			// Return the last known snapshot with a distinct reason instead
+			// of a "context canceled" tool error, so callers that receive
+			// the response still get usable progress.
+			if snap, err := m.GetStatus(sessionID); err == nil {
+				return snap, "client_canceled", nil
+			}
 			return nil, "", ctx.Err()
 		case <-time.After(remaining):
 			snap, _ = m.GetStatus(sessionID)

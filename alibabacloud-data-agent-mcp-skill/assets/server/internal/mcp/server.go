@@ -47,6 +47,12 @@ type Server struct {
 	remoteCaller bool
 	// reqLog controls how much of each tool call reaches the log.
 	reqLog RequestLogLevel
+	// waitCap bounds server-side blocking waits so responses beat the MCP
+	// client transport timeout (see waits.go).
+	waitCap time.Duration
+	// waits tracks in-flight blocking waits per session; shared across
+	// tenant-scoped copies (pointer field).
+	waits *waitRegistry
 }
 
 // SessionDefaults are group-level fallbacks applied when a tool call omits
@@ -98,10 +104,10 @@ type sessionManager interface {
 }
 
 type dataAgentClient interface {
-	ListDatabases() ([]dataagent.DatabaseInfo, error)
+	ListDatabases(string) ([]dataagent.DatabaseInfo, error)
 	ListFiles(string, string, string, string) ([]dataagent.FileInfo, error)
 	ListTables(string) ([]dataagent.TableInfo, error)
-	ListImportedTables(string) ([]dataagent.TableInfo, error)
+	ListImportedTables(string, string) ([]dataagent.TableInfo, error)
 	ImportDatabase(dataagent.ImportDatabaseOpts) error
 	ListInstances(string, string, int, int) ([]dataagent.InstanceInfo, error)
 	SearchDatabases(string, int, int) ([]dataagent.SearchDBInfo, error)
@@ -120,6 +126,8 @@ func New(mgr *session.Manager, client *dataagent.Client, version string) *Server
 		hdrJWT:       tenant.DefaultJWTHeader,
 		remoteCaller: standalone,
 		reqLog:       defaultRequestLogLevel(standalone),
+		waitCap:      waitCapFromEnv(),
+		waits:        newWaitRegistry(),
 	}
 
 	mcpServer := server.NewMCPServer(
@@ -347,7 +355,8 @@ func isRemoteTransport(transport string) bool {
 
 var listWorkspaceDatabasesTool = mcp.NewTool(
 	"data_agent_list_workspace_databases",
-	mcp.WithDescription("List databases imported into the current workspace's Data Agent Data Center. MANDATORY first step before data_agent_create_session — always call this in the same turn, in any auth mode (AK/SK or API Key). Never create a session from guessed or memorized database parameters."),
+	mcp.WithDescription("List databases imported into a workspace's Data Agent Data Center. MANDATORY first step before data_agent_create_session — always call this in the same turn, in any auth mode (AK/SK or API Key). Never create a session from guessed or memorized database parameters."),
+	mcp.WithString("workspace_id", mcp.Description("Workspace ID to list databases for. Defaults to the configured workspace. Resolve names to IDs via data_agent_list_workspaces; never pass a workspace name.")),
 )
 
 var createSessionTool = mcp.NewTool(
@@ -373,15 +382,15 @@ var statusTool = mcp.NewTool(
 	"data_agent_status",
 	mcp.WithDescription("Get current status of a Data Agent session including step progress, waiting state, and confirmations. Pass wait_timeout to block server-side until status changes — eliminates LLM roundtrip cost during polling."),
 	mcp.WithString("session_id", mcp.Required(), mcp.Description("Session ID to check")),
-	mcp.WithNumber("wait_timeout", mcp.Description("Seconds to block waiting for a status change (0=immediate snapshot). Recommended: 30. Returns changed=true when status advances, changed=false on timeout.")),
+	mcp.WithNumber("wait_timeout", mcp.Description("Seconds to block waiting for a status change (0=immediate snapshot). Recommended: 30. Capped server-side (default 110s) so the response beats the MCP transport timeout. Returns changed=true when status advances, changed=false on timeout. Never call in parallel for the same session.")),
 	mcp.WithString("poll_hint", mcp.Description("Caller-supplied differentiation hint to avoid identical consecutive calls. Pass the current step or an incrementing counter (e.g. check-1, check-2). The server ignores this value.")),
 )
 
 var waitResultTool = mcp.NewTool(
 	"data_agent_wait_result",
-	mcp.WithDescription("Block until the session needs LLM attention: completed, error, canceled, or waiting for manual input. For auto_confirm=true sessions this returns only on completion/error, eliminating all intermediate status polling. Returns reason: 'completed'|'error'|'canceled'|'waiting_input'|'timeout'."),
+	mcp.WithDescription("Block until the session needs LLM attention: completed, error, canceled, or waiting for manual input. For auto_confirm=true sessions this returns only on completion/error, eliminating all intermediate status polling. Returns reason: 'completed'|'error'|'canceled'|'waiting_input'|'timeout'. On reason=timeout the session is still running: report the returned progress (checkpoint_delta, new_conclusions) to the user, then call this tool again with the same session_id. Never call in parallel for the same session."),
 	mcp.WithString("session_id", mcp.Required(), mcp.Description("Session ID to wait for")),
-	mcp.WithNumber("timeout", mcp.Description("Max seconds to wait (default 300). Returns reason=timeout if exceeded.")),
+	mcp.WithNumber("timeout", mcp.Description("Max seconds to block. Default and ceiling: the server wait cap (110s unless DATA_AGENT_WAIT_CAP overrides it), chosen to finish before common MCP client transport timeouts (~120s); larger values are clamped. On reason=timeout just call again.")),
 )
 
 var watchSessionTool = mcp.NewTool(
@@ -436,8 +445,9 @@ var listTablesTool = mcp.NewTool(
 
 var listImportedTablesTool = mcp.NewTool(
 	"data_agent_list_imported_tables",
-	mcp.WithDescription("List tables already imported into the current workspace's Data Center. Only shows tables tagged for the active workspace."),
-	mcp.WithString("database_id", mcp.Required(), mcp.Description("DMS database ID")),
+	mcp.WithDescription("List tables already imported into a workspace's Data Center. Only shows tables tagged for that workspace."),
+	mcp.WithString("database_id", mcp.Description("DMS database ID. Omit to list imported tables across all databases in the workspace.")),
+	mcp.WithString("workspace_id", mcp.Description("Workspace ID to list imported tables for. Defaults to the configured workspace.")),
 )
 
 var importDatabaseTool = mcp.NewTool(

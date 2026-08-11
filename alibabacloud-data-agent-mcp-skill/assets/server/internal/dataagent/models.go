@@ -81,6 +81,8 @@ type TableInfo struct {
 	TableName string `json:"table_name"`
 	TableID   string `json:"table_id"`
 	Engine    string `json:"engine"`
+	DbID      string `json:"db_id,omitempty"`   // parent database id (set in workspace-wide listings)
+	DbName    string `json:"db_name,omitempty"` // parent database name
 }
 
 // InstanceInfo from ListInstances.

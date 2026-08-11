@@ -60,6 +60,7 @@ type State struct {
 	RecommendedQuestions   []string       `json:"recommended_questions,omitempty"`
 	WorkspaceID            string         `json:"workspace_id,omitempty"`
 	PollSeq                int            `json:"-"` // not persisted; auto-incremented per status call
+	pollCheckpoint         int            // checkpoint seen at the last poll; progress resets PollSeq
 }
 
 // ---------- Change notification ----------
@@ -92,9 +93,17 @@ func (s *State) Changed() <-chan struct{} {
 
 // ---------- Thread-safe getters ----------
 
+// IncrPollSeq increments and returns the poll counter behind the anti-loop
+// warning. The counter resets whenever the checkpoint has advanced since the
+// previous poll: polling that observes progress is legitimate — only repeated
+// polls with no progress should escalate to a warning.
 func (s *State) IncrPollSeq() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.Checkpoint != s.pollCheckpoint {
+		s.pollCheckpoint = s.Checkpoint
+		s.PollSeq = 0
+	}
 	s.PollSeq++
 	return s.PollSeq
 }

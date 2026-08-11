@@ -15,11 +15,11 @@
 //
 //	tools                          list MCP tools
 //	workspaces                     data_agent_list_workspaces
-//	dbs                            data_agent_list_workspace_databases
-//	tables <db_id>                 data_agent_list_imported_tables
+//	dbs [workspace_id]             data_agent_list_workspace_databases
+//	tables [db_id] [workspace_id]  data_agent_list_imported_tables ("-" db_id = all)
 //	sessions                       data_agent_list_sessions (incl. history)
 //	status <session_id>            data_agent_status snapshot
-//	wait <session_id> [timeout]    data_agent_wait_result (default 240s)
+//	wait <session_id> [timeout]    data_agent_wait_result loop (default 240s total)
 //	result <session_id>            data_agent_result (saves images to ./dacli-out)
 //	files <session_id>             data_agent_list_files
 //	send <session_id> <message>    data_agent_send
@@ -248,10 +248,9 @@ func (c *client) ask(dbName, tables, query string) error {
 	}
 	fmt.Printf("session created: %s (waiting up to 240s...)\n", created.SessionID)
 
-	text, _, isErr, err = c.callTool("data_agent_wait_result",
-		map[string]interface{}{"session_id": created.SessionID, "timeout": 240})
-	if err != nil || isErr {
-		return fmt.Errorf("wait result: %v %s", err, text)
+	text, err = c.waitLoop(created.SessionID, 240)
+	if err != nil {
+		return err
 	}
 	var snap struct {
 		Status string `json:"status"`
@@ -261,6 +260,33 @@ func (c *client) ask(dbName, tables, query string) error {
 	fmt.Printf("status=%s reason=%s\n", snap.Status, snap.Reason)
 	// Fetch the full result (conclusions text + chart images).
 	return c.result(created.SessionID)
+}
+
+// waitLoop calls data_agent_wait_result until a terminal reason or the total
+// deadline. The server caps each block (~110s by default) and returns
+// reason=timeout while the session is still running, so a longer overall wait
+// is expressed as repeated calls.
+func (c *client) waitLoop(sessionID string, totalSeconds int) (string, error) {
+	deadline := time.Now().Add(time.Duration(totalSeconds) * time.Second)
+	for {
+		text, _, isErr, err := c.callTool("data_agent_wait_result",
+			map[string]interface{}{"session_id": sessionID, "timeout": totalSeconds})
+		if err != nil || isErr {
+			return text, fmt.Errorf("wait result: %v %s", err, text)
+		}
+		var snap struct {
+			Reason   string `json:"reason"`
+			StepName string `json:"step_name"`
+		}
+		_ = json.Unmarshal([]byte(text), &snap)
+		if snap.Reason != "timeout" && snap.Reason != "client_canceled" {
+			return text, nil
+		}
+		if time.Now().After(deadline) {
+			return text, nil
+		}
+		fmt.Printf("still running (step=%q), waiting again...\n", snap.StepName)
+	}
 }
 
 // result prints the final result and saves any inline chart images.
@@ -331,12 +357,22 @@ func (c *client) dispatch(args []string) error {
 	case "workspaces":
 		return c.simple("data_agent_list_workspaces", nil)
 	case "dbs":
-		return c.simple("data_agent_list_workspace_databases", nil)
-	case "tables":
-		if err := need(1, "tables <db_id>"); err != nil {
-			return err
+		args := map[string]interface{}{}
+		if len(rest) > 0 {
+			args["workspace_id"] = rest[0]
 		}
-		return c.simple("data_agent_list_imported_tables", map[string]interface{}{"database_id": rest[0]})
+		return c.simple("data_agent_list_workspace_databases", args)
+	case "tables":
+		// tables [db_id] [workspace_id] — omit db_id (or pass "-") to list
+		// all imported tables across the workspace.
+		args := map[string]interface{}{}
+		if len(rest) > 0 && rest[0] != "-" {
+			args["database_id"] = rest[0]
+		}
+		if len(rest) > 1 {
+			args["workspace_id"] = rest[1]
+		}
+		return c.simple("data_agent_list_imported_tables", args)
 	case "sessions":
 		return c.simple("data_agent_list_sessions", map[string]interface{}{"include_history": true})
 	case "status":
@@ -352,7 +388,12 @@ func (c *client) dispatch(args []string) error {
 		if len(rest) > 1 {
 			timeout, _ = strconv.Atoi(rest[1])
 		}
-		return c.simple("data_agent_wait_result", map[string]interface{}{"session_id": rest[0], "timeout": timeout})
+		text, err := c.waitLoop(rest[0], timeout)
+		if err != nil {
+			return err
+		}
+		fmt.Println(pretty(text))
+		return nil
 	case "result":
 		if err := need(1, "result <session_id>"); err != nil {
 			return err

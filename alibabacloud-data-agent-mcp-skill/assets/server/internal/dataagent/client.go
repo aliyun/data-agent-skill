@@ -371,12 +371,16 @@ func (c *Client) ResolveWorkspaceID() string {
 }
 
 // ListDatabases calls ListTagMetaAsset on the dms-enterprise endpoint to
-// list databases visible in the user's Data Agent workspace.
-func (c *Client) ListDatabases() ([]DatabaseInfo, error) {
+// list databases imported into a workspace's Data Center.
+// An empty workspaceID falls back to the configured/default workspace.
+func (c *Client) ListDatabases(workspaceID string) ([]DatabaseInfo, error) {
 	dmsEndpoint := c.DMSEnterpriseEndpoint()
 
 	tid := c.resolveTid(dmsEndpoint)
-	ws := c.ResolveWorkspaceID()
+	ws := workspaceID
+	if ws == "" {
+		ws = c.ResolveWorkspaceID()
+	}
 
 	tagName := fmt.Sprintf("sys::DMS-DA::%s::space:%s", c.region, ws)
 
@@ -539,18 +543,25 @@ func (c *Client) ListTables(databaseID string) ([]TableInfo, error) {
 }
 
 // ListImportedTables queries tables already imported into a workspace via ListTagMetaAsset.
-func (c *Client) ListImportedTables(databaseID string) ([]TableInfo, error) {
+// An empty workspaceID falls back to the configured/default workspace; an empty
+// databaseID lists imported tables across all databases in the workspace.
+func (c *Client) ListImportedTables(databaseID, workspaceID string) ([]TableInfo, error) {
 	dmsEndpoint := c.DMSEnterpriseEndpoint()
 	tid := c.resolveTid(dmsEndpoint)
-	ws := c.ResolveWorkspaceID()
+	ws := workspaceID
+	if ws == "" {
+		ws = c.ResolveWorkspaceID()
+	}
 	tagName := fmt.Sprintf("sys::DMS-DA::%s::space:%s", c.region, ws)
 
 	params := map[string]string{
-		"TagName":      tagName,
-		"MetaType":     "META_TABLE",
-		"MetaParentId": databaseID,
-		"PageNumber":   "1",
-		"PageSize":     "200",
+		"TagName":    tagName,
+		"MetaType":   "META_TABLE",
+		"PageNumber": "1",
+		"PageSize":   "200",
+	}
+	if databaseID != "" {
+		params["MetaParentId"] = databaseID
 	}
 	if tid != "" {
 		params["Tid"] = tid
@@ -590,6 +601,8 @@ func (c *Client) ListImportedTables(databaseID string) ([]TableInfo, error) {
 			TableName: firstStr(attrs, "TableName", "tableName"),
 			TableID:   firstStr(attrs, "TableId", "tableId"),
 			Engine:    firstStr(attrs, "Engine", "engine"),
+			DbID:      firstStr(attrs, "DbId", "dbId"),
+			DbName:    firstStr(attrs, "SchemaName", "schemaName"),
 		})
 	}
 	return result, nil

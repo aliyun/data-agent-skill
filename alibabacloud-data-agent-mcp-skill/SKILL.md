@@ -68,11 +68,12 @@ Facts the agent may need when the user asks setup questions (do not perform setu
 ## Core Analysis
 
 ### data_agent_list_workspace_databases
-List databases imported into the current workspace's Data Agent Data Center. This is the **authoritative source** for database analysis sessions.
+List databases imported into a workspace's Data Agent Data Center. This is the **authoritative source** for database analysis sessions.
 ```
-data_agent_list_workspace_databases()
+data_agent_list_workspace_databases(workspace_id?)
 → [{db_id, db_name, db_type, instance_id, instance_resource_id, catalog_name}, ...]
 ```
+- **workspace_id** (optional): target workspace. Defaults to the configured workspace. Resolve names to IDs via `data_agent_list_workspaces`; never pass a workspace name.
 
 Use this tool before `data_agent_create_session` for database analysis. Pass its `db_id`, `db_name`, `instance_id`, `instance_resource_id`, and `db_type` into the session options.
 
@@ -110,12 +111,14 @@ Block until the session needs LLM attention: completed, error, canceled, or wait
 
 > **May be unavailable.** Non-blocking deployments (e.g. DataBuddy IM) disable this tool via `tools.exclude` because a long internal block can exceed the outer MCP call timeout. If `data_agent_wait_result` is not in your tool schema, do not call or invent it — fall back to the one-shot status snapshot protocol (create session, take at most one `data_agent_status` snapshot per user turn, end the turn if still running). See the Progress Tracking Protocol below.
 ```
-data_agent_wait_result(session_id, timeout=300)
+data_agent_wait_result(session_id, timeout=110)
 → {session_id, status, reason, mode, current_step, total_steps, step_name,
    waiting_for, waiting_detail, checkpoint, conclusions, artifacts, error_message, updated_at}
 ```
-- **timeout** (default 300s): max seconds to block. Returns `reason="timeout"` if exceeded. Must be lower than the MCP transport timeout (leave ≥60s buffer to avoid a race where the transport times out before the server returns).
-- **reason**: `"completed"` | `"error"` | `"canceled"` | `"waiting_input"` | `"timeout"`
+- **timeout** (default and ceiling: server wait cap, 110s unless `DATA_AGENT_WAIT_CAP` overrides it): max seconds to block. The server clamps larger values so the response always beats common MCP client transport timeouts (~120s) — never rely on a longer block.
+- **reason**: `"completed"` | `"error"` | `"canceled"` | `"waiting_input"` | `"timeout"` | `"client_canceled"` | `"duplicate_wait"`
+- On `reason="timeout"` the session is still running and the response carries `checkpoint_delta`, `new_conclusions`, and `next_action`: briefly report that progress to the user, then call `data_agent_wait_result` again with the same `session_id`. Loop until a terminal reason (cap the loop, e.g. 10 rounds for pro/ultra).
+- **Never call in parallel** for the same session: a duplicate concurrent call returns immediately with `reason="duplicate_wait"` and a warning instead of blocking.
 - Returns immediately when the SSE watcher fires any terminal or input event — no polling.
 
 ### data_agent_status
@@ -124,7 +127,7 @@ Get current status snapshot. Use `wait_timeout` when you want incremental step-l
 data_agent_status(session_id, wait_timeout=30, poll_hint="check-N")
 → {session_id, status, mode, current_step, total_steps, step_name, waiting_for, conclusions, artifacts, poll_seq, changed, ...}
 ```
-- **wait_timeout** (recommended: 30): seconds the MCP server blocks waiting for the next status change. Returns `changed=true` when checkpoint advances; `changed=false` on timeout.
+- **wait_timeout** (recommended: 30): seconds the MCP server blocks waiting for the next status change (capped server-side at the wait cap, 110s by default). Returns `changed=true` when checkpoint advances; `changed=false` on timeout. Long-poll calls do not count toward the anti-loop `poll_seq` warning; bare snapshots (`wait_timeout` omitted) do. Never call in parallel for the same session.
 - **poll_hint** (optional): incrementing tag (`"check-1"`, `"check-2"`, …) to distinguish consecutive calls in history.
 
 ### data_agent_watch_session
@@ -210,11 +213,13 @@ data_agent_list_tables(database_id)
 ```
 
 ### data_agent_list_imported_tables
-List tables already imported into the current workspace. Only shows tables tagged for the active workspace.
+List tables already imported into a workspace. Only shows tables tagged for that workspace.
 ```
-data_agent_list_imported_tables(database_id)
-→ [{table_name, table_id, engine}, ...]
+data_agent_list_imported_tables(database_id?, workspace_id?)
+→ [{table_name, table_id, engine, db_id, db_name}, ...]
 ```
+- **database_id** (optional): DMS database ID. Omit to list imported tables across all databases in the workspace; each row carries `db_id`/`db_name` for attribution.
+- **workspace_id** (optional): target workspace. Defaults to the configured workspace.
 
 ### data_agent_search_instances
 Search DMS-managed database instances.
@@ -289,7 +294,7 @@ data_agent_list_agents(
      database_id, db_name, tables, query,
      instance_id, instance_name, engine,
      mode="lite", auto_confirm=true)              # or omit mode for "auto" (backend decides)
-3. data_agent_wait_result(session_id, timeout=120) # Block until completed/error/waiting_input
+3. data_agent_wait_result(session_id, timeout=110) # Block until completed/error/waiting_input
                                                     # (if excluded: one-shot data_agent_status snapshot, then end turn if still running)
 4. data_agent_result(session_id)                  # Get conclusion (when completed)
 5. data_agent_list_files(session_id)              # Get reports/charts; embed images as ![](download_url)
@@ -303,7 +308,9 @@ data_agent_list_agents(
 ```
 1. data_agent_create_session(
      ..., mode="pro", auto_confirm=true)          # All confirmations automatic ("ultra" for the most thorough tier)
-2. data_agent_wait_result(session_id, timeout=480) # Block until completed/error (all steps auto-confirmed)
+2. LOOP data_agent_wait_result(session_id, timeout=110)  # Server-capped block; pro/ultra runs need several rounds
+     reason=="timeout" → report checkpoint_delta/new_conclusions to user, loop again (max ~10 rounds)
+     reason terminal   → exit loop
                                                     # (if excluded: one-shot data_agent_status snapshot, then end turn if still running)
 3. data_agent_result(session_id)                  # Get multi-step conclusions
 4. data_agent_list_files(session_id)              # Get artifacts
@@ -341,7 +348,7 @@ data_agent_list_agents(
      file_id="f-xxx", file_name="sales.csv",
      query="analyze sales trends",
      mode="pro", auto_confirm=true)              # File defaults to pro mode
-3. data_agent_wait_result(session_id, timeout=480) # Block until completed/error
+3. LOOP data_agent_wait_result(session_id, timeout=110)  # Loop on reason=timeout, reporting progress each round
                                                     # (if excluded: one-shot data_agent_status snapshot, then end turn if still running)
 4. data_agent_result(session_id)                  # Get conclusions
 5. data_agent_list_files(session_id)              # Get generated reports
@@ -466,6 +473,7 @@ The MCP Server's Session Daemon automatically:
 4. Never call or invent `data_agent_wait_result` when it is not in your tool schema
 5. Violating these rules triggers upstream "Repetitive tool calls detected" errors that abort the entire conversation
 6. **NEVER** abandon a running pro/ultra session and create a new one with the same or similar query — this wastes compute and restarts from zero. Stick with the existing session until it completes, errors, or is explicitly canceled by the user
+7. **NEVER** issue parallel/duplicate calls to `data_agent_wait_result` or `data_agent_status` for the same session — issue ONE call and wait for its response. The server degrades duplicates to an immediate snapshot with `reason="duplicate_wait"`; a duplicate response means you must stop and wait for the original call
 
 ---
 
@@ -478,11 +486,11 @@ Two supported paths, depending on whether `data_agent_wait_result` is exposed in
 
 ## Standard Workflow (when `data_agent_wait_result` is available)
 
-Use `data_agent_wait_result` — the server blocks internally and wakes up instantly via SSE when the session reaches a terminal state or needs input. For a typical `auto_confirm=true` pro run this is just 2-4 tool calls total.
+Use `data_agent_wait_result` — the server blocks internally and wakes up instantly via SSE when the session reaches a terminal state or needs input. The block is capped server-side (110s by default) so each call returns before the MCP transport timeout; long pro/ultra runs simply take several rounds of the loop, each producing a progress update for the user.
 
 ```
 1. data_agent_create_session(..., auto_confirm=true) → session_id
-2. data_agent_wait_result(session_id, timeout=480)
+2. data_agent_wait_result(session_id, timeout=110)
    → {status, reason, ...}
    IF reason == "completed":
      → data_agent_result(session_id)        → conclusions + artifacts + chart ImageContent
@@ -493,15 +501,19 @@ Use `data_agent_wait_result` — the server blocks internally and wakes up insta
    IF reason == "waiting_input":
      → waiting_for == "ask_plan": show plan, ask user → data_agent_send → loop back to wait_result
      → else: show detail, ask user → data_agent_send → loop back to wait_result
-   IF reason == "timeout":
-     → retry: call data_agent_wait_result again (up to 3 retries total)
-     → each retry is a fresh MCP tool call; the server re-checks current state and waits again
-     → if still timeout after 3 retries, report progress snapshot to user → DONE
+   IF reason == "timeout" (or "client_canceled"):
+     → session is still running; the response carries checkpoint_delta, new_conclusions, next_action
+     → briefly report that progress to the user, then call data_agent_wait_result again
+     → keep looping (up to ~10 rounds for pro/ultra); if the cap is reached, report the
+       progress snapshot and session_id to the user → DONE
+   IF reason == "duplicate_wait":
+     → a wait is already in flight — you issued a parallel call by mistake; do NOT retry,
+       wait for the original call's response
 ```
 
 The default workflow is always:
 ```
-create_session → wait_result → (if timeout) wait_result retry → ... → result
+create_session → wait_result → (if timeout: report progress) → wait_result → ... → result
 ```
 
 **NEVER** use this pattern:
