@@ -514,10 +514,26 @@ func (m *Manager) SendMessage(sessionID, message string) error {
 	m.mu.RUnlock()
 
 	if ok {
-		return entry.watcher.SendMessage(message)
+		// A terminal session means the watcher goroutine has already exited
+		// (Run returns on completion/error/cancel) — sending through the dead
+		// watcher would deliver the message but leave nobody listening for
+		// the follow-up's SSE events, stranding the session as "running"
+		// until housekeeping reconciles minutes later. Drop the stale entry
+		// and revive with a fresh watcher instead.
+		switch entry.state.GetStatus() {
+		case StatusCompleted, StatusError, StatusCanceled:
+			m.mu.Lock()
+			if m.watchers[sessionID] == entry {
+				delete(m.watchers, sessionID)
+			}
+			m.mu.Unlock()
+			entry.cancel()
+		default:
+			return entry.watcher.SendMessage(message)
+		}
 	}
 
-	// No active watcher: the session may have completed (watcher exited) or
+	// No live watcher: the session may have completed (watcher exited) or
 	// the server may have restarted. The remote Data Agent session itself is
 	// multi-turn, so revive it from persisted state to support follow-up
 	// questions on finished sessions.

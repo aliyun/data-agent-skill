@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -83,5 +84,39 @@ func TestWaitForChangeClientCanceledReturnsSnapshot(t *testing.T) {
 	}
 	if snap == nil || snap.SessionID != "s1" {
 		t.Errorf("snapshot missing or wrong session: %+v", snap)
+	}
+}
+
+// A follow-up sent to a finished session whose stale entry is still in the
+// watchers map must NOT go through the dead watcher (its Run loop exited on
+// completion, so nobody would listen for the follow-up's SSE events). The
+// manager must drop the stale entry and take the revive path instead.
+func TestSendMessageOnFinishedSessionTakesRevivePath(t *testing.T) {
+	state := &State{
+		SessionID: "s1",
+		AgentID:   "a1",
+		Status:    StatusCompleted, // terminal → watcher goroutine has exited
+		changed:   make(chan struct{}),
+	}
+	m := NewManager(nil, t.TempDir())
+	m.watchers["s1"] = &watcherEntry{
+		watcher: NewWatcher(state, nil, m.sessDir),
+		state:   state,
+		cancel:  func() {},
+	}
+
+	// No persisted state on disk → the revive path fails with "not found",
+	// which proves SendMessage did not use the dead watcher (that would
+	// have attempted a real API call instead).
+	err := m.SendMessage("s1", "follow-up")
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected revive-path error, got: %v", err)
+	}
+
+	m.mu.RLock()
+	_, still := m.watchers["s1"]
+	m.mu.RUnlock()
+	if still {
+		t.Fatal("stale terminal entry must be removed from the watchers map")
 	}
 }
