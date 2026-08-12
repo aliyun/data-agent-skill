@@ -366,7 +366,7 @@ var listWorkspaceDatabasesTool = mcp.NewTool(
 
 var createSessionTool = mcp.NewTool(
 	"data_agent_create_session",
-	mcp.WithDescription("Create a Data Agent analysis session. Supports database analysis (database_id) or file analysis (file_id from upload_file). MANDATORY: before calling this tool for database analysis, you MUST call data_agent_list_workspace_databases in this same turn and use its returned values — never guess or reuse database_id/instance_id/engine from memory or prior conversations. For pro/ultra mode with auto_confirm=true, all plan/SQL/report confirmations are handled automatically."),
+	mcp.WithDescription("Create a Data Agent analysis session. Supports database analysis (database_id) or file analysis (file_id from upload_file). MANDATORY: before calling this tool for database analysis, you MUST call data_agent_list_workspace_databases in this same turn and use its returned values — never guess or reuse database_id/instance_id/engine from memory or prior conversations. Mode selection: quick factual question → mode=lite; deep analysis/report requested → mode=pro (or ultra for the most thorough); unsure → omit mode and the backend decides. For pro/ultra mode with auto_confirm=true, all plan/SQL/report confirmations are handled automatically."),
 	mcp.WithString("database_id", mcp.Description("DMS database ID — MUST come from a data_agent_list_workspace_databases call in this turn (required for database analysis, or use file_id for file analysis; not needed when a custom agent supplies the data source)")),
 	mcp.WithString("db_name", mcp.Description("Database schema name from data_agent_list_workspace_databases (required for database analysis, unless a custom agent supplies the data source)")),
 	mcp.WithString("tables", mcp.Description("Comma-separated table names to analyze (required for database analysis, unless a custom agent supplies the data source)")),
@@ -410,8 +410,8 @@ var watchSessionTool = mcp.NewTool(
 
 var sendTool = mcp.NewTool(
 	"data_agent_send",
-	mcp.WithDescription("Send a message to an active Data Agent session. Use for confirming plans, answering questions, or follow-up queries."),
-	mcp.WithString("session_id", mcp.Required(), mcp.Description("Target session ID")),
+	mcp.WithDescription("Send a message to a Data Agent session: confirm a plan, answer a question, or ask a follow-up. Works on finished sessions too — the server transparently revives a completed session and the remote session keeps the full conversation context, so pronouns resolve against earlier turns. Prefer this over creating a new session when the user follows up on the same data. After sending, use data_agent_wait_result as usual; each turn appends to conclusions."),
+	mcp.WithString("session_id", mcp.Required(), mcp.Description("Target session ID (running, waiting for input, or already completed)")),
 	mcp.WithString("message", mcp.Required(), mcp.Description("Message to send")),
 )
 
@@ -431,8 +431,8 @@ var listSessionsTool = mcp.NewTool(
 
 var stopSessionTool = mcp.NewTool(
 	"data_agent_stop_session",
-	mcp.WithDescription("Stop monitoring a Data Agent session and clean up resources."),
-	mcp.WithString("session_id", mcp.Required(), mcp.Description("Session ID to stop")),
+	mcp.WithDescription("Stop the server-side monitoring (SSE watcher) of a session and release local resources. This does NOT cancel the remote Data Agent session itself; follow-ups via data_agent_send still work later. Only needed when abandoning a session early — completed sessions are cleaned up automatically."),
+	mcp.WithString("session_id", mcp.Required(), mcp.Description("Session ID to stop monitoring")),
 )
 
 var listFilesTool = mcp.NewTool(

@@ -168,7 +168,7 @@ data_agent_list_sessions(include_history=false)
 > Active sessions appear first. When `include_history=true`, historical sessions are sorted by `updated_at` descending.
 
 ### data_agent_stop_session
-Stop monitoring a session and clean up resources.
+Stop the server-side monitoring (SSE watcher) of a session and release local resources. Does **not** cancel the remote Data Agent session — follow-ups via `data_agent_send` still work later. Only needed when abandoning a session early; completed sessions are cleaned up automatically.
 ```
 data_agent_stop_session(session_id)
 → {ok}
