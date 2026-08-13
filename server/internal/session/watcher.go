@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -202,17 +203,12 @@ func (w *Watcher) streamOnce(ctx context.Context) (bool, bool) {
 		case "data":
 			// data events inside content lifecycle (e.g. task_finish, output_conclusion)
 			// are self-contained — parse them directly without accumulation.
+			// Route through handleParsedEvent so every action is honored
+			// (conclusions, recommended questions, ...), not just conclusions.
 			if contentCategory != "" {
 				parsed := event.Parse(ev.EventType, ev.Category, ev.Content, ev.ContentType)
-				if parsed.Action == event.ActionConclusion && parsed.Content != "" {
-					w.state.AddConclusion(parsed.Content)
-					if len(parsed.Images) > 0 {
-						filenames := w.persistImages(parsed.Images)
-						for _, fn := range filenames {
-							w.state.AddArtifact("image:" + fn)
-						}
-					}
-					w.state.Persist(w.sessDir)
+				if w.handleParsedEvent(parsed) {
+					return false, false
 				}
 				continue
 			}
@@ -226,20 +222,8 @@ func (w *Watcher) streamOnce(ctx context.Context) (bool, bool) {
 				}
 				// Feed accumulated content to parser at content_finish boundary.
 				parsed := event.Parse("content_finish", contentCategory, string(accum), ev.ContentType)
-				if parsed.Action == event.ActionConclusion && parsed.Content != "" {
-					w.state.AddConclusion(parsed.Content)
-					if len(parsed.Images) > 0 {
-						filenames := w.persistImages(parsed.Images)
-						for _, fn := range filenames {
-							w.state.AddArtifact("image:" + fn)
-						}
-					}
-					w.state.Persist(w.sessDir)
-				} else if parsed.Action.NeedsConfirmation() {
-					shouldReconnect := w.handleParsedEvent(parsed)
-					if shouldReconnect {
-						return false, false
-					}
+				if w.handleParsedEvent(parsed) {
+					return false, false
 				}
 			}
 			contentCategory = ""
@@ -341,6 +325,14 @@ func (w *Watcher) handleParsedEvent(pe event.ParsedEvent) bool {
 					w.state.AddArtifact("image:" + fn)
 				}
 			}
+			w.state.Persist(w.sessDir)
+		}
+
+	case event.ActionRecommendedQuestion:
+		// Follow-up questions suggested by the backend (newline-joined by the
+		// parser); surfaced through the result tool's recommended_questions.
+		if pe.Content != "" {
+			w.state.SetRecommendedQuestions(strings.Split(pe.Content, "\n"))
 			w.state.Persist(w.sessDir)
 		}
 
