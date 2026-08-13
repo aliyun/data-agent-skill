@@ -428,3 +428,40 @@ func assertAction(t *testing.T, pe ParsedEvent, want Action, msg string) {
 		t.Fatalf("%s: got %s, want %s", msg, pe.Action, want)
 	}
 }
+
+// task_finish insights carry the detail rows in the "data" field; the parser
+// must keep them in the conclusion instead of reducing the result to the
+// one-line summary.
+func TestParseTaskFinishKeepsDetailData(t *testing.T) {
+	content := `[{"title":"销售额TOP5国家","summary":"美国居首","chart_type":"bar",` +
+		`"data":"[{\"country\":\"USA\",\"total\":523.06},{\"country\":\"Canada\",\"total\":303.96}]"}]`
+	pe := Parse("data", "task_finish", content, "json")
+	if pe.Action != ActionConclusion {
+		t.Fatalf("action = %v, want conclusion", pe.Action)
+	}
+	for _, want := range []string{"销售额TOP5国家: 美国居首", "USA", "523.06", "Canada"} {
+		if !strings.Contains(pe.Content, want) {
+			t.Fatalf("conclusion missing %q:\n%s", want, pe.Content)
+		}
+	}
+}
+
+// Insights without a data field keep the historical summary-only shape.
+func TestParseTaskFinishWithoutDataUnchanged(t *testing.T) {
+	pe := Parse("data", "task_finish", `[{"title":"t","summary":"s"}]`, "json")
+	if pe.Content != "t: s" {
+		t.Fatalf("content = %q, want %q", pe.Content, "t: s")
+	}
+}
+
+// Oversized detail payloads are truncated, not dropped.
+func TestParseTaskFinishTruncatesHugeData(t *testing.T) {
+	big := strings.Repeat("x", 10000)
+	pe := Parse("data", "task_finish", `[{"title":"t","summary":"s","data":"`+big+`"}]`, "json")
+	if !strings.Contains(pe.Content, "...(truncated)") {
+		t.Fatal("expected truncation marker")
+	}
+	if len(pe.Content) > 4200 {
+		t.Fatalf("conclusion too large: %d bytes", len(pe.Content))
+	}
+}

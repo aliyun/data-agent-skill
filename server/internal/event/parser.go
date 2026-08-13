@@ -221,6 +221,9 @@ func parseChatFinish(category, content, contentType string) ParsedEvent {
 //	}
 // parseTaskFinish extracts insights from task_finish events (ASK_DATA mode).
 // Content is a JSON array: [{"title":"...", "summary":"...", "chart_type":"...", "data":"..."}]
+// The data field carries the detailed result rows behind the summary (e.g. the
+// actual TOP-N table); dropping it would leave callers with only a one-line
+// digest, so it is appended to the conclusion (bounded by taskFinishDataLimit).
 func parseTaskFinish(content string) ParsedEvent {
 	// task_finish content may be a JSON array of insight objects.
 	var items []map[string]interface{}
@@ -229,13 +232,17 @@ func parseTaskFinish(content string) ParsedEvent {
 		for _, item := range items {
 			title, _ := item["title"].(string)
 			summary, _ := item["summary"].(string)
-			if summary != "" {
-				if title != "" {
-					parts = append(parts, title+": "+summary)
-				} else {
-					parts = append(parts, summary)
-				}
+			if summary == "" {
+				continue
 			}
+			part := summary
+			if title != "" {
+				part = title + ": " + summary
+			}
+			if data := insightData(item); data != "" {
+				part += "\ndata: " + data
+			}
+			parts = append(parts, part)
 		}
 		if len(parts) > 0 {
 			combined := ""
@@ -260,6 +267,9 @@ func parseTaskFinish(content string) ParsedEvent {
 			if title != "" {
 				c = title + ": " + summary
 			}
+			if data := insightData(parsed); data != "" {
+				c += "\ndata: " + data
+			}
 			return ParsedEvent{Action: ActionConclusion, Category: "task_finish", Content: c}
 		}
 	}
@@ -268,6 +278,33 @@ func parseTaskFinish(content string) ParsedEvent {
 		return ParsedEvent{Action: ActionConclusion, Category: "task_finish", Content: content}
 	}
 	return ParsedEvent{Action: ActionNone, Category: "task_finish"}
+}
+
+// taskFinishDataLimit bounds the detail rows appended to a conclusion so a
+// huge result set cannot blow up the session state or the caller's context.
+const taskFinishDataLimit = 4096
+
+// insightData renders the "data" field of a task_finish insight (the detail
+// rows behind the summary). It may arrive as a string or as structured JSON;
+// oversized payloads are truncated at taskFinishDataLimit.
+func insightData(item map[string]interface{}) string {
+	v, ok := item["data"]
+	if !ok || v == nil {
+		return ""
+	}
+	var s string
+	if str, isStr := v.(string); isStr {
+		s = strings.TrimSpace(str)
+	} else if b, err := json.Marshal(v); err == nil {
+		s = string(b)
+	}
+	if s == "" || s == "null" || s == "{}" || s == "[]" {
+		return ""
+	}
+	if len(s) > taskFinishDataLimit {
+		s = s[:taskFinishDataLimit] + "...(truncated)"
+	}
+	return s
 }
 
 func parsePlanContent(content, category string) ParsedEvent {
