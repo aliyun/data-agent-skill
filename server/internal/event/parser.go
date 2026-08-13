@@ -111,7 +111,7 @@ func parseDataEvent(category, content, contentType string) ParsedEvent {
 		}
 
 	case "task_finish":
-		return parseTaskFinish(content)
+		return parseTaskFinish(content, contentType)
 
 	case CatAskPlan:
 		return parsePlanContent(content, category)
@@ -220,29 +220,30 @@ func parseChatFinish(category, content, contentType string) ParsedEvent {
 //	  "plans": [{ "plan": { "steps": [{ "order":1, "name":"...", ... }] } }]
 //	}
 // parseTaskFinish extracts insights from task_finish events (ASK_DATA mode).
-// Content is a JSON array: [{"title":"...", "summary":"...", "chart_type":"...", "data":"..."}]
-// The data field carries the detailed result rows behind the summary (e.g. the
-// actual TOP-N table); dropping it would leave callers with only a one-line
-// digest, so it is appended to the conclusion (bounded by taskFinishDataLimit).
-func parseTaskFinish(content string) ParsedEvent {
+// Wire protocol (mirrors @dmsfe/data-agent-sdk parseTaskFinishContent):
+//   - content_type "str" (or empty): content is a markdown report — keep it whole.
+//   - content_type "json": content is a chart array
+//     [{"title"?, "summary"?, "chart_type", "data", "x"?, "y"?}], where data
+//     carries the detail rows behind the summary (e.g. the actual TOP-N
+//     table); title and summary are both optional, so a chart-only insight
+//     must not be dropped. Unparseable/empty JSON falls back to the raw text.
+func parseTaskFinish(content, contentType string) ParsedEvent {
+	// Markdown payloads are kept verbatim; only "json" is structured.
+	if contentType != "json" {
+		if strings.TrimSpace(content) != "" {
+			return ParsedEvent{Action: ActionConclusion, Category: "task_finish", Content: content}
+		}
+		return ParsedEvent{Action: ActionNone, Category: "task_finish"}
+	}
+
 	// task_finish content may be a JSON array of insight objects.
 	var items []map[string]interface{}
 	if err := json.Unmarshal([]byte(content), &items); err == nil && len(items) > 0 {
 		var parts []string
 		for _, item := range items {
-			title, _ := item["title"].(string)
-			summary, _ := item["summary"].(string)
-			if summary == "" {
-				continue
+			if part := renderInsight(item); part != "" {
+				parts = append(parts, part)
 			}
-			part := summary
-			if title != "" {
-				part = title + ": " + summary
-			}
-			if data := insightData(item); data != "" {
-				part += "\ndata: " + data
-			}
-			parts = append(parts, part)
 		}
 		if len(parts) > 0 {
 			combined := ""
@@ -261,16 +262,8 @@ func parseTaskFinish(content string) ParsedEvent {
 	}
 	// Single object fallback.
 	if parsed, ok := tryParseJSON(content); ok {
-		if summary, _ := stringField(parsed, "summary"); summary != "" {
-			title, _ := stringField(parsed, "title")
-			c := summary
-			if title != "" {
-				c = title + ": " + summary
-			}
-			if data := insightData(parsed); data != "" {
-				c += "\ndata: " + data
-			}
-			return ParsedEvent{Action: ActionConclusion, Category: "task_finish", Content: c}
+		if part := renderInsight(parsed); part != "" {
+			return ParsedEvent{Action: ActionConclusion, Category: "task_finish", Content: part}
 		}
 	}
 	// Plain text fallback — treat any non-empty content as conclusion.
@@ -278,6 +271,34 @@ func parseTaskFinish(content string) ParsedEvent {
 		return ParsedEvent{Action: ActionConclusion, Category: "task_finish", Content: content}
 	}
 	return ParsedEvent{Action: ActionNone, Category: "task_finish"}
+}
+
+// renderInsight flattens one task_finish insight into conclusion text.
+// All fields are optional on the wire; an insight is dropped only when it
+// carries neither text nor data.
+func renderInsight(item map[string]interface{}) string {
+	title, _ := item["title"].(string)
+	summary, _ := item["summary"].(string)
+	part := summary
+	if title != "" && summary != "" {
+		part = title + ": " + summary
+	} else if title != "" {
+		part = title
+	}
+	if chartType, _ := item["chart_type"].(string); chartType != "" {
+		if part != "" {
+			part += " (chart: " + chartType + ")"
+		} else {
+			part = "(chart: " + chartType + ")"
+		}
+	}
+	if data := insightData(item); data != "" {
+		if part != "" {
+			part += "\n"
+		}
+		part += "data: " + data
+	}
+	return part
 }
 
 // taskFinishDataLimit bounds the detail rows appended to a conclusion so a

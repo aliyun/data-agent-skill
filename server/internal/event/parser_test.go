@@ -465,3 +465,29 @@ func TestParseTaskFinishTruncatesHugeData(t *testing.T) {
 		t.Fatalf("conclusion too large: %d bytes", len(pe.Content))
 	}
 }
+
+// A chart-only insight (data without summary/title) must not be dropped —
+// title and summary are both optional in the wire schema (per
+// @dmsfe/data-agent-sdk TaskFinishChart: only chart_type/data are present).
+func TestParseTaskFinishKeepsChartOnlyInsight(t *testing.T) {
+	content := `[{"chart_type":"bar","data":"[{\"c\":\"USA\",\"v\":523.06}]"}]`
+	pe := Parse("data", "task_finish", content, "json")
+	if pe.Action != ActionConclusion {
+		t.Fatalf("action = %v, want conclusion (chart-only insight dropped)", pe.Action)
+	}
+	for _, want := range []string{"(chart: bar)", "USA", "523.06"} {
+		if !strings.Contains(pe.Content, want) {
+			t.Fatalf("conclusion missing %q:\n%s", want, pe.Content)
+		}
+	}
+}
+
+// content_type=str means the payload is a markdown report; it must be kept
+// verbatim even when it happens to parse as JSON (SDK: str → markdown).
+func TestParseTaskFinishStrKeptVerbatim(t *testing.T) {
+	md := `[{"title":"looks like json but is markdown"}]`
+	pe := Parse("data", "task_finish", md, "str")
+	if pe.Content != md {
+		t.Fatalf("str content mangled: %q", pe.Content)
+	}
+}
