@@ -120,3 +120,14 @@ func TestSendMessageOnFinishedSessionTakesRevivePath(t *testing.T) {
 		t.Fatal("stale terminal entry must be removed from the watchers map")
 	}
 }
+
+// Re-emitted mission objectives replace the earlier conclusion copy.
+func TestUpsertConclusionReplacesByKey(t *testing.T) {
+	s := &State{SessionID: "s1", changed: make(chan struct{})}
+	s.UpsertConclusion("k:0:1", "v1")
+	s.UpsertConclusion("", "standalone")
+	s.UpsertConclusion("k:0:1", "v2")
+	if len(s.Conclusions) != 2 || s.Conclusions[0] != "v2" || s.Conclusions[1] != "standalone" {
+		t.Fatalf("conclusions = %v", s.Conclusions)
+	}
+}

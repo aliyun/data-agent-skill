@@ -61,6 +61,7 @@ type State struct {
 	WorkspaceID            string         `json:"workspace_id,omitempty"`
 	PollSeq                int            `json:"-"` // not persisted; auto-incremented per status call
 	pollCheckpoint         int            // checkpoint seen at the last poll; progress resets PollSeq
+	conclusionIdx          map[string]int // dedup key → Conclusions index (not persisted)
 }
 
 // ---------- Change notification ----------
@@ -309,6 +310,30 @@ func (s *State) AddConfirmation(confirmType string, auto bool) {
 func (s *State) AddConclusion(text string) {
 	s.mu.Lock()
 	s.Conclusions = append(s.Conclusions, text)
+	s.UpdatedAt = time.Now()
+	s.mu.Unlock()
+	s.notify()
+}
+
+// UpsertConclusion appends a conclusion or, when the same key was seen
+// before, replaces the earlier copy in place. The backend re-emits mission
+// objective conclusions as a run progresses; replacing keeps the latest text
+// without piling up near-duplicates.
+func (s *State) UpsertConclusion(key, text string) {
+	if key == "" {
+		s.AddConclusion(text)
+		return
+	}
+	s.mu.Lock()
+	if s.conclusionIdx == nil {
+		s.conclusionIdx = make(map[string]int)
+	}
+	if i, ok := s.conclusionIdx[key]; ok && i < len(s.Conclusions) {
+		s.Conclusions[i] = text
+	} else {
+		s.conclusionIdx[key] = len(s.Conclusions)
+		s.Conclusions = append(s.Conclusions, text)
+	}
 	s.UpdatedAt = time.Now()
 	s.mu.Unlock()
 	s.notify()

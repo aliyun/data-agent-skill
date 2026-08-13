@@ -317,7 +317,7 @@ func (w *Watcher) handleParsedEvent(pe event.ParsedEvent) bool {
 
 	case event.ActionConclusion:
 		if pe.Content != "" {
-			w.state.AddConclusion(pe.Content)
+			w.state.UpsertConclusion(pe.DedupKey, pe.Content)
 			// Persist extracted images
 			if len(pe.Images) > 0 {
 				filenames := w.persistImages(pe.Images)
@@ -325,6 +325,23 @@ func (w *Watcher) handleParsedEvent(pe event.ParsedEvent) bool {
 					w.state.AddArtifact("image:" + fn)
 				}
 			}
+			w.state.Persist(w.sessDir)
+		}
+
+	case event.ActionArtifact:
+		// A generated file (data export / report file) finished uploading.
+		for _, a := range pe.Artifacts {
+			w.state.AddArtifact(a)
+		}
+		if len(pe.Artifacts) > 0 {
+			w.state.Persist(w.sessDir)
+		}
+
+	case event.ActionReportGenerated:
+		// jsx_report / mission_report rendered; record the reference so
+		// callers know a report exists (fetch via data_agent_list_files).
+		if pe.Content != "" {
+			w.state.AddArtifact(pe.Content)
 			w.state.Persist(w.sessDir)
 		}
 

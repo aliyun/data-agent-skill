@@ -60,6 +60,7 @@ const (
 	ActionCanceled                    // Stream canceled
 	ActionRecommendedQuestion         // Server sent recommended follow-up questions
 	ActionReportGenerated             // jsx_report or mission_report generated
+	ActionArtifact                    // A generated file artifact finished uploading
 )
 
 // String returns a human-readable name for the action.
@@ -89,6 +90,8 @@ func (a Action) String() string {
 		return "recommended_question"
 	case ActionReportGenerated:
 		return "report_generated"
+	case ActionArtifact:
+		return "artifact"
 	default:
 		return "unknown"
 	}
@@ -120,6 +123,7 @@ type ParsedEvent struct {
 	Action      Action                 // What the caller should do
 	Category    string                 // Original event category
 	Content     string                 // Key content (conclusion text, plan JSON, SQL, error message)
+	DedupKey    string                 // Non-empty for conclusions that replace an earlier one (e.g. re-emitted mission objectives)
 	StepCurrent int                    // Current step number (for plan progress)
 	StepTotal   int                    // Total steps (for plan progress)
 	StepName    string                 // Current step name

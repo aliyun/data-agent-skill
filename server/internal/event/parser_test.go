@@ -491,3 +491,31 @@ func TestParseTaskFinishStrKeptVerbatim(t *testing.T) {
 		t.Fatalf("str content mangled: %q", pe.Content)
 	}
 }
+
+// output_conclusion events carry {"mission_idx","objective_order","result"};
+// the conclusion must expose the result text (trace markers stripped) with a
+// dedup key so re-emitted objectives replace instead of duplicate.
+func TestParseOutputConclusionExtractsResultAndKey(t *testing.T) {
+	content := `{"mission_idx":0,"objective_order":2,"result":" - Rock领先<trace id=\"0-1-3\">，营收826.65</trace>元"}`
+	pe := Parse("data", "output_conclusion", content, "json")
+	if pe.Action != ActionConclusion {
+		t.Fatalf("action = %v", pe.Action)
+	}
+	if strings.Contains(pe.Content, "<trace") || strings.Contains(pe.Content, "mission_idx") {
+		t.Fatalf("content not cleaned: %q", pe.Content)
+	}
+	if !strings.Contains(pe.Content, "Rock领先") || !strings.Contains(pe.Content, "826.65") {
+		t.Fatalf("result text lost: %q", pe.Content)
+	}
+	if pe.DedupKey != "output_conclusion:0:2" {
+		t.Fatalf("dedup key = %q", pe.DedupKey)
+	}
+}
+
+// file_upload_finish announces a generated artifact; it must be recorded.
+func TestParseFileUploadFinish(t *testing.T) {
+	pe := Parse("data", "file_upload_finish", "各流派销售明细.xlsx 上传完成", "str")
+	if pe.Action != ActionArtifact || len(pe.Artifacts) != 1 || pe.Artifacts[0] != "file:各流派销售明细.xlsx" {
+		t.Fatalf("parsed = %+v", pe)
+	}
+}

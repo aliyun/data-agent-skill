@@ -2,6 +2,7 @@ package event
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -95,20 +96,7 @@ func parseDataEvent(category, content, contentType string) ParsedEvent {
 		return parsePlanProgress(content)
 
 	case CatOutputConclusion:
-		// A standalone data/output_conclusion (not inside a content lifecycle).
-		// Try to extract base64 images from the conclusion markdown.
-		var images []Base64Image
-		if parsed, ok := tryParseJSON(content); ok {
-			if result, found := stringField(parsed, "result"); found {
-				images = ExtractBase64Images(result)
-			}
-		}
-		return ParsedEvent{
-			Action:   ActionConclusion,
-			Category: category,
-			Content:  content,
-			Images:   images,
-		}
+		return parseOutputConclusion(content, category)
 
 	case "task_finish":
 		return parseTaskFinish(content, contentType)
@@ -132,9 +120,76 @@ func parseDataEvent(category, content, contentType string) ParsedEvent {
 	case CatRecommendedQuestion:
 		return parseRecommendedQuestion(content, category)
 
+	case "file_upload_finish":
+		// "<filename> 上传完成" — a generated artifact (data export or report
+		// file) finished uploading; record it so callers learn the artifact
+		// exists and can fetch it via data_agent_list_files.
+		name := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(content), "上传完成"))
+		if name == "" {
+			return ParsedEvent{Action: ActionNone, Category: category}
+		}
+		return ParsedEvent{
+			Action:    ActionArtifact,
+			Category:  category,
+			Artifacts: []string{"file:" + name},
+		}
+
 	default:
 		return ParsedEvent{Action: ActionNone, Category: category}
 	}
+}
+
+// mission objective conclusions may embed <trace id="..."> provenance markers
+// meant for the web UI; they are noise for MCP callers.
+var traceTagPattern = regexp.MustCompile(`</?trace[^>]*>`)
+
+// parseOutputConclusion extracts the result text of an output_conclusion
+// event. Content shape: {"mission_idx":N, "objective_order":M, "result":"..."}.
+// The backend re-emits the same objective as the mission progresses (later
+// copies carry trace markers), so a dedup key replaces earlier copies instead
+// of appending near-duplicates.
+func parseOutputConclusion(content, category string) ParsedEvent {
+	parsed, ok := tryParseJSON(content)
+	if !ok {
+		// Plain markdown (accumulated deltas) — keep verbatim, extract images.
+		return ParsedEvent{
+			Action:   ActionConclusion,
+			Category: category,
+			Content:  content,
+			Images:   ExtractBase64Images(content),
+		}
+	}
+	result, _ := stringField(parsed, "result")
+	if result == "" {
+		// Unknown shape — keep raw content rather than dropping it.
+		return ParsedEvent{Action: ActionConclusion, Category: category, Content: content}
+	}
+	images := ExtractBase64Images(result)
+	text := strings.TrimSpace(traceTagPattern.ReplaceAllString(result, ""))
+
+	key := ""
+	if mi, ok := numField(parsed, "mission_idx"); ok {
+		if oo, ok2 := numField(parsed, "objective_order"); ok2 {
+			key = fmt.Sprintf("output_conclusion:%d:%d", mi, oo)
+		}
+	}
+	return ParsedEvent{
+		Action:   ActionConclusion,
+		Category: category,
+		Content:  text,
+		DedupKey: key,
+		Images:   images,
+	}
+}
+
+// numField reads an integer-valued JSON number field.
+func numField(m map[string]interface{}, key string) (int, bool) {
+	if v, ok := m[key]; ok {
+		if f, isNum := v.(float64); isNum {
+			return int(f), true
+		}
+	}
+	return 0, false
 }
 
 // ---------------------------------------------------------------------------
@@ -145,22 +200,10 @@ func parseContentFinish(category, content, contentType string) ParsedEvent {
 	switch category {
 	case CatOutputConclusion:
 		// The caller should have accumulated delta chunks and passes the
-		// concatenated text as content here.
-		// Try to extract base64 images: content may be JSON with "result" field or plain markdown.
-		var images []Base64Image
-		if parsed, ok := tryParseJSON(content); ok {
-			if result, found := stringField(parsed, "result"); found {
-				images = ExtractBase64Images(result)
-			}
-		} else {
-			images = ExtractBase64Images(content)
-		}
-		return ParsedEvent{
-			Action:   ActionConclusion,
-			Category: category,
-			Content:  content,
-			Images:   images,
-		}
+		// concatenated text as content here. Same wire shape as the
+		// standalone data event — reuse the extractor (result text, trace
+		// stripping, dedup key, base64 images).
+		return parseOutputConclusion(content, category)
 
 	case CatToolCallResponse:
 		// Check accumulated tool_call_response content for result_type.
