@@ -73,6 +73,7 @@ func main() {
 	}
 
 	mgr := session.NewManager(client, cfg.SessionsDir)
+	mgr.SetDefaultTenantKey(cred.TenantKey())
 	mgr.RestoreSessions(ctx)
 	go mgr.RunHousekeeping(ctx)
 
@@ -80,6 +81,12 @@ func main() {
 	srv.SetUploadRoots(cfg.Upload.AllowedDirs)
 	srv.SetCustomAgentID(cfg.CustomAgentID)
 	srv.ApplyRequestLogConfig(cfg.Log.Requests)
+	// Legacy per-connection credential headers (databuddy embedded mode):
+	// clients built here inherit the server's region/endpoint options while
+	// the credential and workspace come from the connection headers.
+	srv.SetClientFactory(func(c *dataagent.Credential) *dataagent.Client {
+		return dataagent.NewClient(c, cfg.Region, clientOpts...)
+	})
 
 	// Identity multi-tenant mode: map upstream identity headers (e.g. Feishu
 	// Aily's x-aily-user/x-aily-email) to per-user RAM roles via STS

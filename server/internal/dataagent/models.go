@@ -1,5 +1,10 @@
 package dataagent
 
+import (
+	"crypto/sha256"
+	"encoding/hex"
+)
+
 // SessionInfo from CreateSession/DescribeSession.
 type SessionInfo struct {
 	SessionID     string `json:"sessionId"`
@@ -66,6 +71,31 @@ type Credential struct {
 
 // IsAPIKey returns true if API Key auth mode is active.
 func (c *Credential) IsAPIKey() bool { return c.APIKey != "" }
+
+// TenantKey returns a stable, non-reversible fingerprint of the credential
+// identity, used for per-tenant session isolation in multi-tenant
+// deployments. Only stable identities yield a key: API Keys and long-term
+// AK/SK pairs. STS credentials rotate on refresh, so they return "" (no
+// isolation — matches the embedded single-tenant deployment behavior).
+func (c *Credential) TenantKey() string {
+	if c == nil {
+		return ""
+	}
+	switch {
+	case c.APIKey != "":
+		return fingerprint("apikey:" + c.APIKey)
+	case c.AccessKeyID != "" && c.SecurityToken == "":
+		return fingerprint("ak:" + c.AccessKeyID)
+	}
+	return ""
+}
+
+// fingerprint returns the first 16 hex chars of the SHA-256 digest. The
+// plaintext credential is never persisted.
+func fingerprint(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])[:16]
+}
 
 // FileInfo from ListFileUpload.
 type FileInfo struct {

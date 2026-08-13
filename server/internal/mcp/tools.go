@@ -176,6 +176,7 @@ func (s *Server) handleCreateSession(ctx context.Context, req mcp.CallToolReques
 		CustomAgentID: customAgentID,
 		FileID:        fileID,
 		FileName:      fileName,
+		TenantKey:     tenantKeyFromCtx(ctx),
 	}
 
 	state, err := s.mgr.CreateSession(ctx, opts)
@@ -195,6 +196,9 @@ func (s *Server) handleStatus(ctx context.Context, req mcp.CallToolRequest) (*mc
 	sid := argStr(req, "session_id")
 	if sid == "" {
 		return mcp.NewToolResultError("session_id is required"), nil
+	}
+	if _, err := s.checkSessionAccess(ctx, sid); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get status: %v", err)), nil
 	}
 
 	waitTimeout := 0
@@ -273,6 +277,9 @@ func (s *Server) handleWaitResult(ctx context.Context, req mcp.CallToolRequest) 
 	sid := argStr(req, "session_id")
 	if sid == "" {
 		return mcp.NewToolResultError("session_id is required"), nil
+	}
+	if _, err := s.checkSessionAccess(ctx, sid); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to wait: %v", err)), nil
 	}
 
 	// Cap the block so the response beats the MCP transport timeout
@@ -356,9 +363,13 @@ func (s *Server) handleWatchSession(ctx context.Context, req mcp.CallToolRequest
 		WorkspaceID: argStr(req, "workspace_id"),
 		Mode:        normalizeMode(argStr(req, "mode")),
 		AutoConfirm: argBool(req, "auto_confirm", true),
+		TenantKey:   tenantKeyFromCtx(ctx),
 	})
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to watch session: %v", err)), nil
+	}
+	if !visibleToTenant(tenantKeyFromCtx(ctx), snap.TenantKey) {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to watch session: session %s not found", sid)), nil
 	}
 
 	return jsonResult(map[string]any{
@@ -378,14 +389,17 @@ func (s *Server) handleWatchSession(ctx context.Context, req mcp.CallToolRequest
 	})
 }
 
-func (s *Server) handleSend(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	sid := argStr(req, "session_id")
 	msg := argStr(req, "message")
 	if sid == "" || msg == "" {
 		return mcp.NewToolResultError("session_id and message are required"), nil
 	}
+	if _, err := s.checkSessionAccess(ctx, sid); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to send message: %v", err)), nil
+	}
 
-	if err := s.mgr.SendMessage(sid, msg); err != nil {
+	if err := s.mgr.SendMessage(ctx, sid, msg); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to send message: %v", err)), nil
 	}
 
@@ -401,10 +415,13 @@ func (s *Server) handleSend(_ context.Context, req mcp.CallToolRequest) (*mcp.Ca
 	})
 }
 
-func (s *Server) handleResult(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleResult(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	sid := argStr(req, "session_id")
 	if sid == "" {
 		return mcp.NewToolResultError("session_id is required"), nil
+	}
+	if _, err := s.checkSessionAccess(ctx, sid); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get result: %v", err)), nil
 	}
 
 	state, err := s.mgr.GetResult(sid)
@@ -455,7 +472,8 @@ func (s *Server) handleResult(_ context.Context, req mcp.CallToolRequest) (*mcp.
 	}, nil
 }
 
-func (s *Server) handleListSessions(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleListSessions(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	callerKey := tenantKeyFromCtx(ctx)
 	includeHistory := argBool(req, "include_history", false)
 	includeRemote := argBool(req, "include_remote", false)
 
@@ -483,6 +501,9 @@ func (s *Server) handleListSessions(_ context.Context, req mcp.CallToolRequest) 
 	seen := make(map[string]struct{}, len(localSessions))
 	out := make([]entry, 0, len(localSessions))
 	for _, st := range localSessions {
+		if !visibleToTenant(callerKey, st.TenantKey) {
+			continue
+		}
 		seen[st.SessionID] = struct{}{}
 		out = append(out, entry{
 			SessionID:   st.SessionID,
@@ -542,10 +563,13 @@ func mapRemoteStatus(s string) session.Status {
 	}
 }
 
-func (s *Server) handleStopSession(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleStopSession(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	sid := argStr(req, "session_id")
 	if sid == "" {
 		return mcp.NewToolResultError("session_id is required"), nil
+	}
+	if _, err := s.checkSessionAccess(ctx, sid); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to stop session: %v", err)), nil
 	}
 
 	if err := s.mgr.StopSession(sid); err != nil {
@@ -555,10 +579,13 @@ func (s *Server) handleStopSession(_ context.Context, req mcp.CallToolRequest) (
 	return jsonResult(map[string]any{"ok": true})
 }
 
-func (s *Server) handleListFiles(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleListFiles(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	sid := argStr(req, "session_id")
 	if sid == "" {
 		return mcp.NewToolResultError("session_id is required"), nil
+	}
+	if _, err := s.checkSessionAccess(ctx, sid); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to list files: %v", err)), nil
 	}
 
 	var agentID, workspaceID string

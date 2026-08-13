@@ -59,6 +59,7 @@ type State struct {
 	ErrorMessage           string         `json:"error_message,omitempty"`
 	RecommendedQuestions   []string       `json:"recommended_questions,omitempty"`
 	WorkspaceID            string         `json:"workspace_id,omitempty"`
+	TenantKey              string         `json:"tenant_key,omitempty"` // owner fingerprint for multi-tenant isolation
 	PollSeq                int            `json:"-"` // not persisted; auto-incremented per status call
 	pollCheckpoint         int            // checkpoint seen at the last poll; progress resets PollSeq
 	conclusionIdx          map[string]int // dedup key → Conclusions index (not persisted)
@@ -390,6 +391,7 @@ type StateSnapshot struct {
 	ErrorMessage           string         `json:"error_message,omitempty"`
 	RecommendedQuestions   []string       `json:"recommended_questions,omitempty"`
 	WorkspaceID            string         `json:"workspace_id,omitempty"`
+	TenantKey              string         `json:"tenant_key,omitempty"`
 }
 
 // Snapshot returns a deep copy of the state as a plain struct suitable for
@@ -433,6 +435,7 @@ func (s *State) Snapshot() StateSnapshot {
 	}
 	snap.NextImageSeq = s.NextImageSeq
 	snap.WorkspaceID = s.WorkspaceID
+	snap.TenantKey = s.TenantKey
 
 	return snap
 }
@@ -489,6 +492,7 @@ func stateFromSnapshot(snap *StateSnapshot) *State {
 		ErrorMessage:           snap.ErrorMessage,
 		RecommendedQuestions:   append([]string{}, snap.RecommendedQuestions...),
 		WorkspaceID:            snap.WorkspaceID,
+		TenantKey:              snap.TenantKey,
 		changed:                make(chan struct{}),
 	}
 	return s

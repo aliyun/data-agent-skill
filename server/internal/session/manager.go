@@ -30,6 +30,7 @@ type CreateOpts struct {
 	CustomAgentID string
 	FileID        string // uploaded file ID (alternative to DatabaseID)
 	FileName      string // original filename for file-based DataSource
+	TenantKey     string // credential fingerprint for multi-tenant isolation ("" = default tenant)
 }
 
 // WatchOpts identifies an existing remote Data Agent session to monitor.
@@ -39,6 +40,7 @@ type WatchOpts struct {
 	WorkspaceID string
 	Mode        string
 	AutoConfirm bool
+	TenantKey   string // credential fingerprint for multi-tenant isolation ("" = default tenant)
 }
 
 // Manager tracks all active session watchers. It provides the high-level
@@ -50,6 +52,47 @@ type Manager struct {
 	client   *dataagent.Client
 	sessDir  string
 	baseCtx  context.Context // process-lifetime context for watcher goroutines
+	// defaultTenantKey is the fingerprint of the server's own credential;
+	// see SetDefaultTenantKey.
+	defaultTenantKey string
+}
+
+type clientOverrideKeyType struct{}
+
+var clientOverrideKey = clientOverrideKeyType{}
+
+// WithClient returns a derived context that overrides the Manager's default
+// client for context-aware operations (CreateSession, WatchSession,
+// SendMessage). The MCP layer uses it to run legacy per-connection
+// credentials (X-STS-* / X-Data-Agent-Api-Key headers) against the shared
+// default manager.
+func WithClient(ctx context.Context, client *dataagent.Client) context.Context {
+	return context.WithValue(ctx, clientOverrideKey, client)
+}
+
+// effectiveClient returns the per-request client override from ctx if
+// present, otherwise the Manager's default client.
+func (m *Manager) effectiveClient(ctx context.Context) *dataagent.Client {
+	if c, ok := ctx.Value(clientOverrideKey).(*dataagent.Client); ok && c != nil {
+		return c
+	}
+	return m.client
+}
+
+// SetDefaultTenantKey records the tenant fingerprint of the server's default
+// credential. Persisted sessions owned by a different tenant are not restored
+// with the default client on startup (see RestoreSessions).
+func (m *Manager) SetDefaultTenantKey(key string) {
+	m.defaultTenantKey = key
+}
+
+// canRestoreTenant reports whether a persisted session may be restored using
+// the server's default client: legacy sessions without a tenant key and
+// sessions owned by the default credential are restorable; sessions created
+// with per-connection credentials are revived lazily by their owner via
+// data_agent_watch_session or data_agent_send.
+func canRestoreTenant(snapTenantKey, defaultTenantKey string) bool {
+	return snapTenantKey == "" || snapTenantKey == defaultTenantKey
 }
 
 // watcherEntry bundles a Watcher with its cancel function.
@@ -57,6 +100,9 @@ type watcherEntry struct {
 	watcher *Watcher
 	state   *State
 	cancel  context.CancelFunc
+	// client is the per-connection client that owns this watcher; nil means
+	// the Manager's default client.
+	client *dataagent.Client
 }
 
 // NewManager creates a Manager that uses the given client and persists state
@@ -110,6 +156,10 @@ func (m *Manager) RestoreSessions(ctx context.Context) {
 		if snap.AgentID == "" {
 			continue
 		}
+		if !canRestoreTenant(snap.TenantKey, m.defaultTenantKey) {
+			log.Printf("skipping session %s owned by tenant %s (revived lazily by its owner)", sessionID, snap.TenantKey)
+			continue
+		}
 
 		// Verify session is still active on server side.
 		info, err := m.client.DescribeSession(sessionID, snap.WorkspaceID)
@@ -148,13 +198,15 @@ func (m *Manager) RestoreSessions(ctx context.Context) {
 // CreateSession creates a new Data Agent session, waits for it to become
 // RUNNING, sends the initial query, and starts a background watcher goroutine.
 func (m *Manager) CreateSession(ctx context.Context, opts CreateOpts) (*State, error) {
+	client := m.effectiveClient(ctx)
+
 	// Fill in default workspace if not specified.
 	if opts.WorkspaceID == "" {
-		opts.WorkspaceID = m.client.ResolveWorkspaceID()
+		opts.WorkspaceID = client.ResolveWorkspaceID()
 	}
 
 	// 1. Create session on server.
-	info, err := m.client.CreateSession(dataagent.CreateSessionOpts{
+	info, err := client.CreateSession(dataagent.CreateSessionOpts{
 		Mode:          opts.Mode,
 		PlanMode:      opts.PlanMode,
 		DatabaseID:    opts.DatabaseID,
@@ -187,7 +239,7 @@ func (m *Manager) CreateSession(ctx context.Context, opts CreateOpts) (*State, e
 			FileID:         opts.FileID,
 			Database:       opts.FileName,
 			Tables:         []string{baseName},
-			RegionID:       m.client.Region(),
+			RegionID:       client.Region(),
 		}
 	} else if opts.DatabaseID != "" {
 		ds = &dataagent.DataSource{
@@ -199,12 +251,12 @@ func (m *Manager) CreateSession(ctx context.Context, opts CreateOpts) (*State, e
 			Database:       opts.DbName,
 			Tables:         opts.Tables,
 			Engine:         opts.Engine,
-			RegionID:       m.client.Region(),
+			RegionID:       client.Region(),
 		}
 	}
 
 	// 4. Send initial query.
-	if err := m.client.SendMessage(dataagent.SendMessageOpts{
+	if err := client.SendMessage(dataagent.SendMessageOpts{
 		AgentID:     agentID,
 		SessionID:   sessionID,
 		Message:     opts.Query,
@@ -225,13 +277,14 @@ func (m *Manager) CreateSession(ctx context.Context, opts CreateOpts) (*State, e
 		Mode:        opts.Mode,
 		AutoConfirm: opts.AutoConfirm,
 		WorkspaceID: opts.WorkspaceID,
+		TenantKey:   opts.TenantKey,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 		changed:     make(chan struct{}),
 	}
 
 	// 6. Create and start watcher.
-	watcher := NewWatcher(state, m.client, m.sessDir)
+	watcher := NewWatcher(state, client, m.sessDir)
 
 	watchCtx, watchCancel := context.WithCancel(m.watchContext())
 
@@ -239,6 +292,7 @@ func (m *Manager) CreateSession(ctx context.Context, opts CreateOpts) (*State, e
 		watcher: watcher,
 		state:   state,
 		cancel:  watchCancel,
+		client:  client,
 	}
 
 	m.mu.Lock()
@@ -256,11 +310,13 @@ func (m *Manager) CreateSession(ctx context.Context, opts CreateOpts) (*State, e
 // WatchSession attaches the local MCP server to an existing remote session and
 // starts the same background SSE watcher used for sessions created locally.
 func (m *Manager) WatchSession(ctx context.Context, opts WatchOpts) (*StateSnapshot, error) {
+	client := m.effectiveClient(ctx)
+
 	if opts.SessionID == "" {
 		return nil, fmt.Errorf("session_id is required")
 	}
 	if opts.WorkspaceID == "" {
-		opts.WorkspaceID = m.client.ResolveWorkspaceID()
+		opts.WorkspaceID = client.ResolveWorkspaceID()
 	}
 
 	m.mu.RLock()
@@ -271,7 +327,7 @@ func (m *Manager) WatchSession(ctx context.Context, opts WatchOpts) (*StateSnaps
 	}
 	m.mu.RUnlock()
 
-	info, err := m.client.DescribeSession(opts.SessionID, opts.WorkspaceID)
+	info, err := client.DescribeSession(opts.SessionID, opts.WorkspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("describe session: %w", err)
 	}
@@ -302,6 +358,9 @@ func (m *Manager) WatchSession(ctx context.Context, opts WatchOpts) (*StateSnaps
 		if state.Mode == "" {
 			state.Mode = opts.Mode
 		}
+		if state.TenantKey == "" {
+			state.TenantKey = opts.TenantKey
+		}
 	} else {
 		state = &State{
 			SessionID:   opts.SessionID,
@@ -310,6 +369,7 @@ func (m *Manager) WatchSession(ctx context.Context, opts WatchOpts) (*StateSnaps
 			Mode:        opts.Mode,
 			AutoConfirm: opts.AutoConfirm,
 			WorkspaceID: opts.WorkspaceID,
+			TenantKey:   opts.TenantKey,
 			CreatedAt:   now,
 			UpdatedAt:   now,
 			changed:     make(chan struct{}),
@@ -322,12 +382,13 @@ func (m *Manager) WatchSession(ctx context.Context, opts WatchOpts) (*StateSnaps
 		return &snap, nil
 	}
 
-	watcher := NewWatcher(state, m.client, m.sessDir)
+	watcher := NewWatcher(state, client, m.sessDir)
 	watchCtx, watchCancel := context.WithCancel(m.watchContext())
 	entry := &watcherEntry{
 		watcher: watcher,
 		state:   state,
 		cancel:  watchCancel,
+		client:  client,
 	}
 
 	m.mu.Lock()
@@ -506,9 +567,9 @@ func resultReason(snap *StateSnapshot) string {
 	return ""
 }
 
-// SendMessage sends a user message to an active session (for manual
-// confirmation or free-form input).
-func (m *Manager) SendMessage(sessionID, message string) error {
+// SendMessage sends a user message to a session (for manual confirmation,
+// free-form input, or follow-up questions on finished sessions).
+func (m *Manager) SendMessage(ctx context.Context, sessionID, message string) error {
 	m.mu.RLock()
 	entry, ok := m.watchers[sessionID]
 	m.mu.RUnlock()
@@ -537,12 +598,13 @@ func (m *Manager) SendMessage(sessionID, message string) error {
 	// the server may have restarted. The remote Data Agent session itself is
 	// multi-turn, so revive it from persisted state to support follow-up
 	// questions on finished sessions.
-	return m.reviveAndSend(sessionID, message)
+	return m.reviveAndSend(ctx, sessionID, message)
 }
 
 // reviveAndSend reloads a persisted session, restarts its SSE watcher, and
-// sends the follow-up message within the restored conversation context.
-func (m *Manager) reviveAndSend(sessionID, message string) error {
+// sends the follow-up message within the restored conversation context. The
+// caller's per-connection client (tenant isolation) is honored via ctx.
+func (m *Manager) reviveAndSend(ctx context.Context, sessionID, message string) error {
 	snap := LoadState(m.sessDir, sessionID)
 	if snap == nil {
 		return fmt.Errorf("session %s not found or not active", sessionID)
@@ -551,12 +613,13 @@ func (m *Manager) reviveAndSend(sessionID, message string) error {
 		return fmt.Errorf("session %s has no agent id; cannot revive", sessionID)
 	}
 
+	client := m.effectiveClient(ctx)
 	state := stateFromSnapshot(snap)
 	state.SetStatus(StatusRunning)
 
-	watcher := NewWatcher(state, m.client, m.sessDir)
+	watcher := NewWatcher(state, client, m.sessDir)
 	watchCtx, watchCancel := context.WithCancel(m.watchContext())
-	entry := &watcherEntry{watcher: watcher, state: state, cancel: watchCancel}
+	entry := &watcherEntry{watcher: watcher, state: state, cancel: watchCancel, client: client}
 
 	m.mu.Lock()
 	if existing, ok := m.watchers[sessionID]; ok {
@@ -678,12 +741,13 @@ func (m *Manager) StopSession(sessionID string) error {
 // waitForRunning polls DescribeSession until the session status is RUNNING or
 // the timeout is reached.
 func (m *Manager) waitForRunning(ctx context.Context, sessionID, workspaceID string, timeout time.Duration) error {
+	client := m.effectiveClient(ctx)
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
-		info, err := m.client.DescribeSession(sessionID, workspaceID)
+		info, err := client.DescribeSession(sessionID, workspaceID)
 		if err != nil {
 			log.Printf("[DEBUG] DescribeSession(%s) error: %v", sessionID, err)
 		} else {

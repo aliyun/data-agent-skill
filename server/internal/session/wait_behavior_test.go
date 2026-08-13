@@ -108,7 +108,7 @@ func TestSendMessageOnFinishedSessionTakesRevivePath(t *testing.T) {
 	// No persisted state on disk → the revive path fails with "not found",
 	// which proves SendMessage did not use the dead watcher (that would
 	// have attempted a real API call instead).
-	err := m.SendMessage("s1", "follow-up")
+	err := m.SendMessage(context.Background(), "s1", "follow-up")
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("expected revive-path error, got: %v", err)
 	}

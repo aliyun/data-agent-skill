@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"net/http"
@@ -25,6 +26,9 @@ type Server struct {
 	mcp      *server.MCPServer
 	resolve  Resolver
 	defaults SessionDefaults // tenant group defaults for the current request
+	// clientFactory builds per-connection clients for the legacy databuddy
+	// credential headers (see legacy.go); nil disables that path.
+	clientFactory ClientFactory
 	// customAgentID is the server-wide default custom agent, below any
 	// identity group default.
 	customAgentID string
@@ -94,7 +98,7 @@ type sessionManager interface {
 	WaitForChange(context.Context, string, int, time.Duration) (*session.StateSnapshot, bool, error)
 	WaitForResult(context.Context, string, time.Duration) (*session.StateSnapshot, string, error)
 	WatchSession(context.Context, session.WatchOpts) (*session.StateSnapshot, error)
-	SendMessage(string, string) error
+	SendMessage(context.Context, string, string) error
 	GetResult(string) (*session.StateSnapshot, error)
 	ListSessions() []*session.StateSnapshot
 	ListAllSessions() []*session.StateSnapshot
@@ -281,6 +285,19 @@ func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest
 			rec.tagError(res)
 		}()
 
+		// Legacy per-connection credentials (databuddy embedded mode) take
+		// precedence over identity resolution: the caller supplied explicit
+		// credentials, so run against the shared default manager with the
+		// per-connection client from the request context (session ops pick
+		// it up via session.WithClient).
+		if lc := legacyFromCtx(ctx); lc != nil {
+			scoped := *s
+			scoped.client = lc.client
+			if lc.agentID != "" {
+				scoped.defaults.CustomAgentID = lc.agentID
+			}
+			return h(&scoped, ctx, req)
+		}
 		if s.resolve == nil {
 			return h(s, ctx, req)
 		}
@@ -311,7 +328,14 @@ func (s *Server) identityHTTPContext(ctx context.Context, r *http.Request) conte
 	)
 }
 
-func (s *Server) Run(_ context.Context) error {
+// httpContext merges the identity headers (identity/JWT multi-tenant mode)
+// and the legacy databuddy credential headers into the request context.
+func (s *Server) httpContext(ctx context.Context, r *http.Request) context.Context {
+	ctx = s.identityHTTPContext(ctx, r)
+	return s.legacyHTTPContext(ctx, r)
+}
+
+func (s *Server) Run(ctx context.Context) error {
 	transport := os.Getenv("MCP_TRANSPORT")
 	switch transport {
 	case "sse":
@@ -319,20 +343,30 @@ func (s *Server) Run(_ context.Context) error {
 		if err != nil {
 			return err
 		}
+		token, err := requireAuthToken(transport)
+		if err != nil {
+			return err
+		}
 		log.Printf("starting SSE MCP server on %s", addr)
-		return server.NewSSEServer(s.mcp,
+		sse := server.NewSSEServer(s.mcp,
 			server.WithBaseURL("http://"+addr),
-			server.WithSSEContextFunc(s.identityHTTPContext),
-		).Start(addr)
+			server.WithSSEContextFunc(s.httpContext),
+		)
+		return s.serveHTTP(ctx, addr, token, sse)
 	case "streamable-http":
 		addr, err := mcpAddr()
 		if err != nil {
 			return err
 		}
+		token, err := requireAuthToken(transport)
+		if err != nil {
+			return err
+		}
 		log.Printf("starting Streamable HTTP MCP server on %s", addr)
-		return server.NewStreamableHTTPServer(s.mcp,
-			server.WithHTTPContextFunc(s.identityHTTPContext),
-		).Start(addr)
+		httpSrv := server.NewStreamableHTTPServer(s.mcp,
+			server.WithHTTPContextFunc(s.httpContext),
+		)
+		return s.serveHTTP(ctx, addr, token, httpSrv)
 	default:
 		if transport != "" && transport != "stdio" {
 			log.Printf("unknown MCP_TRANSPORT %q, falling back to stdio", transport)
@@ -340,6 +374,57 @@ func (s *Server) Run(_ context.Context) error {
 		stdio := server.NewStdioServer(s.mcp)
 		return stdio.Listen(context.Background(), os.Stdin, os.Stdout)
 	}
+}
+
+// requireAuthToken makes bearer authentication mandatory on the remote
+// transports: a network-reachable MCP port without a shared secret would
+// expose every configured credential to the local network, so the server
+// refuses to start rather than open a bare port.
+func requireAuthToken(transport string) (string, error) {
+	token := os.Getenv("MCP_AUTH_TOKEN")
+	if token == "" {
+		return "", fmt.Errorf("MCP_AUTH_TOKEN is required for the %s transport; set a random secret and have clients send it as 'Authorization: Bearer <token>'", transport)
+	}
+	return token, nil
+}
+
+// serveHTTP wraps the MCP transport handler with the unauthenticated
+// /health probe endpoint and mandatory bearer-token authentication, then
+// serves on addr until ctx is canceled (graceful shutdown).
+func (s *Server) serveHTTP(ctx context.Context, addr, token string, mcpHandler http.Handler) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.Handle("/", withBearerAuth(token, mcpHandler))
+	httpSrv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdownCtx)
+	}()
+	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":"ok","version":%q}`, s.version)
+}
+
+// withBearerAuth rejects requests whose Authorization header is not
+// "Bearer <token>" (constant-time comparison).
+func withBearerAuth(token string, next http.Handler) http.Handler {
+	expected := "Bearer " + token
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get("Authorization")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // mcpAddr returns the listen address from MCP_PORT. HTTP transports require

@@ -334,6 +334,15 @@ func (c *Client) SendMessage(opts SendMessageOpts) error {
 	return nil
 }
 
+// SetWorkspaceID overrides the workspace this client operates in. Used by
+// the MCP layer when a per-connection X-Data-Agent-Workspace-Id header
+// scopes the caller to a specific workspace.
+func (c *Client) SetWorkspaceID(id string) {
+	c.wsMu.Lock()
+	c.workspaceID = id
+	c.wsMu.Unlock()
+}
+
 // ResolveWorkspaceID calls InitDataAgentPersonalWorkspace to get the user's
 // personal workspace ID. Result is cached.
 func (c *Client) ResolveWorkspaceID() string {

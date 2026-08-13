@@ -64,7 +64,11 @@ func (m *Manager) doHousekeeping() {
 // reconcileWithServer checks the server-side session status and updates the
 // local state if the server reports the session as finished.
 func (m *Manager) reconcileWithServer(sessionID string, entry *watcherEntry) {
-	info, err := m.client.DescribeSession(sessionID, entry.state.GetWorkspaceID())
+	client := entry.client
+	if client == nil {
+		client = m.client
+	}
+	info, err := client.DescribeSession(sessionID, entry.state.GetWorkspaceID())
 	if err != nil {
 		log.Printf("[housekeeping] DescribeSession(%s) error: %v", sessionID, err)
 		return
