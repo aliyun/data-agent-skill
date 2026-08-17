@@ -3,7 +3,6 @@ package mcp
 import (
 	"context"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -172,43 +171,5 @@ func TestCheckSessionAccessTenantIsolation(t *testing.T) {
 	}
 	if _, err := s.checkSessionAccess(context.Background(), "s1"); err != nil {
 		t.Errorf("default caller must access every session: %v", err)
-	}
-}
-
-// Remote transports refuse to start without MCP_AUTH_TOKEN, and the bearer
-// wrapper rejects wrong or missing tokens while /health stays open.
-func TestAuthTokenMandatory(t *testing.T) {
-	t.Setenv("MCP_AUTH_TOKEN", "")
-	if _, err := requireAuthToken("sse"); err == nil {
-		t.Fatal("expected error when MCP_AUTH_TOKEN is unset")
-	}
-	t.Setenv("MCP_AUTH_TOKEN", "sekret")
-	token, err := requireAuthToken("sse")
-	if err != nil || token != "sekret" {
-		t.Fatalf("requireAuthToken = %q, %v", token, err)
-	}
-}
-
-func TestWithBearerAuth(t *testing.T) {
-	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	h := withBearerAuth("sekret", next)
-
-	for _, c := range []struct {
-		header string
-		want   int
-	}{
-		{"", http.StatusUnauthorized},
-		{"Bearer wrong", http.StatusUnauthorized},
-		{"Bearer sekret", http.StatusOK},
-	} {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		if c.header != "" {
-			req.Header.Set("Authorization", c.header)
-		}
-		h.ServeHTTP(rec, req)
-		if rec.Code != c.want {
-			t.Errorf("Authorization=%q: status = %d, want %d", c.header, rec.Code, c.want)
-		}
 	}
 }

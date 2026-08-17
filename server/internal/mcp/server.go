@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"context"
-	"crypto/subtle"
 	"fmt"
 	"log"
 	"net/http"
@@ -335,7 +334,7 @@ func (s *Server) httpContext(ctx context.Context, r *http.Request) context.Conte
 	return s.legacyHTTPContext(ctx, r)
 }
 
-func (s *Server) Run(ctx context.Context) error {
+func (s *Server) Run(_ context.Context) error {
 	transport := os.Getenv("MCP_TRANSPORT")
 	switch transport {
 	case "sse":
@@ -343,30 +342,20 @@ func (s *Server) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		token, err := requireAuthToken(transport)
-		if err != nil {
-			return err
-		}
 		log.Printf("starting SSE MCP server on %s", addr)
-		sse := server.NewSSEServer(s.mcp,
+		return server.NewSSEServer(s.mcp,
 			server.WithBaseURL("http://"+addr),
 			server.WithSSEContextFunc(s.httpContext),
-		)
-		return s.serveHTTP(ctx, addr, token, sse)
+		).Start(addr)
 	case "streamable-http":
 		addr, err := mcpAddr()
 		if err != nil {
 			return err
 		}
-		token, err := requireAuthToken(transport)
-		if err != nil {
-			return err
-		}
 		log.Printf("starting Streamable HTTP MCP server on %s", addr)
-		httpSrv := server.NewStreamableHTTPServer(s.mcp,
+		return server.NewStreamableHTTPServer(s.mcp,
 			server.WithHTTPContextFunc(s.httpContext),
-		)
-		return s.serveHTTP(ctx, addr, token, httpSrv)
+		).Start(addr)
 	default:
 		if transport != "" && transport != "stdio" {
 			log.Printf("unknown MCP_TRANSPORT %q, falling back to stdio", transport)
@@ -376,57 +365,6 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
-// requireAuthToken makes bearer authentication mandatory on the remote
-// transports: a network-reachable MCP port without a shared secret would
-// expose every configured credential to the local network, so the server
-// refuses to start rather than open a bare port.
-func requireAuthToken(transport string) (string, error) {
-	token := os.Getenv("MCP_AUTH_TOKEN")
-	if token == "" {
-		return "", fmt.Errorf("MCP_AUTH_TOKEN is required for the %s transport; set a random secret and have clients send it as 'Authorization: Bearer <token>'", transport)
-	}
-	return token, nil
-}
-
-// serveHTTP wraps the MCP transport handler with the unauthenticated
-// /health probe endpoint and mandatory bearer-token authentication, then
-// serves on addr until ctx is canceled (graceful shutdown).
-func (s *Server) serveHTTP(ctx context.Context, addr, token string, mcpHandler http.Handler) error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.Handle("/", withBearerAuth(token, mcpHandler))
-	httpSrv := &http.Server{Addr: addr, Handler: mux}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = httpSrv.Shutdown(shutdownCtx)
-	}()
-	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return err
-	}
-	return nil
-}
-
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"status":"ok","version":%q}`, s.version)
-}
-
-// withBearerAuth rejects requests whose Authorization header is not
-// "Bearer <token>" (constant-time comparison).
-func withBearerAuth(token string, next http.Handler) http.Handler {
-	expected := "Bearer " + token
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got := r.Header.Get("Authorization")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 // mcpAddr returns the listen address from MCP_PORT. HTTP transports require
 // the host agent/runtime to choose and pass an available port explicitly.
 func mcpAddr() (string, error) {
@@ -434,7 +372,11 @@ func mcpAddr() (string, error) {
 	if port == "" {
 		return "", fmt.Errorf("MCP_PORT must be set for %s transport; choose an available local port in the agent runtime", os.Getenv("MCP_TRANSPORT"))
 	}
-	return ":" + port, nil
+	// MCP_HOST confines the listener to one interface. Sidecar/same-pod
+	// deployments should set 127.0.0.1 so the port is reachable only from
+	// inside the pod's network namespace; empty keeps the historical
+	// all-interfaces default.
+	return os.Getenv("MCP_HOST") + ":" + port, nil
 }
 
 // isRemoteTransport reports whether the transport serves callers over the
