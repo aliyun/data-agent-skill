@@ -1,17 +1,13 @@
 package mcp
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"mime/multipart"
-	"net/http"
-	"net/textproto"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -673,86 +669,94 @@ func (s *Server) handleListAgents(_ context.Context, req mcp.CallToolRequest) (*
 	return jsonResult(agents)
 }
 
-func (s *Server) handleUploadFile(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	filePath := argStr(req, "file_path")
-	if filePath == "" {
-		return mcp.NewToolResultError("file_path is required"), nil
+// argInt64 reads a numeric argument; JSON numbers arrive as float64 and some
+// callers send numbers as strings, so both forms are accepted.
+func argInt64(req mcp.CallToolRequest, key string) int64 {
+	v, ok := req.GetArguments()[key]
+	if !ok || v == nil {
+		return 0
+	}
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case string:
+		i, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64)
+		if err != nil {
+			return 0
+		}
+		return i
+	}
+	return 0
+}
+
+// handleGetUploadSignature returns the pre-signed OSS POST policy so the
+// caller uploads the file bytes itself; the server never enters the data
+// path and no server-side filesystem access is involved.
+func (s *Server) handleGetUploadSignature(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	fileName := path.Base(strings.TrimSpace(argStr(req, "file_name")))
+	if fileName == "" || fileName == "." || fileName == "/" {
+		return mcp.NewToolResultError("file_name is required (bare filename, e.g. sales.csv)"), nil
+	}
+	fileSize := argInt64(req, "file_size")
+	if fileSize <= 0 {
+		return mcp.NewToolResultError("file_size must be a positive byte count"), nil
 	}
 
-	realPath, info, err := s.resolveUploadPath(filePath)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	sig, err := s.client.GetFileUploadSignature(info.Name(), info.Size())
+	sig, err := s.client.GetFileUploadSignature(fileName, fileSize)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get upload signature: %v", err)), nil
 	}
 
-	f, err := os.Open(realPath)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("failed to open file: %v", err)), nil
-	}
-	defer f.Close()
+	ossKey := sig.UploadDir + "/" + fileName
+	return jsonResult(map[string]any{
+		"upload_host": sig.UploadHost,
+		"oss_key":     ossKey,
+		// Ready-to-use form fields for the multipart POST; the file part
+		// (named "file") must be the last part and carry file_content_type.
+		"form_fields": map[string]string{
+			"key":                     ossKey,
+			"policy":                  sig.Policy,
+			"x-oss-signature":         sig.OssSignature,
+			"x-oss-signature-version": sig.OssSignatureVersion,
+			"x-oss-date":              sig.OssDate,
+			"x-oss-security-token":    sig.OssSecurityToken,
+			"x-oss-credential":        sig.OssCredential,
+			"success_action_status":   "200",
+		},
+		"file_content_type": detectContentType(fileName),
+		"instructions": "POST multipart/form-data to upload_host: add every form_fields entry " +
+			"as a form field, then the file bytes as the final part named \"file\" with " +
+			"Content-Type file_content_type. On HTTP 200, call data_agent_upload_callback " +
+			"with file_name, oss_key, and file_size to obtain the file_id.",
+	})
+}
 
-	// OSS multipart/form-data POST upload.
-	ossKey := sig.UploadDir + "/" + info.Name()
-
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	writer.WriteField("key", ossKey)
-	writer.WriteField("policy", sig.Policy)
-	writer.WriteField("x-oss-signature", sig.OssSignature)
-	writer.WriteField("x-oss-signature-version", sig.OssSignatureVersion)
-	writer.WriteField("x-oss-date", sig.OssDate)
-	writer.WriteField("x-oss-security-token", sig.OssSecurityToken)
-	writer.WriteField("x-oss-credential", sig.OssCredential)
-	writer.WriteField("success_action_status", "200")
-
-	// OSS policy requires correct content-type for the file part.
-	contentType := detectContentType(info.Name())
-	partHeader := make(textproto.MIMEHeader)
-	partHeader.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, info.Name()))
-	partHeader.Set("Content-Type", contentType)
-	part, err := writer.CreatePart(partHeader)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("failed to create form file: %v", err)), nil
+// handleUploadCallback registers a completed OSS upload with the Data Center
+// and returns the file ID used by create_session.
+func (s *Server) handleUploadCallback(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	fileName := path.Base(strings.TrimSpace(argStr(req, "file_name")))
+	ossKey := strings.TrimSpace(argStr(req, "oss_key"))
+	if fileName == "" || fileName == "." || ossKey == "" {
+		return mcp.NewToolResultError("file_name and oss_key are required"), nil
 	}
-	if _, err := io.Copy(part, f); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("failed to write file data: %v", err)), nil
-	}
-	writer.Close()
-
-	httpReq, err := http.NewRequest("POST", sig.UploadHost, &body)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("failed to create upload request: %v", err)), nil
-	}
-	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
-
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("upload failed: %v", err)), nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
-		log.Printf("[DEBUG] OSS upload error: status=%d body=%s", resp.StatusCode, string(respBody))
-		return mcp.NewToolResultError(fmt.Sprintf("upload returned HTTP %d: %s", resp.StatusCode, string(respBody))), nil
+	fileSize := argInt64(req, "file_size")
+	if fileSize <= 0 {
+		return mcp.NewToolResultError("file_size must be a positive byte count"), nil
 	}
 
-	// Callback with OSS path to get the Data Center file ID.
-	fileID, err := s.client.FileUploadCallback(info.Name(), ossKey, info.Size())
+	fileID, err := s.client.FileUploadCallback(fileName, ossKey, fileSize)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("upload callback failed: %v", err)), nil
 	}
 	if fileID == "" {
-		fileID = sig.UploadDir
+		// Legacy fallback: the upload dir doubles as the file ID.
+		fileID = path.Dir(ossKey)
 	}
 
 	return jsonResult(map[string]any{
-		"file_id":  fileID,
-		"filename": info.Name(),
-		"size":     info.Size(),
+		"file_id":   fileID,
+		"file_name": fileName,
+		"size":      fileSize,
 	})
 }
 

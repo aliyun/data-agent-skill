@@ -1,6 +1,6 @@
 # data-agent-mcp-server
 
-Go MCP Server exposing **Alibaba Cloud Apsara Data Agent for Analytics** as 18
+Go MCP Server exposing **Alibaba Cloud Apsara Data Agent for Analytics** as 19
 native `data_agent_*` tools. This directory is a standalone Go project; the
 distributable skill wrapper lives in
 [`../alibabacloud-data-agent-mcp-skill/`](../alibabacloud-data-agent-mcp-skill/)
@@ -67,7 +67,6 @@ Key environment variables:
 | `DATA_AGENT_CONFIG` | Explicit config.yaml path |
 | `DATA_AGENT_WORKSPACE_ID` | Default workspace (empty = auto-discovery) |
 | `DATA_AGENT_WAIT_CAP` | Blocking-wait ceiling in seconds (default 55, chosen to stay under nginx's default 60s `proxy_read_timeout`) |
-| `DATA_AGENT_UPLOAD_DIRS` | Allowlisted upload directories; unset disables `data_agent_upload_file` on HTTP transports (fail-closed) |
 | `DATA_AGENT_LOG_REQUESTS` | Per-call logging: `basic` / `full` / `off` |
 
 ## Verify
@@ -75,7 +74,7 @@ Key environment variables:
 ```bash
 make dacli
 ./bin/dacli --url http://localhost:61026/mcp \
-  --user <user-id> --token <identity-auth-token> tools   # expect 18 tools
+  --user <user-id> --token <identity-auth-token> tools   # expect 19 tools
 ./bin/dacli ... dbs                                      # workspace databases
 ./bin/dacli ... ask <db> "<tables>" "<question>"         # end-to-end analysis
 ```
@@ -97,7 +96,7 @@ section is enabled in `config.yaml`.
 ├── main.go              # entry point (config load, transport selection)
 ├── cmd/dacli/           # manual verification CLI
 ├── internal/
-│   ├── mcp/             # MCP server + 18 tool handlers + wait cap
+│   ├── mcp/             # MCP server + 19 tool handlers + wait cap
 │   ├── session/         # session manager, SSE watcher, housekeeping
 │   ├── dataagent/       # Alibaba Cloud API client (V3 signing, SSE, paging)
 │   ├── tenant/          # identity → RAM role AssumeRole registry (JWT/token)

@@ -36,17 +36,6 @@ sts:
   endpoint: ""            # default: sts.{region}.aliyuncs.com
   session_expiration: 3600
 
-# Confine data_agent_upload_file to these directories. The tool reads a
-# server-side path chosen by the caller, so leaving this empty on the HTTP
-# transports (streamable-http / sse) disables uploads entirely (fail-closed) —
-# otherwise a remote client could read any file the server process can.
-# The stdio transport (local caller, same trust domain) stays unrestricted
-# while the list is empty. Env override: DATA_AGENT_UPLOAD_DIRS (path list).
-upload:
-  allowed_dirs: []
-  #  - ~/data-agent-uploads
-  #  - /srv/data-agent/inbox
-
 # Blocking-wait ceiling for data_agent_wait_result and data_agent_status
 # (wait_timeout), in seconds. Requests above the cap are clamped so the tool
 # response always beats reverse-proxy and client timeouts (~120s in common

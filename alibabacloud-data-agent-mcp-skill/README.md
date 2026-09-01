@@ -1,6 +1,6 @@
 # Alibaba Cloud Data Agent MCP Skill
 
-A standalone Agent Skill that exposes **Alibaba Cloud Apsara Data Agent for Analytics** as a native MCP server (`data-agent`, 18 `data_agent_*` tools), built in Go. AI assistants call the tools directly to discover databases, run natural language analysis, track progress via server-side SSE monitoring, and fetch conclusions, charts, and file artifacts (reports / Excel exports).
+A standalone Agent Skill that exposes **Alibaba Cloud Apsara Data Agent for Analytics** as a native MCP server (`data-agent`, 19 `data_agent_*` tools), built in Go. AI assistants call the tools directly to discover databases, run natural language analysis, track progress via server-side SSE monitoring, and fetch conclusions, charts, and file artifacts (reports / Excel exports).
 
 > Looking for the Python CLI integration instead? See the repository root [README](../README.md) and [SKILL.md](../alibabacloud-data-agent-skill/SKILL.md).
 
@@ -47,8 +47,6 @@ STS so RAM/DMS permissions apply per end user. Secrets stay in `.env`.
 region: cn-hangzhou
 sessions_dir: ~/.data-agent/sessions
 
-upload:
-  allowed_dirs: [/srv/data-agent/inbox]   # HTTP transports refuse uploads while empty
 log:
   requests: full                          # basic | full | off
 
@@ -101,7 +99,6 @@ Lookup order: `$DATA_AGENT_CONFIG` > `./config.yaml` > `~/.data-agent/config.yam
 | `data_agent_endpoint` | `dms.{region}.aliyuncs.com` | Host for the AK/SK-signed Data Agent API (session create/send/status and the SSE stream) |
 | `api_key_endpoint` | `dataagent-{region}.aliyuncs.com` | API Key control-plane host (ignored with AK/SK auth) |
 | `api_key_stream_endpoint` | `dataagent-stream-{region}.aliyuncs.com` | API Key streaming-plane host (ignored with AK/SK auth) |
-| `upload.allowed_dirs` | `[]` (empty) | Directories `data_agent_upload_file` may read. HTTP transports refuse every upload while empty (fail-closed); stdio stays unrestricted until the list is set |
 | `log.requests` | `basic` on HTTP transports, `off` on stdio | Per-tool-call logging: `basic` (tool, caller, outcome, duration) \| `full` (adds redacted arguments) \| `off`. A standalone deployment logs by default; stdio stays quiet because the host agent owns the console. The identity token is never logged |
 | `sts.endpoint` | `sts.{region}.aliyuncs.com` | STS endpoint used for AssumeRole |
 | `sts.session_expiration` | `3600` | Temporary credential lifetime in seconds |
@@ -137,7 +134,6 @@ The `.env` file (path: `$DATA_AGENT_ENV_FILE`, else `./.env`) is loaded into the
 | `IDENTITY_JWT_SECRETS` | Comma-separated extra HS256 keys, merged with `identity.jwt.secret` for multiple upstream agents |
 | `IDENTITY_SESSION_NAME_PREFIX` | Overrides `identity.session_name_prefix`; an **empty** value means no prefix (unset keeps the config/default) |
 | `MCP_TRANSPORT` / `MCP_PORT` | `stdio` (default) \| `streamable-http` \| `sse`; port is required for HTTP transports |
-| `DATA_AGENT_UPLOAD_DIRS` | Path list (`:`-separated) confining `data_agent_upload_file`; overrides `upload.allowed_dirs`. Required on HTTP transports, which otherwise refuse uploads |
 | `DATA_AGENT_LOG_REQUESTS` | `basic` \| `full` \| `off`; overrides `log.requests`. Unset = `basic` on HTTP transports, `off` on stdio |
 | `DATA_AGENT_DEBUG_SSE` | `1` = log raw SSE traffic (debugging) |
 
@@ -307,7 +303,7 @@ Deploy as Option 2 (Streamable HTTP) where the upstream egress can reach it, and
 # stdio handshake
 printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}\n' \
   | bash scripts/select-binary.sh
-# → serverInfo "data-agent-mcp-server"; the client should list 18 data_agent_* tools
+# → serverInfo "data-agent-mcp-server"; the client should list 19 data_agent_* tools
 ```
 
 ### dacli — manual verification client
@@ -322,7 +318,7 @@ cd server && make dacli          # -> bin/dacli (or: go build -o bin/dacli ./cmd
   --user ou_xxxxxxxx --token <shared-secret> <command>
 
 # commands
-./bin/dacli ... tools                     # list the 18 MCP tools
+./bin/dacli ... tools                     # list the 19 MCP tools
 ./bin/dacli ... workspaces                # visible workspaces under the assumed role
 ./bin/dacli ... dbs                       # workspace Data Center databases
 ./bin/dacli ... ask chinook "album,artist,track" "哪个艺术家的专辑数量最多？"

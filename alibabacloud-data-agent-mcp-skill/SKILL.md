@@ -6,10 +6,11 @@ domain: AIOps
 ---
 metadata:
   author: DataAgent Team
-  version: "3.0.0"
+  version: "3.1.0"
 ---
 
 # Changelog
+- **v3.1.0** — File upload moved out of the server's data path: `data_agent_upload_file` (server-side local path read) is replaced by `data_agent_get_upload_signature` + `data_agent_upload_callback`, so the caller (e.g. Feishu Aily, the host agent) POSTs the file bytes to OSS itself. The `upload.allowed_dirs` / `DATA_AGENT_UPLOAD_DIRS` allowlist is removed — the server no longer reads caller-chosen local files on any transport. Tool surface: 19 `data_agent_*` tools.
 - **v3.0.0** — Session mode tiers aligned with the platform: `auto` / `lite` / `pro` / `ultra` (defaults: `auto` for database, `pro` for file); legacy `ASK_DATA`/`ANALYSIS`/`INSIGHT` values are auto-mapped to `lite`/`pro`/`ultra` for backward compatibility. New `plan_mode` parameter on `data_agent_create_session` (`force` = always generate an execution plan, `disable` = skip planning), injected as `SessionConfig.PlanMode`. Generic multi-tenant identity mode: `identity` config section (legacy `aily:` alias still parsed) with configurable identity headers (defaults `x-aily-*`, Feishu Aily compatible) and two mapping styles — `identity.default` (global sharing: one RAM role + workspace/agent/mode session defaults for every identified user) and `identity.groups.<name>` (per-group role + session defaults + member list; group wins over default). Per-user tenants (isolated client, session store `sessions_dir/identity/<user>/`, `RoleSessionName = <prefix>-<user_id>` for ActionTrail attribution) via STS AssumeRole with auto-refresh. Follow-up questions on finished sessions: `data_agent_send` revives completed sessions from persisted state. YAML (`config.yaml`) + `.env` configuration replaces JSON-only config. Fixed SSE parsing without `event:` prefix lines and watcher lifetime on HTTP transports. Repackaged as a standalone skill; binaries are built from source by `scripts/select-binary.sh` (Go 1.23+).
 - **v2.x** — Tool surface grew to 18 `data_agent_*` tools (discovery/import, workspaces, custom agents, file upload, session lifecycle). Event-driven waiting: `data_agent_wait_result` blocks until the session needs LLM attention; `data_agent_status` gained server-side `wait_timeout`; CRITICAL ANTI-LOOP rules against repetitive polling. `data_agent_result` returns chart images as MCP ImageContent. Clear split between workspace Data Center metadata (`data_agent_list_workspace_databases`, authoritative for `create_session`) and DMS discovery (`data_agent_search_dms_databases`, import only). API Key auth mode and file analysis flows.
 - **v2.0.0** — Initial Go MCP Server architecture: Session Daemon with background SSE monitoring, auto-confirm for ANALYSIS mode, core session tools.
@@ -40,7 +41,7 @@ When this skill is active:
 2. Do not fall back to `aliyun` CLI, Python SDK, direct HTTP/curl, locally cached metadata, or hardcoded database IDs.
 3. If `data_agent_*` tools are not available in the runtime, report: "Data Agent MCP server is not registered in this agent runtime. Task aborted." Then stop the task. Do not start the bundled server, do not edit runtime settings, do not probe localhost ports, do not call `/mcp` with curl, and do not attempt CLI/SDK/API fallbacks.
 4. For database analysis, **always** call `data_agent_list_workspace_databases()` in the same conversation turn **immediately before** `data_agent_create_session`, and use **only** the returned row for `database_id`, `db_name`, `instance_id`, `instance_name`, and `engine`. This applies in ALL auth modes (AK/SK and API Key). **Never** guess, infer, or reuse database/instance parameters from memory, prior conversations, user-provided IDs, or DMS search results — workspace contents change over time and stale values cause `Specified parameter InstanceId is not valid` or wrong-database analysis.
-5. For file analysis, call `data_agent_upload_file()` before `data_agent_create_session(file_id=...)`.
+5. For file analysis, the caller uploads the file itself: call `data_agent_get_upload_signature()`, POST the file bytes to the returned OSS host, then call `data_agent_upload_callback()` to get the `file_id` for `data_agent_create_session(file_id=...)`. The MCP server never reads local files.
 6. For session query/status/stop/delete-style requests, use `data_agent_list_sessions()`, `data_agent_status()`, and `data_agent_stop_session()`. If the user asks for hard deletion, explain that the current MCP surface supports stopping monitoring and cleanup via `data_agent_stop_session`, not permanent remote deletion.
 7. Do not invent deprecated tool names or legacy command patterns such as `data_agent_search_databases`, `data_agent_list_databases`, `file` subcommands, `attach --session-id`, `reports --session-id`, `--db-id`, or wildcard table imports.
 8. Workspace names are display names, not IDs. If the user gives a workspace name such as `dev-workspace`, call `data_agent_list_workspaces(type="ALL")`, exact-match `name`, and use the matched `workspace_id` for workspace-scoped tools. Do not pass the name itself as `workspace_id` and do not guess an ID.
@@ -49,7 +50,7 @@ When this skill is active:
 
 # Installation & Setup
 
-Setup is an **install-time responsibility**, not part of task execution. This skill assumes the `data-agent` MCP server (18 `data_agent_*` tools) is already registered in the host runtime.
+Setup is an **install-time responsibility**, not part of task execution. This skill assumes the `data-agent` MCP server (19 `data_agent_*` tools) is already registered in the host runtime.
 
 - **Full setup reference** (transports & runtime registration for Claude Code / OpenClaw / hosted runtimes, credentials, YAML + .env configuration, multi-tenant identity mode, observability): [references/INSTALLATION.md](references/INSTALLATION.md)
 - **Human deployment walkthrough** (systemd, dacli verification client): [README.md](README.md)
@@ -63,7 +64,7 @@ Facts the agent may need when the user asks setup questions (do not perform setu
 
 ---
 
-# MCP Tools (18)
+# MCP Tools (19)
 
 ## Core Analysis
 
@@ -78,12 +79,12 @@ data_agent_list_workspace_databases(workspace_id?)
 Use this tool before `data_agent_create_session` for database analysis. Pass its `db_id`, `db_name`, `instance_id`, `instance_resource_id`, and `db_type` into the session options.
 
 ### data_agent_create_session
-Create an analysis session with automatic SSE monitoring. Supports **database analysis** (`database_id`) or **file analysis** (`file_id` from `upload_file`). For pro/ultra mode with `auto_confirm=true`, all plan/SQL/report confirmations are handled automatically.
+Create an analysis session with automatic SSE monitoring. Supports **database analysis** (`database_id`) or **file analysis** (`file_id` from `data_agent_upload_callback`). For pro/ultra mode with `auto_confirm=true`, all plan/SQL/report confirmations are handled automatically.
 ```
 data_agent_create_session(
   query,                                          # Required
   database_id?, db_name?, tables?,                # For database analysis (database_id required)
-  file_id?, file_name?,                           # For file analysis (file_id required, from upload_file)
+  file_id?, file_name?,                           # For file analysis (file_id required, from data_agent_upload_callback)
   mode="auto|lite|pro|ultra",                     # Default: auto for database, pro for file
                                                   # (legacy ASK_DATA/ANALYSIS/INSIGHT auto-map to lite/pro/ultra)
   plan_mode="force|disable",                      # pro/ultra only: force = always generate an execution plan,
@@ -95,7 +96,7 @@ data_agent_create_session(
 → {session_id, status, mode, auto_confirm}
 ```
 
-> **Note**: `database_id` and `file_id` are mutually exclusive — use one or the other. For file analysis, pass the `file_id` and `filename` returned by `upload_file`.
+> **Note**: `database_id` and `file_id` are mutually exclusive — use one or the other. For file analysis, pass the `file_id` returned by `data_agent_upload_callback` and the original filename.
 
 > **Database session gotcha**: `data_agent_search_dms_databases` is only for DMS discovery/import. Its returned `instance_id` may be `0` or otherwise unusable for `create_session`, which can cause `Specified parameter InstanceId is not valid` or a `database_None_<db_name>` data source. Before creating a database session, always call `data_agent_list_workspace_databases()` in the target workspace and use the imported database row from Data Center:
 > - `database_id` = `db_id`
@@ -187,12 +188,25 @@ data_agent_list_files(session_id, category?)
 
 > **Prefer omitting `category`.** `category="WebReport"` only matches interactive web-rendered reports (produced by the report-render confirmation flow) and often returns empty even when .md/.html/.xlsx artifacts exist. Call without `category` to get the full list, then filter by `file_type` yourself.
 
-### data_agent_upload_file
-Upload a local file for Data Agent analysis. Returns `file_id` (Data Center ID, e.g. `f-xxx`) for use with `create_session`. Supported types: CSV, XLSX, XLS, JSON, TXT.
+### data_agent_get_upload_signature
+Step 1/2 of file upload: get a pre-signed OSS POST policy so the **caller** uploads the file itself — the MCP server never touches the file bytes or the local filesystem. Supported types: CSV, XLSX, XLS, JSON, TXT.
 ```
-data_agent_upload_file(file_path)
-→ {file_id, filename, size}
+data_agent_get_upload_signature(file_name, file_size)
+→ {upload_host, oss_key, form_fields, file_content_type, instructions}
 ```
+- **file_name**: bare filename with extension (e.g. `sales.csv`); path components are stripped.
+- **file_size**: size in bytes; must match the content actually uploaded.
+
+Then perform the upload: POST `multipart/form-data` to `upload_host`, adding every `form_fields` entry as a form field and the file bytes as the **final** part named `file` with `Content-Type: <file_content_type>`. HTTP 200 means the upload succeeded.
+
+### data_agent_upload_callback
+Step 2/2 of file upload: register the completed OSS upload with the Data Center. Call only after the multipart POST returned HTTP 200.
+```
+data_agent_upload_callback(file_name, oss_key, file_size)
+→ {file_id, file_name, size}
+```
+- **oss_key**: the `oss_key` returned by `data_agent_get_upload_signature`.
+- Returns `file_id` (Data Center ID, e.g. `f-xxx`) for use with `create_session`.
 
 ## Resource Discovery
 
@@ -342,16 +356,21 @@ data_agent_list_agents(
 
 ## File Analysis (Upload + Analyze)
 ```
-1. data_agent_upload_file(file_path="/path/to/sales.csv")
-   → {file_id: "f-xxx", filename: "sales.csv", size: 1024}
-2. data_agent_create_session(
+1. data_agent_get_upload_signature(file_name="sales.csv", file_size=1024)
+   → {upload_host, oss_key, form_fields, file_content_type, instructions}
+2. POST multipart/form-data to upload_host                # Performed by the caller (e.g. the host agent),
+   → form_fields as form fields + file bytes as final     # not by the MCP server
+     part named "file" (Content-Type: file_content_type)
+3. data_agent_upload_callback(file_name="sales.csv", oss_key="<oss_key>", file_size=1024)
+   → {file_id: "f-xxx", file_name: "sales.csv", size: 1024}
+4. data_agent_create_session(
      file_id="f-xxx", file_name="sales.csv",
      query="analyze sales trends",
      mode="pro", auto_confirm=true)              # File defaults to pro mode
-3. LOOP data_agent_wait_result(session_id, timeout=55)  # Loop on reason=timeout, reporting progress each round
+5. LOOP data_agent_wait_result(session_id, timeout=55)  # Loop on reason=timeout, reporting progress each round
                                                     # (if excluded: one-shot data_agent_status snapshot, then end turn if still running)
-4. data_agent_result(session_id)                  # Get conclusions
-5. data_agent_list_files(session_id)              # Get generated reports
+6. data_agent_result(session_id)                  # Get conclusions
+7. data_agent_list_files(session_id)              # Get generated reports
 ```
 
 > Supported file types: CSV, XLSX, XLS, JSON, TXT.
@@ -645,7 +664,7 @@ If a single `data_agent_status` call fails (network error, timeout), you may ret
 ├── bin/                         # Build output (gitignored)
 ├── cmd/dacli/                   # Manual verification client
 └── internal/
-    ├── mcp/                     # MCP Server + 18 tool handlers
+    ├── mcp/                     # MCP Server + 19 tool handlers
     ├── session/                 # Session Manager + Watcher + Housekeeping
     ├── dataagent/               # Alibaba Cloud API client (V3 signing, SSE)
     ├── config/                  # YAML + .env configuration loader

@@ -77,7 +77,6 @@ func main() {
 	go mgr.RunHousekeeping(ctx)
 
 	srv := mcpserver.New(mgr, client, version)
-	srv.SetUploadRoots(cfg.Upload.AllowedDirs)
 	srv.SetCustomAgentID(cfg.CustomAgentID)
 	srv.ApplyRequestLogConfig(cfg.Log.Requests)
 

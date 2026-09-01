@@ -67,7 +67,7 @@ OpenClaw skill installation and MCP server registration are separate steps. For 
 2. Start the bundled server as a long-running HTTP MCP service in the OpenClaw runtime, sidecar, worker image, or internal gateway using `MCP_TRANSPORT=streamable-http`. Register that service as an MCP server named `data-agent` with URL `http://<reachable-host>:<port>/mcp`.
 3. Use stdio only if the OpenClaw runtime itself launches local tool processes from the same filesystem that contains this skill. In that case, use the `command` and `args` from "Option 2: stdio" above.
 4. Ensure the runtime host can execute `bash` and the bundled `scripts/select-binary.sh` path, and can read Alibaba Cloud credentials from environment variables, `~/.aliyun/config.json`, instance role, or `DATA_AGENT_API_KEY`.
-5. If OpenClaw uses a tool allowlist, allow the `data-agent` server or all `data_agent_*` tools. At minimum allow `data_agent_list_workspace_databases`, `data_agent_create_session`, `data_agent_status`, `data_agent_send`, `data_agent_result`, `data_agent_list_sessions`, `data_agent_stop_session`, `data_agent_list_files`, `data_agent_upload_file`, `data_agent_search_dms_databases`, `data_agent_list_tables`, `data_agent_list_imported_tables`, `data_agent_search_instances`, `data_agent_import_database`, `data_agent_list_workspaces`, and `data_agent_list_agents`.
+5. If OpenClaw uses a tool allowlist, allow the `data-agent` server or all `data_agent_*` tools. At minimum allow `data_agent_list_workspace_databases`, `data_agent_create_session`, `data_agent_status`, `data_agent_send`, `data_agent_result`, `data_agent_list_sessions`, `data_agent_stop_session`, `data_agent_list_files`, `data_agent_get_upload_signature`, `data_agent_upload_callback`, `data_agent_search_dms_databases`, `data_agent_list_tables`, `data_agent_list_imported_tables`, `data_agent_search_instances`, `data_agent_import_database`, `data_agent_list_workspaces`, and `data_agent_list_agents`.
 6. Restart or reload the OpenClaw agent runtime after registering the server, then verify that `data_agent_*` tools are visible before running analysis tasks. If tools are not visible, do not attempt Data Agent work through CLI, SDK, or direct API fallbacks.
 
 Do not rely on this repository's `.claude/settings.json` for OpenClaw. That file is only a Claude Code convenience and is not read by remote OpenClaw deployments. Do not ask the task-running agent to fix registration by launching a local server or editing OpenClaw/Qwen settings during the task; that is an installation responsibility for AgentHub/OpenClaw setup.
@@ -93,7 +93,7 @@ For other setups, add to your user-level `~/.claude/settings.json`:
 }
 ```
 
-> After saving, restart Claude Code or run `/mcp` to verify the `data-agent` server is connected and 18 tools are available.
+> After saving, restart Claude Code or run `/mcp` to verify the `data-agent` server is connected and 19 tools are available.
 
 ## Credentials
 
@@ -162,11 +162,6 @@ dms_enterprise_endpoint: ""
 # Empty = dms.{region}.aliyuncs.com. Override it together with
 # dms_enterprise_endpoint for a fully private deployment.
 data_agent_endpoint: ""
-# Required on the HTTP transports: data_agent_upload_file reads a caller-chosen
-# server path, so uploads are refused until the directories are listed here.
-upload:
-  allowed_dirs:
-    - /srv/data-agent/inbox
 ```
 
 **Environment Variables** (override .env and config file):
@@ -192,7 +187,6 @@ upload:
 | `AILY_SHARED_SECRET` / `IDENTITY_SHARED_SECRET` / `IDENTITY_AUTH_TOKEN` | — | Overrides `identity.auth_token` for caller authentication |
 | `IDENTITY_JWT_SECRET` | — | Overrides `identity.jwt.secret`, the HS256 key verifying the upstream-signed identity token |
 | `MCP_TRANSPORT` / `MCP_PORT` | `stdio` / — | Transport (`stdio` \| `streamable-http` \| `sse`); port required for HTTP transports |
-| `DATA_AGENT_UPLOAD_DIRS` | — | `:`-separated directories `data_agent_upload_file` may read; overrides `upload.allowed_dirs`. HTTP transports refuse uploads while unset |
 | `DATA_AGENT_LOG_REQUESTS` | `basic` on HTTP, `off` on stdio | Per-call logging: `basic` \| `full` (adds redacted arguments) \| `off`; overrides `log.requests` |
 | `DATA_AGENT_DEBUG_SSE` | — | `1` = log raw SSE traffic (debugging) |
 | `DATA_AGENT_SESSION_LOOKBACK_DAYS` | `7` | Remote session list lookback window for `data_agent_list_sessions(include_remote=true)` |

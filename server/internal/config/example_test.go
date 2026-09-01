@@ -34,9 +34,6 @@ func TestShippedExampleConfigLoads(t *testing.T) {
 			t.Errorf("%s = %q, want empty in the template", name, got)
 		}
 	}
-	if cfg.Upload.AllowedDirs != nil && len(cfg.Upload.AllowedDirs) != 0 {
-		t.Errorf("upload.allowed_dirs = %v, want empty in the template", cfg.Upload.AllowedDirs)
-	}
 }
 
 // custom_agent_id mirrors workspace_id: a top-level default plus an env

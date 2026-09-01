@@ -157,19 +157,6 @@ type STS struct {
 	SessionExpiration int    `yaml:"session_expiration"` // seconds, default 3600
 }
 
-// Upload restricts which local files data_agent_upload_file may read.
-//
-// The tool reads a server-side path chosen by the caller, so on the HTTP
-// transports (where the caller is remote) an unrestricted path would let any
-// client exfiltrate arbitrary server files. AllowedDirs confines uploads to
-// an explicit set of directories; HTTP transports refuse every upload while
-// it is empty (fail-closed). The stdio transport, where client and server
-// share one trust domain and the caller is the local user, stays
-// unrestricted unless AllowedDirs is set.
-type Upload struct {
-	AllowedDirs []string `yaml:"allowed_dirs"`
-}
-
 // Log configures server logging. Everything goes to stderr, so on stdio the
 // host agent captures it and on the HTTP transports the process supervisor
 // (systemd, container runtime) does.
@@ -209,7 +196,6 @@ type Config struct {
 	// Empty = dataagent-stream-{region}.aliyuncs.com. Only used with api_key auth.
 	APIKeyStreamEndpoint string `yaml:"api_key_stream_endpoint"`
 	STS                  STS    `yaml:"sts"`
-	Upload               Upload `yaml:"upload"`
 	Log                  Log    `yaml:"log"`
 	// Identity is the multi-tenant identity section. The legacy section
 	// name "aily" is still accepted as an alias.
@@ -378,18 +364,11 @@ func Load() (Config, string, error) {
 			}
 		}
 	}
-	// Colon-separated on Unix, semicolon-separated on Windows (os.PathListSeparator).
-	if v := os.Getenv("DATA_AGENT_UPLOAD_DIRS"); v != "" {
-		cfg.Upload.AllowedDirs = filepath.SplitList(v)
-	}
 	if v := os.Getenv("DATA_AGENT_LOG_REQUESTS"); v != "" {
 		cfg.Log.Requests = v
 	}
 
 	cfg.SessionsDir = expandHome(cfg.SessionsDir)
-	for i, d := range cfg.Upload.AllowedDirs {
-		cfg.Upload.AllowedDirs[i] = expandHome(strings.TrimSpace(d))
-	}
 	cfg.ApplyDefaults()
 
 	if err := cfg.validate(); err != nil {

@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -39,12 +38,6 @@ type Server struct {
 	// plain identity headers must not be treated as the caller.
 	jwtIdentity bool
 
-	// uploadRoots confines data_agent_upload_file to these directories
-	// (empty = no allowlist configured).
-	uploadRoots []string
-	// remoteCaller is true on the HTTP transports, where the caller is not
-	// the local user and uploads must be confined to uploadRoots.
-	remoteCaller bool
 	// reqLog controls how much of each tool call reaches the log.
 	reqLog RequestLogLevel
 	// waitCap bounds server-side blocking waits so responses beat the MCP
@@ -123,11 +116,10 @@ func New(mgr *session.Manager, client *dataagent.Client, version string) *Server
 	s := &Server{
 		mgr: mgr, client: client, version: version,
 		hdrUser: "x-aily-user", hdrEmail: "x-aily-email", hdrToken: "x-aily-token",
-		hdrJWT:       tenant.DefaultJWTHeader,
-		remoteCaller: standalone,
-		reqLog:       defaultRequestLogLevel(standalone),
-		waitCap:      waitCapFromEnv(),
-		waits:        newWaitRegistry(),
+		hdrJWT:  tenant.DefaultJWTHeader,
+		reqLog:  defaultRequestLogLevel(standalone),
+		waitCap: waitCapFromEnv(),
+		waits:   newWaitRegistry(),
 	}
 
 	mcpServer := server.NewMCPServer(
@@ -153,7 +145,8 @@ func New(mgr *session.Manager, client *dataagent.Client, version string) *Server
 	mcpServer.AddTool(searchDMSDatabasesTool, s.withTenant((*Server).handleSearchDatabases))
 	mcpServer.AddTool(listWorkspacesTool, s.withTenant((*Server).handleListWorkspaces))
 	mcpServer.AddTool(listAgentsTool, s.withTenant((*Server).handleListAgents))
-	mcpServer.AddTool(uploadFileTool, s.withTenant((*Server).handleUploadFile))
+	mcpServer.AddTool(getUploadSignatureTool, s.withTenant((*Server).handleGetUploadSignature))
+	mcpServer.AddTool(uploadCallbackTool, s.withTenant((*Server).handleUploadCallback))
 
 	s.mcp = mcpServer
 	return s
@@ -183,88 +176,6 @@ func (s *Server) EnableJWTIdentity(header string) {
 	if header != "" {
 		s.hdrJWT = header
 	}
-}
-
-// SetUploadRoots confines data_agent_upload_file to the given directories.
-// Relative entries are resolved against the working directory and symlinked
-// roots are followed, so the check compares real paths. Passing no directory
-// leaves stdio unrestricted and keeps the HTTP transports fail-closed.
-func (s *Server) SetUploadRoots(dirs []string) {
-	roots := make([]string, 0, len(dirs))
-	for _, d := range dirs {
-		if d == "" {
-			continue
-		}
-		abs, err := filepath.Abs(d)
-		if err != nil {
-			log.Printf("upload root %q ignored: %v", d, err)
-			continue
-		}
-		real, err := filepath.EvalSymlinks(abs)
-		if err != nil {
-			log.Printf("upload root %q ignored: %v", d, err)
-			continue
-		}
-		roots = append(roots, real)
-	}
-	s.uploadRoots = roots
-	switch {
-	case len(roots) > 0:
-		log.Printf("file uploads confined to %v", roots)
-	case s.remoteCaller:
-		log.Print("file uploads disabled: upload.allowed_dirs is required on HTTP transports " +
-			"(set upload.allowed_dirs or DATA_AGENT_UPLOAD_DIRS)")
-	}
-}
-
-// resolveUploadPath validates a caller-supplied upload path and returns the
-// real path together with its file info.
-//
-// The path is resolved through symlinks before the allowlist check so a link
-// inside an allowed directory cannot point outside it, and only regular files
-// are accepted (directories, devices, and pipes are not uploadable).
-func (s *Server) resolveUploadPath(filePath string) (string, os.FileInfo, error) {
-	if len(s.uploadRoots) == 0 && s.remoteCaller {
-		return "", nil, fmt.Errorf("file uploads are disabled: no upload directory is allowed on this " +
-			"transport; configure upload.allowed_dirs (or DATA_AGENT_UPLOAD_DIRS) on the server")
-	}
-
-	abs, err := filepath.Abs(filePath)
-	if err != nil {
-		return "", nil, fmt.Errorf("invalid file path: %w", err)
-	}
-	real, err := filepath.EvalSymlinks(abs)
-	if err != nil {
-		return "", nil, fmt.Errorf("file not found: %w", err)
-	}
-	info, err := os.Stat(real)
-	if err != nil {
-		return "", nil, fmt.Errorf("file not found: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return "", nil, fmt.Errorf("not a regular file: %s", filePath)
-	}
-
-	if len(s.uploadRoots) == 0 {
-		return real, info, nil // stdio without allowlist: local caller, any path
-	}
-	for _, root := range s.uploadRoots {
-		if withinRoot(root, real) {
-			return real, info, nil
-		}
-	}
-	return "", nil, fmt.Errorf("file path is outside the allowed upload directories: %s", filePath)
-}
-
-// withinRoot reports whether path is root itself or nested under it.
-func withinRoot(root, path string) bool {
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return false
-	}
-	// ".." as the first segment means path escapes root; Rel already cleaned
-	// the result, so a prefix check on the separator is enough.
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // withTenant wraps a tool handler so it runs against the tenant resolved from
@@ -366,12 +277,12 @@ var listWorkspaceDatabasesTool = mcp.NewTool(
 
 var createSessionTool = mcp.NewTool(
 	"data_agent_create_session",
-	mcp.WithDescription("Create a Data Agent analysis session. Supports database analysis (database_id) or file analysis (file_id from upload_file). MANDATORY: before calling this tool for database analysis, you MUST call data_agent_list_workspace_databases in this same turn and use its returned values — never guess or reuse database_id/instance_id/engine from memory or prior conversations. Mode selection: quick factual question → mode=lite; deep analysis/report requested → mode=pro (or ultra for the most thorough); unsure → omit mode and the backend decides. For pro/ultra mode with auto_confirm=true, all plan/SQL/report confirmations are handled automatically."),
+	mcp.WithDescription("Create a Data Agent analysis session. Supports database analysis (database_id) or file analysis (file_id from data_agent_upload_callback). MANDATORY: before calling this tool for database analysis, you MUST call data_agent_list_workspace_databases in this same turn and use its returned values — never guess or reuse database_id/instance_id/engine from memory or prior conversations. Mode selection: quick factual question → mode=lite; deep analysis/report requested → mode=pro (or ultra for the most thorough); unsure → omit mode and the backend decides. For pro/ultra mode with auto_confirm=true, all plan/SQL/report confirmations are handled automatically."),
 	mcp.WithString("database_id", mcp.Description("DMS database ID — MUST come from a data_agent_list_workspace_databases call in this turn (required for database analysis, or use file_id for file analysis; not needed when a custom agent supplies the data source)")),
 	mcp.WithString("db_name", mcp.Description("Database schema name from data_agent_list_workspace_databases (required for database analysis, unless a custom agent supplies the data source)")),
 	mcp.WithString("tables", mcp.Description("Comma-separated table names to analyze (required for database analysis, unless a custom agent supplies the data source)")),
 	mcp.WithString("query", mcp.Required(), mcp.Description("Natural language analysis query")),
-	mcp.WithString("file_id", mcp.Description("Uploaded file ID from upload_file (alternative to database_id). File analysis defaults to pro mode.")),
+	mcp.WithString("file_id", mcp.Description("Uploaded file ID from data_agent_upload_callback (alternative to database_id). File analysis defaults to pro mode.")),
 	mcp.WithString("file_name", mcp.Description("Original filename (e.g. sales.csv). Required when using file_id.")),
 	mcp.WithString("mode", mcp.Description("Session mode tier: auto (default for database — backend decides), lite (quick Q&A, single SQL, ~seconds), pro (deep multi-step analysis with reports, minutes; default for file), ultra (most thorough multi-dimensional insights). Legacy values ASK_DATA/ANALYSIS/INSIGHT are auto-mapped to lite/pro/ultra.")),
 	mcp.WithString("plan_mode", mcp.Description("Plan mode for pro/ultra sessions: 'force' (always generate an execution plan) or 'disable' (skip planning, execute directly). Empty = server default.")),
@@ -489,8 +400,17 @@ var listAgentsTool = mcp.NewTool(
 	mcp.WithString("workspace_id", mcp.Description("Workspace ID returned by data_agent_list_workspaces, not the workspace display name (default: personal workspace)")),
 )
 
-var uploadFileTool = mcp.NewTool(
-	"data_agent_upload_file",
-	mcp.WithDescription("Upload a local file (CSV, XLSX, XLS, JSON, TXT) for Data Agent analysis. Returns file_id for use with create_session."),
-	mcp.WithString("file_path", mcp.Required(), mcp.Description("Absolute path to the local file to upload. Must be a regular file inside the server's allowed upload directories when the server configures them (always required on HTTP transports)")),
+var getUploadSignatureTool = mcp.NewTool(
+	"data_agent_get_upload_signature",
+	mcp.WithDescription("Step 1/2 of file upload: get a pre-signed OSS POST policy for uploading a file (CSV, XLSX, XLS, JSON, TXT) for Data Agent analysis. The caller performs the upload itself: POST multipart/form-data to the returned upload_host with every form_fields entry as a form field, then the file bytes as the final part named 'file' using the returned file_content_type. On HTTP 200, call data_agent_upload_callback with the returned oss_key to obtain the file_id for data_agent_create_session."),
+	mcp.WithString("file_name", mcp.Required(), mcp.Description("Bare filename including extension (e.g. sales.csv); no path components")),
+	mcp.WithNumber("file_size", mcp.Required(), mcp.Description("File size in bytes; must match the content actually uploaded")),
+)
+
+var uploadCallbackTool = mcp.NewTool(
+	"data_agent_upload_callback",
+	mcp.WithDescription("Step 2/2 of file upload: register a completed OSS upload with the Data Center and get the file_id for data_agent_create_session. Call only after the multipart POST from data_agent_get_upload_signature returned HTTP 200."),
+	mcp.WithString("file_name", mcp.Required(), mcp.Description("The same filename passed to data_agent_get_upload_signature")),
+	mcp.WithString("oss_key", mcp.Required(), mcp.Description("The oss_key returned by data_agent_get_upload_signature")),
+	mcp.WithNumber("file_size", mcp.Required(), mcp.Description("Uploaded file size in bytes")),
 )
