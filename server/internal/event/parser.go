@@ -2,9 +2,12 @@ package event
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Parse takes a raw SSE event and returns a ParsedEvent with the determined action.
@@ -92,6 +95,12 @@ func Parse(eventType, category, content, contentType string) ParsedEvent {
 
 func parseDataEvent(category, content, contentType string) ParsedEvent {
 	switch category {
+	case CatLLM:
+		return parseFallback(content, category)
+
+	case CatToolCallResponse:
+		return parseToolCallResponse(content)
+
 	case CatPlan:
 		return parsePlanProgress(content)
 
@@ -198,6 +207,9 @@ func numField(m map[string]interface{}, key string) (int, bool) {
 
 func parseContentFinish(category, content, contentType string) ParsedEvent {
 	switch category {
+	case CatLLM:
+		return parseFallback(content, category)
+
 	case CatOutputConclusion:
 		// The caller should have accumulated delta chunks and passes the
 		// concatenated text as content here. Same wire shape as the
@@ -460,6 +472,79 @@ func parsePlanProgress(content string) ParsedEvent {
 	}
 }
 
+var fallbackFencePattern = regexp.MustCompile("(?s)^```[^\\r\\n`]*\\r?\\n(.*?)\\r?\\n```$")
+
+func parseFallback(content, category string) ParsedEvent {
+	if strings.TrimSpace(content) == "" || isFallbackControl(content) {
+		return ParsedEvent{Action: ActionNone, Category: category}
+	}
+	if len(content) > taskFinishDataLimit {
+		end := taskFinishDataLimit
+		for end > 0 && !utf8.RuneStart(content[end]) {
+			end--
+		}
+		content = content[:end]
+	}
+	return ParsedEvent{Action: ActionFallback, Category: category, Content: content}
+}
+
+func isFallbackControl(content string) bool {
+	text := strings.TrimSpace(content)
+	if match := fallbackFencePattern.FindStringSubmatch(text); match != nil {
+		text = strings.TrimSpace(match[1])
+	}
+	if isPlanPreview(text) {
+		return true
+	}
+	if strings.HasPrefix(text, "<result>") && strings.HasSuffix(text, "</result>") {
+		text = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(text, "<result>"), "</result>"))
+		if match := fallbackFencePattern.FindStringSubmatch(text); match != nil {
+			text = strings.TrimSpace(match[1])
+		}
+	}
+	parsed, ok := tryParseJSON(text)
+	if !ok || len(parsed) != 3 {
+		return false
+	}
+	_, actionOK := stringField(parsed, "action")
+	_, reasonOK := stringField(parsed, "reason")
+	_, answersOK := parsed["answers"].(map[string]interface{})
+	return actionOK && reasonOK && answersOK
+}
+
+func isPlanPreview(content string) bool {
+	decoder := xml.NewDecoder(strings.NewReader(content))
+	depth := 0
+	seenRoot, seenPlan := false, false
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			return seenPlan && depth == 0
+		}
+		if err != nil {
+			return false
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			if depth == 0 {
+				if seenRoot || token.Name.Local != "requirement" || token.Name.Space != "" {
+					return false
+				}
+				seenRoot = true
+			} else if token.Name.Local == "plan" && token.Name.Space == "" {
+				seenPlan = true
+			}
+			depth++
+		case xml.EndElement:
+			depth--
+		case xml.CharData:
+			if depth == 0 && strings.TrimSpace(string(token)) != "" {
+				return false
+			}
+		}
+	}
+}
+
 // parseToolCallResponse inspects accumulated tool_call_response content.
 func parseToolCallResponse(content string) ParsedEvent {
 	parsed, ok := tryParseJSON(content)
@@ -468,6 +553,11 @@ func parseToolCallResponse(content string) ParsedEvent {
 	}
 
 	resultType, _ := stringField(parsed, "result_type")
+	if resultType == "jupyter_cell" {
+		pe := parseFallback(jupyterCellOutput(parsed["result"]), CatToolCallResponse)
+		pe.RawData = parsed
+		return pe
+	}
 	if resultType != "plan" {
 		return ParsedEvent{Action: ActionNone, Category: CatToolCallResponse, RawData: parsed}
 	}
@@ -499,6 +589,84 @@ func parseToolCallResponse(content string) ParsedEvent {
 		Content:   content,
 		StepTotal: len(steps),
 		RawData:   parsed,
+	}
+}
+
+func jupyterCellOutput(result interface{}) string {
+	var cell map[string]interface{}
+	switch result := result.(type) {
+	case string:
+		cell, _ = tryParseJSON(result)
+	case map[string]interface{}:
+		cell = result
+	}
+	if contentType, _ := stringField(cell, "content_type"); contentType != "code" {
+		return ""
+	}
+	for _, key := range []string{"nb_file_outputs", "outputs"} {
+		outputs, _ := cell[key].([]interface{})
+		for _, raw := range outputs {
+			output, _ := raw.(map[string]interface{})
+			if outputType, _ := stringField(output, "output_type"); outputType == "error" {
+				return ""
+			}
+		}
+	}
+	outputs, _ := cell["nb_file_outputs"].([]interface{})
+	if len(outputs) == 0 {
+		outputs, _ = cell["outputs"].([]interface{})
+	}
+	var text strings.Builder
+	previousType, previousText := "", ""
+	for _, raw := range outputs {
+		output, _ := raw.(map[string]interface{})
+		metadata, _ := output["metadata"].(map[string]interface{})
+		if contentType, _ := stringField(metadata, "content_type"); contentType == "dms/executing" {
+			continue
+		}
+		outputType, _ := stringField(output, "output_type")
+		part := ""
+		switch outputType {
+		case "stream":
+			if name, _ := stringField(output, "name"); name == "stdout" {
+				part = notebookText(output["text"])
+			}
+		case "execute_result", "display_data":
+			data, _ := output["data"].(map[string]interface{})
+			part = notebookText(data["text/markdown"])
+			if strings.TrimSpace(part) == "" {
+				part = notebookText(data["text/plain"])
+			}
+		}
+		if part == "" {
+			continue
+		}
+		if text.Len() > 0 && (previousType != "stream" || outputType != "stream") &&
+			!strings.HasSuffix(previousText, "\n") && !strings.HasPrefix(part, "\n") {
+			text.WriteByte('\n')
+		}
+		text.WriteString(part)
+		previousType, previousText = outputType, part
+	}
+	return text.String()
+}
+
+func notebookText(value interface{}) string {
+	switch value := value.(type) {
+	case string:
+		return value
+	case []interface{}:
+		var text strings.Builder
+		for _, raw := range value {
+			part, ok := raw.(string)
+			if !ok {
+				return ""
+			}
+			text.WriteString(part)
+		}
+		return text.String()
+	default:
+		return ""
 	}
 }
 

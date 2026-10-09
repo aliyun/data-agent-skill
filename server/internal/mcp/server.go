@@ -87,7 +87,7 @@ type sessionManager interface {
 	WaitForChange(context.Context, string, int, time.Duration) (*session.StateSnapshot, bool, error)
 	WaitForResult(context.Context, string, time.Duration) (*session.StateSnapshot, string, error)
 	WatchSession(context.Context, session.WatchOpts) (*session.StateSnapshot, error)
-	SendMessage(string, string) error
+	SendMessage(context.Context, string, string) error
 	GetResult(string) (*session.StateSnapshot, error)
 	ListSessions() []*session.StateSnapshot
 	ListAllSessions() []*session.StateSnapshot
@@ -97,18 +97,18 @@ type sessionManager interface {
 }
 
 type dataAgentClient interface {
-	ListDatabases(string) ([]dataagent.DatabaseInfo, error)
-	ListFiles(string, string, string, string) ([]dataagent.FileInfo, error)
-	ListTables(string) ([]dataagent.TableInfo, error)
-	ListImportedTables(string, string) ([]dataagent.TableInfo, error)
-	ImportDatabase(dataagent.ImportDatabaseOpts) error
-	ListInstances(string, string, int, int) ([]dataagent.InstanceInfo, error)
-	SearchDatabases(string, int, int) ([]dataagent.SearchDBInfo, error)
-	ListWorkspaces(string) ([]dataagent.WorkspaceInfo, error)
-	ListCustomAgents(string, string) ([]dataagent.AgentInfo, error)
-	GetFileUploadSignature(string, int64) (*dataagent.UploadSignature, error)
-	FileUploadCallback(string, string, int64) (string, error)
-	ListRemoteSessions(workspaceID string) ([]dataagent.RemoteSessionSummary, error)
+	ListDatabases(context.Context, string) ([]dataagent.DatabaseInfo, error)
+	ListFiles(context.Context, string, string, string, string) ([]dataagent.FileInfo, error)
+	ListTables(context.Context, string) ([]dataagent.TableInfo, error)
+	ListImportedTables(context.Context, string, string) ([]dataagent.TableInfo, error)
+	ImportDatabase(context.Context, dataagent.ImportDatabaseOpts) error
+	ListInstances(context.Context, string, string, int, int) ([]dataagent.InstanceInfo, error)
+	SearchDatabases(context.Context, string, int, int) ([]dataagent.SearchDBInfo, error)
+	ListWorkspaces(context.Context, string) ([]dataagent.WorkspaceInfo, error)
+	ListCustomAgents(context.Context, string, string) ([]dataagent.AgentInfo, error)
+	GetFileUploadSignature(context.Context, string, int64) (*dataagent.UploadSignature, error)
+	FileUploadCallback(context.Context, string, string, int64) (string, error)
+	ListRemoteSessions(context.Context, string) ([]dataagent.RemoteSessionSummary, error)
 }
 
 func New(mgr *session.Manager, client *dataagent.Client, version string) *Server {
@@ -184,8 +184,12 @@ func (s *Server) EnableJWTIdentity(header string) {
 // tenant-agnostic.
 func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error)) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, err error) {
+		ctx, requestIDs := dataagent.WithRequestIDs(ctx)
 		rec := s.startToolCall(ctx, req)
 		defer func() {
+			if err == nil {
+				addUpstreamRequests(res, requestIDs.Snapshot())
+			}
 			rec.finish(res, err)
 			// After logging: stamp tool errors with the request id so the
 			// caller-visible message links back to the server log.

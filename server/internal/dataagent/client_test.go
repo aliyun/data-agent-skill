@@ -11,13 +11,14 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
 func TestBuildUserAgentUsesSkillSessionID(t *testing.T) {
 	sessionID := "0123456789abcdef0123456789ABCDEF"
 	got := buildUserAgent(sessionID)
-	want := userAgentPrefix + "/0123456789abcdef0123456789abcdef"
+	want := userAgentPrefix + "/0123456789abcdef0123456789abcdef DataAgent_MCP"
 	if got != want {
 		t.Fatalf("buildUserAgent() = %q, want %q", got, want)
 	}
@@ -29,14 +30,43 @@ func TestBuildUserAgentGeneratesSessionIDFallback(t *testing.T) {
 	if !strings.HasPrefix(got, prefix) {
 		t.Fatalf("buildUserAgent() = %q, want prefix %q", got, prefix)
 	}
+	const suffix = " DataAgent_MCP"
+	if !strings.HasSuffix(got, suffix) {
+		t.Fatalf("buildUserAgent() = %q, want suffix %q", got, suffix)
+	}
 
-	sessionID := strings.TrimPrefix(got, prefix)
+	sessionID := strings.TrimSuffix(strings.TrimPrefix(got, prefix), suffix)
 	if len(sessionID) != 32 {
 		t.Fatalf("fallback session id length = %d, want 32", len(sessionID))
 	}
 	if _, err := hex.DecodeString(sessionID); err != nil {
 		t.Fatalf("fallback session id should be hex: %v", err)
 	}
+}
+
+func TestCreateSessionUserAgent(t *testing.T) {
+	testClientAuthModes(t, func(t *testing.T, c *Client) {
+		calls := 0
+		c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			if got := req.Header.Get("User-Agent"); got != userAgent || !strings.HasSuffix(got, " DataAgent_MCP") {
+				t.Errorf("User-Agent = %q, want %q with DataAgent_MCP token", got, userAgent)
+			}
+			return jsonHTTPResponse(t, map[string]any{
+				"Data": map[string]any{
+					"SessionId": "ua-test-session",
+					"AgentId":   "ua-test-agent",
+				},
+			}), nil
+		})
+		info, err := c.CreateSession(context.Background(), CreateSessionOpts{Mode: "lite", WorkspaceID: "test-workspace"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if calls != 1 || info.SessionID != "ua-test-session" {
+			t.Fatalf("CreateSession() made %d requests, session = %q", calls, info.SessionID)
+		}
+	})
 }
 
 func TestListWorkspacesScansAllPages(t *testing.T) {
@@ -83,7 +113,7 @@ func TestListWorkspacesScansAllPages(t *testing.T) {
 		}), nil
 	})}
 
-	got, err := c.ListWorkspaces("ALL")
+	got, err := c.ListWorkspaces(context.Background(), "ALL")
 	if err != nil {
 		t.Fatalf("ListWorkspaces() error = %v", err)
 	}
@@ -128,7 +158,7 @@ func TestListCustomAgentsStopsOnDuplicatePage(t *testing.T) {
 		}), nil
 	})}
 
-	got, err := c.ListCustomAgents("", "")
+	got, err := c.ListCustomAgents(context.Background(), "", "")
 	if err != nil {
 		t.Fatalf("ListCustomAgents() error = %v", err)
 	}
@@ -174,7 +204,7 @@ func TestListRemoteSessionsAddsCreateTimeRangeForSignedAuth(t *testing.T) {
 		}), nil
 	})}
 
-	got, err := c.ListRemoteSessions("")
+	got, err := c.ListRemoteSessions(context.Background(), "")
 	if err != nil {
 		t.Fatalf("ListRemoteSessions() error = %v", err)
 	}
@@ -235,13 +265,191 @@ func TestListRemoteSessionsAddsTimeRangeForAPIKeyAuth(t *testing.T) {
 		}), nil
 	})}
 
-	got, err := c.ListRemoteSessions("")
+	got, err := c.ListRemoteSessions(context.Background(), "")
 	if err != nil {
 		t.Fatalf("ListRemoteSessions() error = %v", err)
 	}
 	if len(got) != 1 || got[0].SessionID != "session-api-key" || got[0].WorkspaceID != "ws-dev" {
 		t.Fatalf("ListRemoteSessions() = %+v, want session-api-key in ws-dev", got)
 	}
+}
+
+func TestSuccessfulAPIRequestIDs(t *testing.T) {
+	testClientAuthModes(t, func(t *testing.T, c *Client) {
+		type requestIDCase struct {
+			name, body, acsHeader, header, want, apiKeyWant string
+		}
+		tests := []requestIDCase{
+			{name: "acs header", body: `{}`, acsHeader: "acs-id", header: "other-id", want: "acs-id"},
+			{name: "request header", body: `{}`, header: "header-id", want: "header-id"},
+			{name: "missing", body: `{}`},
+			{name: "empty aliases", body: `{"RequestId":"","requestId":"","request_id":"","RequestID":""}`},
+			{name: "envelope", body: `{"code":"success","requestId":"outer-id","data":{"SessionId":"s"}}`, acsHeader: "header-id", want: "outer-id"},
+			{name: "envelope header", body: `{"code":"success","data":{"SessionId":"s"}}`, header: "header-id", want: "header-id"},
+			{name: "envelope missing", body: `{"code":"success","data":{"SessionId":"s"}}`},
+			{name: "empty inner ID", body: `{"code":"success","requestId":"outer-id","data":{"RequestId":""}}`, want: "outer-id"},
+		}
+		for _, alias := range []string{"RequestId", "requestId", "request_id", "RequestID"} {
+			tests = append(tests, requestIDCase{name: alias, body: fmt.Sprintf(`{%q:"body-id"}`, alias), acsHeader: "header-id", want: "body-id"})
+			tests = append(tests, requestIDCase{name: "inner " + alias, body: fmt.Sprintf(`{"code":"success","requestId":"outer-id","data":{%q:"inner-id"}}`, alias), acsHeader: "header-id", want: "outer-id", apiKeyWant: "inner-id"})
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				ctx, ids := WithRequestIDs(context.Background())
+				calls := 0
+				c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls++
+					if req.Context().Value(requestIDsKey{}) != ids {
+						t.Error("HTTP request lost its caller context")
+					}
+					header := make(http.Header)
+					header.Set("x-acs-request-id", tt.acsHeader)
+					header.Set("x-request-id", tt.header)
+					return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(tt.body))}, nil
+				})
+				want := tt.want
+				if c.cred.IsAPIKey() && tt.apiKeyWant != "" {
+					want = tt.apiKeyWant
+				}
+				body, err := c.callAPI(ctx, c.endpoint, "DescribeDataAgentSession", "2025-04-14", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := jsonStr(body, "RequestId"); got != want {
+					t.Fatalf("normalized RequestId = %q, want %q", got, want)
+				}
+				created, err := c.CreateSession(ctx, CreateSessionOpts{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				described, err := c.DescribeSession(ctx, "s", "explicit-workspace")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if created.RequestID != want || described.RequestID != want {
+					t.Fatalf("SessionInfo request IDs = %q / %q, want %q", created.RequestID, described.RequestID, want)
+				}
+				var expected []APIRequest
+				if want != "" {
+					expected = []APIRequest{
+						{Action: "DescribeDataAgentSession", RequestID: want},
+						{Action: "CreateDataAgentSession", RequestID: want},
+						{Action: "DescribeDataAgentSession", RequestID: want},
+					}
+				}
+				if calls != 3 || !reflect.DeepEqual(ids.Snapshot(), expected) {
+					t.Fatalf("calls=%d, collected=%+v, want %+v", calls, ids.Snapshot(), expected)
+				}
+			})
+		}
+	})
+}
+
+func TestRequestIDsSnapshotAndScope(t *testing.T) {
+	base := context.Background()
+	ctx, ids := WithRequestIDs(base)
+	recordRequestID(base, "uncollected", "uncollected-id")
+	recordRequestID(ctx, "missing", "")
+	recordRequestID(ctx, "first", "same-id")
+	recordRequestID(ctx, "first", "same-id")
+	want := []APIRequest{{Action: "first", RequestID: "same-id"}, {Action: "first", RequestID: "same-id"}}
+	snapshot := ids.Snapshot()
+	if !reflect.DeepEqual(snapshot, want) {
+		t.Fatalf("snapshot=%+v, want %+v", snapshot, want)
+	}
+	snapshot[0].RequestID = "modified"
+	if !reflect.DeepEqual(ids.Snapshot(), want) {
+		t.Fatal("snapshot aliases collector storage")
+	}
+	child, childIDs := WithRequestIDs(ctx)
+	recordRequestID(child, "child", "child-id")
+	if !reflect.DeepEqual(ids.Snapshot(), want) || len(childIDs.Snapshot()) != 1 {
+		t.Fatal("nested collector leaked into its parent")
+	}
+	recordRequestID(ctx, "later", "later-id")
+	if len(snapshot) != 2 || snapshot[1] != want[1] {
+		t.Fatal("later append changed an earlier snapshot")
+	}
+}
+
+func TestRequestIDsConcurrentSnapshots(t *testing.T) {
+	ctx, ids := WithRequestIDs(context.Background())
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			recordRequestID(ctx, "concurrent", strconv.Itoa(i))
+			snapshot := ids.Snapshot()
+			if len(snapshot) > 0 {
+				snapshot[0].RequestID = "snapshot-only"
+			}
+		}(i)
+	}
+	wg.Wait()
+	got := ids.Snapshot()
+	seen := make(map[string]bool)
+	for _, request := range got {
+		seen[request.RequestID] = true
+	}
+	if len(got) != 100 || len(seen) != 100 || seen["snapshot-only"] {
+		t.Fatalf("concurrent collection lost or changed IDs: %+v", got)
+	}
+}
+
+func TestRequestIDsConcurrentClientIsolation(t *testing.T) {
+	testClientAuthModes(t, func(t *testing.T, c *Client) {
+		c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			id := req.URL.Query().Get("DatabaseId")
+			if c.cred.IsAPIKey() {
+				var payload map[string]any
+				if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+					return nil, err
+				}
+				id = firstStr(payload, "DatabaseId")
+			}
+			return jsonHTTPResponse(t, map[string]any{"RequestID": id}), nil
+		})
+		var wg sync.WaitGroup
+		for i := 0; i < 16; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				ctx, ids := WithRequestIDs(context.Background())
+				var want []APIRequest
+				for j := 0; j < 4; j++ {
+					id := fmt.Sprintf("caller-%d-request-%d", i, j)
+					if _, err := c.CreateSession(ctx, CreateSessionOpts{DatabaseID: id}); err != nil {
+						t.Error(err)
+						return
+					}
+					want = append(want, APIRequest{Action: "CreateDataAgentSession", RequestID: id})
+				}
+				if !reflect.DeepEqual(ids.Snapshot(), want) {
+					t.Errorf("caller %d collected %+v, want %+v", i, ids.Snapshot(), want)
+				}
+			}(i)
+		}
+		wg.Wait()
+	})
+}
+
+func TestAPIRequestContextCancellation(t *testing.T) {
+	testClientAuthModes(t, func(t *testing.T, c *Client) {
+		ctx, cancel := context.WithCancel(context.Background())
+		ctx, ids := WithRequestIDs(ctx)
+		cancel()
+		c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Context().Err() != context.Canceled {
+				t.Error("HTTP request did not inherit cancellation")
+			}
+			return nil, req.Context().Err()
+		})
+		err := c.SendMessage(ctx, SendMessageOpts{})
+		if !errors.Is(err, context.Canceled) || len(ids.Snapshot()) != 0 {
+			t.Fatalf("canceled call: error=%v, requests=%+v", err, ids.Snapshot())
+		}
+	})
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -358,7 +566,7 @@ func TestSendMessageMessageType(t *testing.T) {
 					}
 					return jsonHTTPResponse(t, map[string]any{"success": true}), nil
 				})
-				if err := c.SendMessage(opts); err != nil {
+				if err := c.SendMessage(context.Background(), opts); err != nil {
 					t.Fatalf("SendMessage() error = %v", err)
 				}
 				if calls != 1 {
@@ -583,7 +791,8 @@ func TestSendMessageAPIResponses(t *testing.T) {
 						Body:       io.NopCloser(strings.NewReader(tt.body)),
 					}, nil
 				})
-				err := c.SendMessage(SendMessageOpts{AgentID: "test-agent", SessionID: "test-session", Message: "hello"})
+				ctx, ids := WithRequestIDs(context.Background())
+				err := c.SendMessage(ctx, SendMessageOpts{AgentID: "test-agent", SessionID: "test-session", Message: "hello"})
 				if calls != 1 {
 					t.Fatalf("SendMessage made %d requests, want exactly one", calls)
 				}
@@ -591,7 +800,14 @@ func TestSendMessageAPIResponses(t *testing.T) {
 					if err != nil {
 						t.Fatalf("SendMessage() error = %v", err)
 					}
+					want := []APIRequest{{Action: "SendChatMessage", RequestID: "header-request"}}
+					if !reflect.DeepEqual(ids.Snapshot(), want) {
+						t.Fatalf("successful requests = %+v, want %+v", ids.Snapshot(), want)
+					}
 					return
+				}
+				if len(ids.Snapshot()) != 0 {
+					t.Fatalf("failed API request was collected: %+v", ids.Snapshot())
 				}
 				var apiErr *APIError
 				if !errors.As(err, &apiErr) {
@@ -640,7 +856,11 @@ func TestSendMessageMalformedResponsesAreUnknown(t *testing.T) {
 						Body:       io.NopCloser(strings.NewReader(body)),
 					}, nil
 				})
-				err := c.SendMessage(SendMessageOpts{SessionID: "test-session"})
+				ctx, ids := WithRequestIDs(context.Background())
+				err := c.SendMessage(ctx, SendMessageOpts{SessionID: "test-session"})
+				if len(ids.Snapshot()) != 0 {
+					t.Fatalf("failed response was collected: %+v", ids.Snapshot())
+				}
 				var apiErr *APIError
 				if err == nil || errors.As(err, &apiErr) || IsDefiniteRejection(err) {
 					t.Fatalf("malformed response must be unknown, got %v", err)
@@ -677,7 +897,11 @@ func TestSendMessageTransportFailuresAreUnknown(t *testing.T) {
 					}
 					return &http.Response{StatusCode: tt.status, Header: http.Header{"X-Acs-Request-Id": []string{"read-request"}}, Body: body}, nil
 				})
-				err := c.SendMessage(SendMessageOpts{SessionID: "test-session"})
+				ctx, ids := WithRequestIDs(context.Background())
+				err := c.SendMessage(ctx, SendMessageOpts{SessionID: "test-session"})
+				if len(ids.Snapshot()) != 0 {
+					t.Fatalf("failed response was collected: %+v", ids.Snapshot())
+				}
 				if !errors.Is(err, tt.cause) || IsDefiniteRejection(err) || calls != 1 {
 					t.Fatalf("calls=%d, error=%v, want wrapped unknown transport failure without retry", calls, err)
 				}
@@ -744,7 +968,7 @@ func TestAPIResponsePayloadCompatibility(t *testing.T) {
 		c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return jsonHTTPResponse(t, payload), nil
 		})
-		got, err := c.callAPI(c.endpoint, "ListDataAgentWorkspace", "2025-04-14", nil)
+		got, err := c.callAPI(context.Background(), c.endpoint, "ListDataAgentWorkspace", "2025-04-14", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -762,7 +986,7 @@ func TestAPIResponsePayloadCompatibility(t *testing.T) {
 				resp.Header.Set("x-acs-request-id", "other-request")
 				return resp, nil
 			})
-			_, err := c.DescribeSession("test-session")
+			_, err := c.DescribeSession(context.Background(), "test-session")
 			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("returned HTTP %d", status)) || !strings.Contains(err.Error(), "other-request") || strings.Contains(err.Error(), "response-secret") {
 				t.Fatalf("DescribeSession HTTP %d error = %v", status, err)
 			}

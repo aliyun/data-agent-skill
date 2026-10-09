@@ -62,6 +62,7 @@ const (
 	ActionReportGenerated                   // jsx_report or mission_report generated
 	ActionArtifact                          // A generated file artifact finished uploading
 	ActionStreamEnded
+	ActionFallback // Provisional result when no formal conclusion is available
 )
 
 // String returns a human-readable name for the action.
@@ -95,6 +96,8 @@ func (a Action) String() string {
 		return "artifact"
 	case ActionStreamEnded:
 		return "stream_ended"
+	case ActionFallback:
+		return "fallback"
 	default:
 		return "unknown"
 	}

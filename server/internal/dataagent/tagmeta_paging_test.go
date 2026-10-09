@@ -1,8 +1,11 @@
 package dataagent
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -65,7 +68,7 @@ func TestListImportedTablesScansAllPages(t *testing.T) {
 		}), nil
 	})}
 
-	got, err := c.ListImportedTables("", "")
+	got, err := c.ListImportedTables(context.Background(), "", "")
 	if err != nil {
 		t.Fatalf("ListImportedTables() error = %v", err)
 	}
@@ -105,7 +108,7 @@ func TestListImportedTablesStopsOnRepeatedPage(t *testing.T) {
 		return jsonHTTPResponse(t, map[string]any{"Data": items, "Success": true}), nil
 	})}
 
-	got, err := c.ListImportedTables("100", "")
+	got, err := c.ListImportedTables(context.Background(), "100", "")
 	if err != nil {
 		t.Fatalf("ListImportedTables() error = %v", err)
 	}
@@ -145,7 +148,7 @@ func TestListDatabasesSinglePageStops(t *testing.T) {
 		}), nil
 	})}
 
-	got, err := c.ListDatabases("")
+	got, err := c.ListDatabases(context.Background(), "")
 	if err != nil {
 		t.Fatalf("ListDatabases() error = %v", err)
 	}
@@ -155,6 +158,80 @@ func TestListDatabasesSinglePageStops(t *testing.T) {
 	if len(got) != 1 || got[0].SchemaName != "sales" || got[0].DbID != 123 {
 		t.Fatalf("databases = %+v", got)
 	}
+}
+
+func TestRequestIDsIncludeResolversAndPages(t *testing.T) {
+	testClientAuthModes(t, func(t *testing.T, configured *Client) {
+		c := NewClient(configured.cred, configured.region)
+		ctx, ids := WithRequestIDs(context.Background())
+		c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Context().Value(requestIDsKey{}) != ids {
+				t.Error("resolver or page request lost caller context")
+			}
+			params := make(map[string]any)
+			if c.cred.IsAPIKey() {
+				if err := json.NewDecoder(req.Body).Decode(&params); err != nil {
+					return nil, err
+				}
+			} else {
+				for key, values := range req.URL.Query() {
+					params[key] = values[0]
+				}
+			}
+			action := firstStr(params, "Action")
+			var payload map[string]any
+			switch action {
+			case "GetUserActiveTenant":
+				payload = map[string]any{"Tenant": map[string]any{"Tid": "42"}}
+			case "GetActiveRouteUnit":
+				payload = map[string]any{"Route": map[string]any{"RegionId": "unit-1"}}
+			case "InitDataAgentPersonalWorkspace":
+				payload = map[string]any{"Data": map[string]any{"WorkspaceId": "ws-1"}}
+			case "ListDataAgentWorkSpace":
+				payload = map[string]any{"Content": []map[string]any{{"WorkspaceId": "ws-1"}}}
+			case "ListTagMetaAsset", "listTagMetaAsset":
+				if got := firstStr(params, "TagName"); !strings.HasSuffix(got, "::space:ws-1") {
+					t.Errorf("resolved workspace not used: TagName=%q", got)
+				}
+				count, start := dmsTagMetaPageSize, 0
+				if firstStr(params, "PageNumber") == "2" {
+					count, start = 1, dmsTagMetaPageSize
+				}
+				var items []map[string]any
+				for i := 0; i < count; i++ {
+					items = append(items, map[string]any{"DbId": start + i + 1, "SchemaName": fmt.Sprintf("db-%d", start+i)})
+				}
+				payload = map[string]any{"Data": items, "TotalCount": dmsTagMetaPageSize + 1}
+			default:
+				t.Fatalf("unexpected action %q", action)
+			}
+			if c.cred.IsAPIKey() {
+				payload = map[string]any{"code": "success", "requestId": action + "-id", "data": payload}
+			} else {
+				payload["RequestID"] = action + "-id"
+			}
+			return jsonHTTPResponse(t, payload), nil
+		})
+		got, err := c.ListDatabases(ctx, "")
+		if err != nil || len(got) != dmsTagMetaPageSize+1 {
+			t.Fatalf("ListDatabases: count=%d, error=%v", len(got), err)
+		}
+		actions := []string{"GetUserActiveTenant", "GetActiveRouteUnit", "InitDataAgentPersonalWorkspace", "ListTagMetaAsset", "ListTagMetaAsset"}
+		if c.cred.IsAPIKey() {
+			actions = []string{"ListDataAgentWorkSpace", "listTagMetaAsset", "listTagMetaAsset"}
+		}
+		var want []APIRequest
+		for _, action := range actions {
+			want = append(want, APIRequest{Action: action, RequestID: action + "-id"})
+		}
+		if !reflect.DeepEqual(ids.Snapshot(), want) {
+			t.Fatalf("requests=%+v, want %+v", ids.Snapshot(), want)
+		}
+		otherCtx, otherIDs := WithRequestIDs(context.Background())
+		if c.ResolveWorkspaceID(otherCtx) != "ws-1" || len(otherIDs.Snapshot()) != 0 {
+			t.Fatal("cached resolution must not replay an earlier request ID")
+		}
+	})
 }
 
 // API Key gateway errors must carry the backend request id in all three
@@ -173,7 +250,7 @@ func TestAPIKeyErrorsCarryRequestID(t *testing.T) {
 			resp.Header.Set("x-acs-request-id", "REQ-HTTP-403")
 			return resp, nil
 		})
-		_, err := c.ListDatabases("")
+		_, err := c.ListDatabases(context.Background(), "")
 		if err == nil || !strings.Contains(err.Error(), "REQ-HTTP-403") {
 			t.Fatalf("error missing request id: %v", err)
 		}
@@ -186,7 +263,7 @@ func TestAPIKeyErrorsCarryRequestID(t *testing.T) {
 				"requestId": "REQ-BODY-1",
 			}), nil
 		})
-		_, err := c.ListDatabases("")
+		_, err := c.ListDatabases(context.Background(), "")
 		if err == nil || !strings.Contains(err.Error(), "REQ-BODY-1") {
 			t.Fatalf("error missing body requestId: %v", err)
 		}
@@ -200,7 +277,7 @@ func TestAPIKeyErrorsCarryRequestID(t *testing.T) {
 			resp.Header.Set("x-acs-request-id", "REQ-HDR-400")
 			return resp, nil
 		})
-		_, err := c.ListDatabases("")
+		_, err := c.ListDatabases(context.Background(), "")
 		if err == nil || !strings.Contains(err.Error(), "REQ-HDR-400") {
 			t.Fatalf("error missing header fallback request id: %v", err)
 		}

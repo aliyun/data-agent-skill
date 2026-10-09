@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestSSEFinish(t *testing.T) {
@@ -216,6 +217,210 @@ func TestContentFinishToolCallResponseInvalidJSON(t *testing.T) {
 	assertAction(t, r, ActionNone, "content_finish/tool_call_response invalid json -> ActionNone")
 }
 
+func TestLLMFallback(t *testing.T) {
+	approval := `{"action":"approved","reason":"plan confirmed","answers":{}}`
+	plan := `<requirement><plan><step>Compute totals</step></plan><question>Revenue?</question></requirement>`
+	cases := []struct {
+		name, content string
+		control       bool
+	}{
+		{"empty", " \n\t", true},
+		{"approval_json", approval, true},
+		{"approval_wrapper", "<result>" + approval + "</result>", true},
+		{"approval_fence", "```json\n" + approval + "\n```", true},
+		{"approval_wrapped_fence", " \n```xml\n<result>" + approval + "</result>\n```\n", true},
+		{"approval_inner_fence", "<result>\n```json\n" + approval + "\n```\n</result>", true},
+		{"control_schema", `{"action":"revised","reason":"change grouping","answers":{"period":"quarter"}}`, true},
+		{"plan", plan, true},
+		{"plan_fence", "```xml\n" + plan + "\n```", true},
+		{"nested_plan", `<requirement><analysis><plan/></analysis></requirement>`, true},
+		{"answer", "  September revenue is 360. Total profit is 405.\n", false},
+		{"numeric_json", " {\"value\":9007199254740993.1234567890123456789}\n", false},
+		{"numeric_scalar", "405.000000000000000001", false},
+		{"numeric_array", `[{"value":360},{"value":405}]`, false},
+		{"fenced_json_answer", "```json\n{\"value\":405}\n```", false},
+		{"approved_mention", "The approved budget is 405.", false},
+		{"arbitrary_result", "<result>Total profit is 405.</result>", false},
+		{"result_numeric_json", `<result>{"profit":405}</result>`, false},
+		{"unrelated_json", `{"action":"approved","value":405}`, false},
+		{"extra_result_field", `{"action":"approved","reason":"budget","answers":{},"value":405}`, false},
+		{"numeric_action", `{"action":405,"reason":"budget","answers":{}}`, false},
+		{"numeric_reason", `{"action":"approved","reason":405,"answers":{}}`, false},
+		{"null_answers", `{"action":"approved","reason":"budget","answers":null}`, false},
+		{"array_answers", `{"action":"approved","reason":"budget","answers":[405]}`, false},
+		{"missing_answers", `{"action":"approved","reason":"budget"}`, false},
+		{"approval_with_answer", "<result>" + approval + "</result>\nTotal profit is 405.", false},
+		{"plan_mention", "The <plan> element describes the approved budget of 405.", false},
+		{"other_xml_root", `<report><requirement><plan>405</plan></requirement></report>`, false},
+		{"requirement_without_plan", `<requirement><value>405</value></requirement>`, false},
+		{"escaped_plan", `<requirement>&lt;plan&gt;405&lt;/plan&gt;</requirement>`, false},
+		{"invalid_plan_xml", `<requirement><plan>405</requirement>`, false},
+		{"plan_with_answer", plan + "\nTotal profit is 405.", false},
+		{"plan_with_sibling", plan + "<result>405</result>", false},
+	}
+	for _, eventType := range []string{EventData, EventContentFinish} {
+		for _, tc := range cases {
+			t.Run(eventType+"/"+tc.name, func(t *testing.T) {
+				pe := Parse(eventType, CatLLM, tc.content, "text")
+				wantAction, wantContent := ActionFallback, tc.content
+				if tc.control {
+					wantAction, wantContent = ActionNone, ""
+				}
+				assertAction(t, pe, wantAction, "llm fallback")
+				if pe.Category != CatLLM || pe.Content != wantContent {
+					t.Fatalf("parsed = %+v, want content %q", pe, wantContent)
+				}
+			})
+		}
+	}
+}
+
+func TestToolCallResponseJupyterFallback(t *testing.T) {
+	stdout := `{"output_type":"stream","name":"stdout","text":"metric value\nSeptember revenue 360\nTotal profit 405\n"}`
+	plain := `{"output_type":"execute_result","data":{"text/plain":"405.000000000000000001"}}`
+	markdown := `{"output_type":"display_data","data":{"text/markdown":["| metric | value |\n","| profit | 405 |\n"],"text/plain":"unformatted"}}`
+	executing := `{"output_type":"display_data","metadata":{"content_type":"dms/executing"},"data":{"text/plain":"Executing...","text/markdown":"Running..."}}`
+	failure := `{"output_type":"error","ename":"ValueError","evalue":"synthetic failure","traceback":["Traceback: synthetic failure"]}`
+	cases := []struct {
+		name, cell, want string
+	}{
+		{"observed_stdout", `{"content_type":"code","cell_id":"cell-example","content":"print(summary.to_string(index=False))","nb_file_outputs":[` + stdout + `],"outputs":[]}`, "metric value\nSeptember revenue 360\nTotal profit 405\n"},
+		{"stdout_lines", `{"content_type":"code","nb_file_outputs":[{"output_type":"stream","name":"stdout","text":["metric value\n","profit 405.000000000000000001\n"]}]}`, "metric value\nprofit 405.000000000000000001\n"},
+		{"stdout_chunks", `{"content_type":"code","nb_file_outputs":[{"output_type":"stream","name":"stdout","text":"405."},{"output_type":"stream","name":"stdout","text":"000000000000000001\n"}]}`, "405.000000000000000001\n"},
+		{"plain_result", `{"content_type":"code","nb_file_outputs":[` + plain + `]}`, "405.000000000000000001"},
+		{"plain_display_lines", `{"content_type":"code","outputs":[{"output_type":"display_data","data":{"text/plain":["profit ","405\n"]}}]}`, "profit 405\n"},
+		{"markdown_preferred", `{"content_type":"code","nb_file_outputs":[` + markdown + `]}`, "| metric | value |\n| profit | 405 |\n"},
+		{"markdown_result", `{"content_type":"code","outputs":[{"output_type":"execute_result","data":{"text/markdown":"**Profit: 405**","text/plain":"405"}}]}`, "**Profit: 405**"},
+		{"blank_markdown_uses_plain", `{"content_type":"code","outputs":[{"output_type":"display_data","data":{"text/markdown":[],"text/plain":"405"}}]}`, "405"},
+		{"result_order", `{"content_type":"code","outputs":[` + plain + `,` + markdown + `]}`, "405.000000000000000001\n| metric | value |\n| profit | 405 |\n"},
+		{"outputs_fallback", `{"content_type":"code","nb_file_outputs":[],"outputs":[` + plain + `]}`, "405.000000000000000001"},
+		{"null_nb_outputs", `{"content_type":"code","nb_file_outputs":null,"outputs":[` + plain + `]}`, "405.000000000000000001"},
+		{"nb_outputs_preferred", `{"content_type":"code","nb_file_outputs":[` + plain + `],"outputs":[` + markdown + `]}`, "405.000000000000000001"},
+		{"executing", `{"content_type":"code","nb_file_outputs":[` + executing + `]}`, ""},
+		{"executing_then_result", `{"content_type":"code","nb_file_outputs":[` + executing + `,` + plain + `]}`, "405.000000000000000001"},
+		{"placeholder_not_replaced_by_outputs", `{"content_type":"code","nb_file_outputs":[` + executing + `],"outputs":[` + plain + `]}`, ""},
+		{"markdown_cell", `{"content_type":"markdown","content":"Compute revenue and profit","nb_file_outputs":[{"output_type":"execute_result","data":{"text/plain":"Markdown content saved successfully"}}]}`, ""},
+		{"missing_content_type", `{"nb_file_outputs":[` + stdout + `]}`, ""},
+		{"source_only", `{"content_type":"code","content":"print(405)","nb_file_outputs":[],"outputs":[]}`, ""},
+		{"missing_outputs", `{"content_type":"code","content":"print(405)"}`, ""},
+		{"empty_stdout", `{"content_type":"code","outputs":[{"output_type":"stream","name":"stdout","text":" \n"}]}`, ""},
+		{"stderr", `{"content_type":"code","outputs":[{"output_type":"stream","name":"stderr","text":"Traceback: synthetic failure"}]}`, ""},
+		{"stderr_and_stdout", `{"content_type":"code","outputs":[{"output_type":"stream","name":"stderr","text":"warning"},` + stdout + `]}`, "metric value\nSeptember revenue 360\nTotal profit 405\n"},
+		{"error", `{"content_type":"code","outputs":[` + failure + `]}`, ""},
+		{"stdout_then_error", `{"content_type":"code","nb_file_outputs":[` + stdout + `,` + failure + `]}`, ""},
+		{"error_then_result", `{"content_type":"code","outputs":[` + failure + `,` + plain + `]}`, ""},
+		{"error_in_secondary_outputs", `{"content_type":"code","nb_file_outputs":[` + stdout + `],"outputs":[` + failure + `]}`, ""},
+		{"images_only", `{"content_type":"code","outputs":[{"output_type":"display_data","data":{"image/png":"c3ludGhldGlj","image/svg+xml":"<svg/>","text/html":"<img src='example'>"}}]}`, ""},
+		{"plain_without_image_data", `{"content_type":"code","outputs":[{"output_type":"display_data","data":{"text/plain":"405","image/png":"c3ludGhldGlj"}}]}`, "405"},
+		{"unknown_output_type", `{"content_type":"code","outputs":[{"output_type":"unknown","text":"405","data":{"text/plain":"405"}}]}`, ""},
+		{"malformed_text", `{"content_type":"code","outputs":[{"output_type":"stream","name":"stdout","text":["405",42]}]}`, ""},
+		{"numeric_text_not_coerced", `{"content_type":"code","outputs":[{"output_type":"execute_result","data":{"text/plain":9007199254740993}}]}`, ""},
+		{"malformed_outputs", `{"content_type":"code","outputs":[null,42,"405",{}]}`, ""},
+		{"null_result", `null`, ""},
+		{"scalar_result", `405`, ""},
+	}
+	for _, eventType := range []string{EventData, EventContentFinish} {
+		for _, stringResult := range []bool{false, true} {
+			for _, tc := range cases {
+				t.Run(fmt.Sprintf("%s/string=%t/%s", eventType, stringResult, tc.name), func(t *testing.T) {
+					var result interface{} = json.RawMessage(tc.cell)
+					if stringResult {
+						result = tc.cell
+					}
+					content, err := json.Marshal(map[string]interface{}{"result_type": "jupyter_cell", "result": result})
+					if err != nil {
+						t.Fatal(err)
+					}
+					pe := Parse(eventType, CatToolCallResponse, string(content), "json")
+					wantAction := ActionFallback
+					if tc.want == "" {
+						wantAction = ActionNone
+					}
+					assertAction(t, pe, wantAction, "jupyter fallback")
+					if pe.Category != CatToolCallResponse || pe.Content != tc.want {
+						t.Fatalf("parsed = %+v, want content %q", pe, tc.want)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestFallbackOnlyOnCompletedContent(t *testing.T) {
+	cases := []struct {
+		category, content string
+		action            Action
+	}{
+		{CatLLM, "<result>{\"action\":\"approved\",\"reason\":\"plan confirmed\",\"answers\":{}}</result>", ActionNone},
+		{CatLLM, "```xml\n<requirement><plan>Compute totals</plan></requirement>\n```", ActionNone},
+		{CatLLM, "Total profit is 405.", ActionFallback},
+		{CatToolCallResponse, `{"result_type":"jupyter_cell","result":{"content_type":"code","content":"print(405)","nb_file_outputs":[{"output_type":"stream","name":"stdout","text":"405\n"}]}}`, ActionFallback},
+	}
+	for _, tc := range cases {
+		assertAction(t, Parse(EventContentStart, tc.category, tc.content, "json"), ActionNone, "content_start")
+		var accumulated strings.Builder
+		for start := 0; start < len(tc.content); start += 7 {
+			end := start + 7
+			if end > len(tc.content) {
+				end = len(tc.content)
+			}
+			chunk := tc.content[start:end]
+			assertAction(t, Parse(EventDelta, tc.category, chunk, "json"), ActionNone, "delta fragment")
+			accumulated.WriteString(chunk)
+		}
+		assertAction(t, Parse(EventContentFinish, tc.category, accumulated.String(), "json"), tc.action, "completed content")
+	}
+}
+
+func TestFallbackOutputLimit(t *testing.T) {
+	cases := []struct{ name, text, want string }{
+		{"at_limit", strings.Repeat("x", 4096), strings.Repeat("x", 4096)},
+		{"ascii", strings.Repeat("x", 5000), strings.Repeat("x", 4096)},
+		{"multibyte", strings.Repeat("数", 2000), strings.Repeat("数", 1365)},
+		{"four_byte_boundary", strings.Repeat("x", 4095) + "\U00020000", strings.Repeat("x", 4095)},
+	}
+	for _, tc := range cases {
+		for _, category := range []string{CatLLM, CatToolCallResponse} {
+			t.Run(tc.name+"/"+category, func(t *testing.T) {
+				content := tc.text
+				if category == CatToolCallResponse {
+					textJSON, err := json.Marshal(tc.text)
+					if err != nil {
+						t.Fatal(err)
+					}
+					content = `{"result_type":"jupyter_cell","result":{"content_type":"code","outputs":[{"output_type":"stream","name":"stdout","text":` + string(textJSON) + `}]}}`
+				}
+				for _, eventType := range []string{EventData, EventContentFinish} {
+					pe := Parse(eventType, category, content, "text")
+					assertAction(t, pe, ActionFallback, "bounded fallback")
+					if pe.Content != tc.want || len(pe.Content) > 4096 || !utf8.ValidString(pe.Content) {
+						t.Fatalf("invalid bounded fallback: %d bytes, want %d", len(pe.Content), len(tc.want))
+					}
+				}
+			})
+		}
+	}
+	approval := `{"action":"approved","reason":"` + strings.Repeat("x", 5000) + `","answers":{}}`
+	assertAction(t, Parse(EventContentFinish, CatLLM, approval, "json"), ActionNone, "filter before truncation")
+	failedCell := `{"result_type":"jupyter_cell","result":{"content_type":"code","outputs":[{"output_type":"stream","name":"stdout","text":"` + strings.Repeat("x", 5000) + `"},{"output_type":"error"}]}}`
+	assertAction(t, Parse(EventContentFinish, CatToolCallResponse, failedCell, "json"), ActionNone, "error after large output")
+}
+
+func TestDataToolCallResponsePlan(t *testing.T) {
+	cases := []struct {
+		content string
+		steps   int
+	}{
+		{`{"result_type":"plan","result":"{\"plans\":[{\"plan\":{\"steps\":[{\"order\":1,\"name\":\"Compute totals\"}]}}]}"}`, 1},
+		{`{"result_type":"plan","result":{"plans":[{"plan":{"steps":[{"order":1,"name":"Compute totals"}]}}]}}`, 1},
+		{`{"result_type":"plan"}`, 0},
+		{`{"result_type":"plan","result":"Plan preview"}`, 0},
+	}
+	for _, tc := range cases {
+		assertPlanPreview(t, Parse(EventData, CatToolCallResponse, tc.content, "json"), tc.content, tc.steps)
+	}
+}
+
 func TestDataAskReportRender(t *testing.T) {
 	for _, content := range []string{`{"report":"data"}`, "Report preview", ""} {
 		r := Parse(EventData, CatAskReportRender, content, "json")
@@ -241,7 +446,8 @@ func TestProtocolMatrix(t *testing.T) {
 		{CatAskSQL, `{"sql":"SELECT 1"}`, ActionNone, ActionNone, ActionConfirmSQL},
 		{CatAskReportRender, `{"report":"preview"}`, ActionNone, ActionNone, ActionConfirmReport},
 		{CatAskHuman, `{"result_type":"plan","sql":"SELECT 1"}`, ActionNone, ActionNone, ActionHumanInput},
-		{CatToolCallResponse, `{"result_type":"plan","result":{"plans":[{"plan":{"steps":[]}}]}}`, ActionNone, ActionStepProgress, ActionNone},
+		{CatToolCallResponse, `{"result_type":"plan","result":{"plans":[{"plan":{"steps":[]}}]}}`, ActionStepProgress, ActionStepProgress, ActionNone},
+		{CatLLM, "Total profit is 405.", ActionFallback, ActionFallback, ActionNone},
 		{CatPlan, `{"current_step":1,"plans":[{"plan":{"steps":[{"order":1,"name":"Query"}]}}]}`, ActionStepProgress, ActionNone, ActionNone},
 		{CatChat, "", ActionNone, ActionNone, ActionCompleted},
 		{CatOutputConclusion, `{"mission_idx":0,"objective_order":1,"result":"Conclusion"}`, ActionConclusion, ActionConclusion, ActionNone},
@@ -326,7 +532,7 @@ func TestActionValuesStable(t *testing.T) {
 		ActionNone, ActionConfirmPlan, ActionConfirmSQL, ActionConfirmReport,
 		ActionHumanInput, ActionStepProgress, ActionConclusion, ActionCompleted,
 		ActionError, ActionCanceled, ActionRecommendedQuestion, ActionReportGenerated,
-		ActionArtifact, ActionStreamEnded,
+		ActionArtifact, ActionStreamEnded, ActionFallback,
 	}
 	for want, action := range actions {
 		if int(action) != want {
@@ -351,6 +557,7 @@ func TestActionString(t *testing.T) {
 		ActionReportGenerated:     "report_generated",
 		ActionArtifact:            "artifact",
 		ActionStreamEnded:         "stream_ended",
+		ActionFallback:            "fallback",
 	}
 	for action, expected := range cases {
 		if action.String() != expected {
@@ -395,7 +602,7 @@ func TestToolCallResponsePlanNoResult(t *testing.T) {
 func TestNeedsConfirmationExhaustive(t *testing.T) {
 	confirm := []Action{ActionConfirmPlan, ActionConfirmSQL, ActionConfirmReport, ActionHumanInput}
 	noConfirm := []Action{ActionNone, ActionStepProgress, ActionConclusion, ActionCompleted, ActionError, ActionCanceled,
-		ActionRecommendedQuestion, ActionReportGenerated, ActionArtifact, ActionStreamEnded}
+		ActionRecommendedQuestion, ActionReportGenerated, ActionArtifact, ActionStreamEnded, ActionFallback}
 
 	for _, a := range confirm {
 		if !a.NeedsConfirmation() {
@@ -412,7 +619,7 @@ func TestNeedsConfirmationExhaustive(t *testing.T) {
 func TestIsTerminalExhaustive(t *testing.T) {
 	terminal := []Action{ActionCompleted, ActionError, ActionCanceled}
 	nonTerminal := []Action{ActionNone, ActionConfirmPlan, ActionConfirmSQL, ActionConfirmReport, ActionHumanInput, ActionStepProgress, ActionConclusion,
-		ActionRecommendedQuestion, ActionReportGenerated, ActionArtifact, ActionStreamEnded}
+		ActionRecommendedQuestion, ActionReportGenerated, ActionArtifact, ActionStreamEnded, ActionFallback}
 
 	for _, a := range terminal {
 		if !a.IsTerminal() {

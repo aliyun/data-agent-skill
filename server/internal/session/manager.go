@@ -168,7 +168,7 @@ func (m *Manager) restoreSession(sessionID string) bool {
 	}
 
 	// IDLE can also mean an unanswered question.
-	info, err := m.client.DescribeSession(sessionID, snap.WorkspaceID)
+	info, err := m.client.DescribeSession(m.watchContext(), sessionID, snap.WorkspaceID)
 	if err != nil || info == nil {
 		return false
 	}
@@ -187,11 +187,11 @@ func (m *Manager) restoreSession(sessionID string) bool {
 func (m *Manager) CreateSession(ctx context.Context, opts CreateOpts) (*State, error) {
 	// Fill in default workspace if not specified.
 	if opts.WorkspaceID == "" {
-		opts.WorkspaceID = m.client.ResolveWorkspaceID()
+		opts.WorkspaceID = m.client.ResolveWorkspaceID(ctx)
 	}
 
 	// 1. Create session on server.
-	info, err := m.client.CreateSession(dataagent.CreateSessionOpts{
+	info, err := m.client.CreateSession(ctx, dataagent.CreateSessionOpts{
 		Mode:          opts.Mode,
 		PlanMode:      opts.PlanMode,
 		DatabaseID:    opts.DatabaseID,
@@ -244,7 +244,7 @@ func (m *Manager) CreateSession(ctx context.Context, opts CreateOpts) (*State, e
 	}
 
 	// 4. Send initial query.
-	if err := m.client.SendMessage(dataagent.SendMessageOpts{
+	if err := m.client.SendMessage(ctx, dataagent.SendMessageOpts{
 		AgentID:     agentID,
 		SessionID:   sessionID,
 		Message:     opts.Query,
@@ -288,7 +288,7 @@ func (m *Manager) WatchSession(ctx context.Context, opts WatchOpts) (*StateSnaps
 	defer operation.Unlock()
 
 	if opts.WorkspaceID == "" {
-		opts.WorkspaceID = m.client.ResolveWorkspaceID()
+		opts.WorkspaceID = m.client.ResolveWorkspaceID(ctx)
 	}
 
 	m.mu.RLock()
@@ -299,7 +299,7 @@ func (m *Manager) WatchSession(ctx context.Context, opts WatchOpts) (*StateSnaps
 	}
 	m.mu.RUnlock()
 
-	info, err := m.client.DescribeSession(opts.SessionID, opts.WorkspaceID)
+	info, err := m.client.DescribeSession(ctx, opts.SessionID, opts.WorkspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("describe session: %w", err)
 	}
@@ -533,7 +533,7 @@ func resultReason(snap *StateSnapshot) string {
 
 // SendMessage sends a user message to an active session (for manual
 // confirmation or free-form input).
-func (m *Manager) SendMessage(sessionID, message string) error {
+func (m *Manager) SendMessage(ctx context.Context, sessionID, message string) error {
 	before, _ := m.GetStatus(sessionID)
 	operation := m.sessionOperation(sessionID)
 	operation.Lock()
@@ -551,7 +551,7 @@ func (m *Manager) SendMessage(sessionID, message string) error {
 		switch entry.state.GetStatus() {
 		case StatusCompleted, StatusError, StatusCanceled:
 		default:
-			if err := entry.watcher.SendMessage(message); err != errWatcherExited {
+			if err := entry.watcher.SendMessage(ctx, message); err != errWatcherExited {
 				return err
 			}
 		}
@@ -566,11 +566,11 @@ func (m *Manager) SendMessage(sessionID, message string) error {
 	// the server may have restarted. The remote Data Agent session itself is
 	// multi-turn, so revive it from persisted state to support follow-up
 	// questions on finished sessions.
-	return m.reviveAndSend(sessionID, message)
+	return m.reviveAndSend(ctx, sessionID, message)
 }
 
 // The session operation lock must be held while reviving and sending.
-func (m *Manager) reviveAndSend(sessionID, message string) error {
+func (m *Manager) reviveAndSend(ctx context.Context, sessionID, message string) error {
 	snap := LoadState(m.sessDir, sessionID)
 	if snap == nil {
 		return fmt.Errorf("session %s not found or not active", sessionID)
@@ -583,7 +583,7 @@ func (m *Manager) reviveAndSend(sessionID, message string) error {
 	watcher := NewWatcher(state, m.client, m.sessDir)
 
 	// Rejected sends stay unpublished; uncertain delivery still needs an observer.
-	if err := watcher.SendMessage(message); err != nil {
+	if err := watcher.SendMessage(ctx, message); err != nil {
 		after := state.Snapshot()
 		if after.MessageStatus == SendUnknown || after.Requests[after.PendingAsk].Status == SendUnknown || after.Status == StatusRunning {
 			m.startWatcher(watcher)
@@ -701,7 +701,7 @@ func (m *Manager) waitForRunning(ctx context.Context, sessionID, workspaceID str
 	defer ticker.Stop()
 
 	for {
-		info, err := m.client.DescribeSession(sessionID, workspaceID)
+		info, err := m.client.DescribeSession(ctx, sessionID, workspaceID)
 		if err != nil {
 			log.Printf("[DEBUG] DescribeSession(%s) error: %v", sessionID, err)
 		} else {

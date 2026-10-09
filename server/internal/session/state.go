@@ -76,6 +76,7 @@ type State struct {
 	AppliedEvents        map[string]bool                `json:"applied_events,omitempty"`
 	TurnKey              string                         `json:"turn_key,omitempty"`
 	PendingLLM           string                         `json:"pending_llm,omitempty"`
+	PendingToolOutput    string                         `json:"pending_tool_output,omitempty"`
 	HasTurnConclusion    bool                           `json:"has_turn_conclusion,omitempty"`
 	AwaitingTurn         bool                           `json:"awaiting_turn,omitempty"`
 	MessageStatus        SendStatus                     `json:"message_status,omitempty"`
@@ -310,10 +311,20 @@ func (s *State) AppendLLMFallback(text string) {
 	s.PendingLLM += text
 }
 
+func (s *State) AppendToolOutput(text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.PendingToolOutput != "" {
+		s.PendingToolOutput += "\n\n"
+	}
+	s.PendingToolOutput += text
+}
+
 func (s *State) StartTurn(key string) {
 	s.mu.Lock()
 	s.TurnKey = key
 	s.PendingLLM = ""
+	s.PendingToolOutput = ""
 	s.HasTurnConclusion = false
 	s.AwaitingTurn = false
 	s.PendingAsk = ""
@@ -541,6 +552,7 @@ type StateSnapshot struct {
 	AppliedEvents        map[string]bool                `json:"applied_events,omitempty"`
 	TurnKey              string                         `json:"turn_key,omitempty"`
 	PendingLLM           string                         `json:"pending_llm,omitempty"`
+	PendingToolOutput    string                         `json:"pending_tool_output,omitempty"`
 	HasTurnConclusion    bool                           `json:"has_turn_conclusion,omitempty"`
 	AwaitingTurn         bool                           `json:"awaiting_turn,omitempty"`
 	MessageStatus        SendStatus                     `json:"message_status,omitempty"`
@@ -579,6 +591,7 @@ func (s *State) Snapshot() StateSnapshot {
 		AppliedEvents:     maps.Clone(s.AppliedEvents),
 		TurnKey:           s.TurnKey,
 		PendingLLM:        s.PendingLLM,
+		PendingToolOutput: s.PendingToolOutput,
 		HasTurnConclusion: s.HasTurnConclusion,
 		AwaitingTurn:      s.AwaitingTurn,
 		MessageStatus:     s.MessageStatus,
@@ -678,6 +691,7 @@ func stateFromSnapshot(snap *StateSnapshot) *State {
 		AppliedEvents:        maps.Clone(snap.AppliedEvents),
 		TurnKey:              snap.TurnKey,
 		PendingLLM:           snap.PendingLLM,
+		PendingToolOutput:    snap.PendingToolOutput,
 		HasTurnConclusion:    snap.HasTurnConclusion,
 		AwaitingTurn:         snap.AwaitingTurn,
 		MessageStatus:        snap.MessageStatus,

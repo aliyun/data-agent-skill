@@ -60,8 +60,23 @@ func jsonResult(v any) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultText(string(b)), nil
 }
 
-func (s *Server) handleListDatabases(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	dbs, err := s.client.ListDatabases(argStr(req, "workspace_id"))
+func addUpstreamRequests(res *mcp.CallToolResult, requests []dataagent.APIRequest) {
+	if res == nil || res.IsError || len(requests) == 0 {
+		return
+	}
+	metadata, _ := json.Marshal(struct {
+		RequestID        string                 `json:"request_id"`
+		UpstreamRequests []dataagent.APIRequest `json:"upstream_requests"`
+	}{
+		RequestID:        requests[len(requests)-1].RequestID,
+		UpstreamRequests: requests,
+	})
+	// A separate content block preserves existing list and multimodal payloads.
+	res.Content = append(res.Content, mcp.NewTextContent(string(metadata)))
+}
+
+func (s *Server) handleListDatabases(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	dbs, err := s.client.ListDatabases(ctx, argStr(req, "workspace_id"))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to list databases: %v", err)), nil
 	}
@@ -374,14 +389,14 @@ func (s *Server) handleWatchSession(ctx context.Context, req mcp.CallToolRequest
 	})
 }
 
-func (s *Server) handleSend(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	sid := argStr(req, "session_id")
 	msg := argStr(req, "message")
 	if sid == "" || msg == "" {
 		return mcp.NewToolResultError("session_id and message are required"), nil
 	}
 
-	if err := s.mgr.SendMessage(sid, msg); err != nil {
+	if err := s.mgr.SendMessage(ctx, sid, msg); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to send message: %v", err)), nil
 	}
 
@@ -451,7 +466,7 @@ func (s *Server) handleResult(_ context.Context, req mcp.CallToolRequest) (*mcp.
 	}, nil
 }
 
-func (s *Server) handleListSessions(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleListSessions(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	includeHistory := argBool(req, "include_history", false)
 	includeRemote := argBool(req, "include_remote", false)
 
@@ -497,7 +512,7 @@ func (s *Server) handleListSessions(_ context.Context, req mcp.CallToolRequest) 
 
 	if includeRemote {
 		wsID := argStr(req, "workspace_id")
-		remote, err := s.client.ListRemoteSessions(wsID)
+		remote, err := s.client.ListRemoteSessions(ctx, wsID)
 		if err != nil {
 			log.Printf("[list_sessions] remote fetch failed (degrading to local only): %v", err)
 		} else {
@@ -551,7 +566,7 @@ func (s *Server) handleStopSession(_ context.Context, req mcp.CallToolRequest) (
 	return jsonResult(map[string]any{"ok": true})
 }
 
-func (s *Server) handleListFiles(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleListFiles(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	sid := argStr(req, "session_id")
 	if sid == "" {
 		return mcp.NewToolResultError("session_id is required"), nil
@@ -563,36 +578,36 @@ func (s *Server) handleListFiles(_ context.Context, req mcp.CallToolRequest) (*m
 		workspaceID = state.WorkspaceID
 	}
 
-	files, err := s.client.ListFiles(sid, agentID, workspaceID, argStr(req, "category"))
+	files, err := s.client.ListFiles(ctx, sid, agentID, workspaceID, argStr(req, "category"))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to list files: %v", err)), nil
 	}
 	return jsonResult(files)
 }
 
-func (s *Server) handleListTables(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleListTables(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	dbID := argStr(req, "database_id")
 	if dbID == "" {
 		return mcp.NewToolResultError("database_id is required"), nil
 	}
-	tables, err := s.client.ListTables(dbID)
+	tables, err := s.client.ListTables(ctx, dbID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to list tables: %v", err)), nil
 	}
 	return jsonResult(tables)
 }
 
-func (s *Server) handleListImportedTables(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleListImportedTables(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// database_id is optional: when omitted, all imported tables in the
 	// workspace are returned (across databases).
-	tables, err := s.client.ListImportedTables(argStr(req, "database_id"), argStr(req, "workspace_id"))
+	tables, err := s.client.ListImportedTables(ctx, argStr(req, "database_id"), argStr(req, "workspace_id"))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to list imported tables: %v", err)), nil
 	}
 	return jsonResult(tables)
 }
 
-func (s *Server) handleImportDatabase(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleImportDatabase(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	dbID := argStr(req, "database_id")
 	tablesStr := argStr(req, "tables")
 
@@ -614,7 +629,7 @@ func (s *Server) handleImportDatabase(_ context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError("tables must include at least one table name"), nil
 	}
 
-	err := s.client.ImportDatabase(dataagent.ImportDatabaseOpts{
+	err := s.client.ImportDatabase(ctx, dataagent.ImportDatabaseOpts{
 		DmsDbID:     dbID,
 		Tables:      tables,
 		WorkspaceID: argStr(req, "workspace_id"),
@@ -625,44 +640,44 @@ func (s *Server) handleImportDatabase(_ context.Context, req mcp.CallToolRequest
 	return jsonResult(map[string]any{"ok": true, "database_id": dbID, "tables": tables})
 }
 
-func (s *Server) handleSearchInstances(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	instances, err := s.client.ListInstances(argStr(req, "search_key"), argStr(req, "db_type"), 1, 50)
+func (s *Server) handleSearchInstances(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	instances, err := s.client.ListInstances(ctx, argStr(req, "search_key"), argStr(req, "db_type"), 1, 50)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to search instances: %v", err)), nil
 	}
 	return jsonResult(instances)
 }
 
-func (s *Server) handleSearchDatabases(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleSearchDatabases(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	key := argStr(req, "search_key")
 	if key == "" {
 		return mcp.NewToolResultError("search_key is required"), nil
 	}
-	dbs, err := s.client.SearchDatabases(key, 1, 50)
+	dbs, err := s.client.SearchDatabases(ctx, key, 1, 50)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to search databases: %v", err)), nil
 	}
 	return jsonResult(dbs)
 }
 
-func (s *Server) handleListWorkspaces(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleListWorkspaces(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	wsType := argStr(req, "type")
 	if wsType == "" {
 		wsType = "MY"
 	}
-	workspaces, err := s.client.ListWorkspaces(wsType)
+	workspaces, err := s.client.ListWorkspaces(ctx, wsType)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to list workspaces: %v", err)), nil
 	}
 	return jsonResult(workspaces)
 }
 
-func (s *Server) handleListAgents(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleListAgents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	status := argStr(req, "status")
 	if status == "" {
 		status = "RELEASED"
 	}
-	agents, err := s.client.ListCustomAgents(status, argStr(req, "workspace_id"))
+	agents, err := s.client.ListCustomAgents(ctx, status, argStr(req, "workspace_id"))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to list agents: %v", err)), nil
 	}
@@ -692,7 +707,7 @@ func argInt64(req mcp.CallToolRequest, key string) int64 {
 // handleGetUploadSignature returns the pre-signed OSS POST policy so the
 // caller uploads the file bytes itself; the server never enters the data
 // path and no server-side filesystem access is involved.
-func (s *Server) handleGetUploadSignature(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleGetUploadSignature(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	fileName := path.Base(strings.TrimSpace(argStr(req, "file_name")))
 	if fileName == "" || fileName == "." || fileName == "/" {
 		return mcp.NewToolResultError("file_name is required (bare filename, e.g. sales.csv)"), nil
@@ -702,7 +717,7 @@ func (s *Server) handleGetUploadSignature(_ context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError("file_size must be a positive byte count"), nil
 	}
 
-	sig, err := s.client.GetFileUploadSignature(fileName, fileSize)
+	sig, err := s.client.GetFileUploadSignature(ctx, fileName, fileSize)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get upload signature: %v", err)), nil
 	}
@@ -733,7 +748,7 @@ func (s *Server) handleGetUploadSignature(_ context.Context, req mcp.CallToolReq
 
 // handleUploadCallback registers a completed OSS upload with the Data Center
 // and returns the file ID used by create_session.
-func (s *Server) handleUploadCallback(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleUploadCallback(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	fileName := path.Base(strings.TrimSpace(argStr(req, "file_name")))
 	ossKey := strings.TrimSpace(argStr(req, "oss_key"))
 	if fileName == "" || fileName == "." || ossKey == "" {
@@ -744,7 +759,7 @@ func (s *Server) handleUploadCallback(_ context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError("file_size must be a positive byte count"), nil
 	}
 
-	fileID, err := s.client.FileUploadCallback(fileName, ossKey, fileSize)
+	fileID, err := s.client.FileUploadCallback(ctx, fileName, ossKey, fileSize)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("upload callback failed: %v", err)), nil
 	}

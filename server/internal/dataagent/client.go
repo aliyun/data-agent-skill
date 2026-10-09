@@ -32,7 +32,7 @@ func buildUserAgent(sessionID string) string {
 	if !isValidSkillSessionID(sessionID) {
 		sessionID = newSkillSessionID()
 	}
-	return userAgentPrefix + "/" + strings.ToLower(sessionID)
+	return userAgentPrefix + "/" + strings.ToLower(sessionID) + " DataAgent_MCP"
 }
 
 func isValidSkillSessionID(sessionID string) bool {
@@ -49,6 +49,45 @@ func newSkillSessionID() string {
 		return "00000000000000000000000000000000"
 	}
 	return hex.EncodeToString(b[:])
+}
+
+type APIRequest struct {
+	Action    string `json:"action"`
+	RequestID string `json:"request_id"`
+}
+
+// A collector belongs to one tool call, never to a shared client.
+type RequestIDs struct {
+	mu       sync.Mutex
+	requests []APIRequest
+}
+
+type requestIDsKey struct{}
+
+// Nested tool calls must not reuse the parent collector.
+func WithRequestIDs(ctx context.Context) (context.Context, *RequestIDs) {
+	ids := &RequestIDs{}
+	return context.WithValue(ctx, requestIDsKey{}, ids), ids
+}
+
+// Snapshot returns an independent copy in response-completion order.
+func (ids *RequestIDs) Snapshot() []APIRequest {
+	ids.mu.Lock()
+	defer ids.mu.Unlock()
+	return append([]APIRequest(nil), ids.requests...)
+}
+
+func recordRequestID(ctx context.Context, action, requestID string) {
+	if requestID == "" {
+		return
+	}
+	ids, _ := ctx.Value(requestIDsKey{}).(*RequestIDs)
+	if ids == nil {
+		return
+	}
+	ids.mu.Lock()
+	defer ids.mu.Unlock()
+	ids.requests = append(ids.requests, APIRequest{Action: action, RequestID: requestID})
 }
 
 // Client is the main API client for Alibaba Cloud Data Agent.
@@ -199,11 +238,11 @@ func (c *Client) APIKeyStreamEndpoint() string {
 // ---------- public API methods ----------
 
 // CreateSession creates a new Data Agent session.
-func (c *Client) CreateSession(opts CreateSessionOpts) (*SessionInfo, error) {
+func (c *Client) CreateSession(ctx context.Context, opts CreateSessionOpts) (*SessionInfo, error) {
 	params := map[string]string{
 		"Title": "data-agent-session",
 	}
-	c.setDmsUnit(params)
+	c.setDmsUnit(ctx, params)
 	if opts.DatabaseID != "" {
 		params["DatabaseId"] = opts.DatabaseID
 	}
@@ -232,7 +271,7 @@ func (c *Client) CreateSession(opts CreateSessionOpts) (*SessionInfo, error) {
 	cfgBytes, _ := json.Marshal(sessionCfg)
 	params["SessionConfig"] = string(cfgBytes)
 
-	body, err := c.callAPI(c.endpoint, "CreateDataAgentSession", "2025-04-14", params)
+	body, err := c.callAPI(ctx, c.endpoint, "CreateDataAgentSession", "2025-04-14", params)
 	if err != nil {
 		return nil, fmt.Errorf("CreateSession: %w", err)
 	}
@@ -259,22 +298,22 @@ func (c *Client) CreateSession(opts CreateSessionOpts) (*SessionInfo, error) {
 // An optional workspaceID can be passed to scope the query to a specific
 // workspace (e.g. when the session was created in a non-default workspace).
 // If empty, the globally configured workspace is used.
-func (c *Client) DescribeSession(sessionID string, workspaceID ...string) (*SessionInfo, error) {
+func (c *Client) DescribeSession(ctx context.Context, sessionID string, workspaceID ...string) (*SessionInfo, error) {
 	params := map[string]string{
 		"SessionId": sessionID,
 	}
-	c.setDmsUnit(params)
+	c.setDmsUnit(ctx, params)
 	ws := ""
 	if len(workspaceID) > 0 && workspaceID[0] != "" {
 		ws = workspaceID[0]
 	} else {
-		ws = c.ResolveWorkspaceID()
+		ws = c.ResolveWorkspaceID(ctx)
 	}
 	if ws != "" {
 		params["WorkspaceId"] = ws
 	}
 
-	body, err := c.callAPI(c.endpoint, "DescribeDataAgentSession", "2025-04-14", params)
+	body, err := c.callAPI(ctx, c.endpoint, "DescribeDataAgentSession", "2025-04-14", params)
 	if err != nil {
 		return nil, fmt.Errorf("DescribeSession: %w", err)
 	}
@@ -297,7 +336,7 @@ func (c *Client) DescribeSession(sessionID string, workspaceID ...string) (*Sess
 }
 
 // SendMessage sends a chat message to an active Data Agent session.
-func (c *Client) SendMessage(opts SendMessageOpts) error {
+func (c *Client) SendMessage(ctx context.Context, opts SendMessageOpts) error {
 	messageType := opts.MessageType
 	if messageType == "" {
 		messageType = "primary"
@@ -308,7 +347,7 @@ func (c *Client) SendMessage(opts SendMessageOpts) error {
 		"Message":     opts.Message,
 		"MessageType": messageType,
 	}
-	c.setDmsUnit(params)
+	c.setDmsUnit(ctx, params)
 	if opts.WorkspaceID != "" {
 		params["WorkspaceId"] = opts.WorkspaceID
 	}
@@ -332,7 +371,7 @@ func (c *Client) SendMessage(opts SendMessageOpts) error {
 		params["DataSource"] = string(dsBytes)
 	}
 
-	_, err := c.callAPI(c.endpoint, "SendChatMessage", "2025-04-14", params)
+	_, err := c.callAPI(ctx, c.endpoint, "SendChatMessage", "2025-04-14", params)
 	if err != nil {
 		return fmt.Errorf("SendMessage: %w", err)
 	}
@@ -341,25 +380,25 @@ func (c *Client) SendMessage(opts SendMessageOpts) error {
 
 // ResolveWorkspaceID calls InitDataAgentPersonalWorkspace to get the user's
 // personal workspace ID. Result is cached.
-func (c *Client) ResolveWorkspaceID() string {
+func (c *Client) ResolveWorkspaceID(ctx context.Context) string {
 	c.wsMu.Lock()
 	defer c.wsMu.Unlock()
 	if c.workspaceID != "" {
 		return c.workspaceID
 	}
 	params := map[string]string{}
-	c.setDmsUnit(params)
+	c.setDmsUnit(ctx, params)
 	if c.credential().IsAPIKey() {
 		// InitDataAgentPersonalWorkspace is not available in API Key mode; fall
 		// back to the workspaces the user belongs to (WorkspaceType=MY) and use
 		// the first one.
-		wsList, err := c.ListWorkspaces("MY")
+		wsList, err := c.ListWorkspaces(ctx, "MY")
 		if err == nil && len(wsList) > 0 {
 			c.workspaceID = wsList[0].WorkspaceID
 		}
 		return c.workspaceID
 	}
-	body, err := c.callAPI(c.endpoint, "InitDataAgentPersonalWorkspace", "2025-04-14", params)
+	body, err := c.callAPI(ctx, c.endpoint, "InitDataAgentPersonalWorkspace", "2025-04-14", params)
 	if err != nil {
 		log.Printf("ResolveWorkspaceID failed: %v", err)
 		return ""
@@ -380,7 +419,7 @@ func (c *Client) ResolveWorkspaceID() string {
 // endpoint and returns the raw items. baseParams must not contain paging keys.
 // Stops on an empty/short page, when TotalCount is reached, on a repeated
 // page (API ignoring PageNumber), or at the page-scan safety cap.
-func (c *Client) listTagMetaAssetPages(dmsEndpoint string, baseParams map[string]string) ([]map[string]interface{}, error) {
+func (c *Client) listTagMetaAssetPages(ctx context.Context, dmsEndpoint string, baseParams map[string]string) ([]map[string]interface{}, error) {
 	var items []map[string]interface{}
 	prevFirst := ""
 	for page := 1; page <= dataAgentListMaxPageScan; page++ {
@@ -392,7 +431,7 @@ func (c *Client) listTagMetaAssetPages(dmsEndpoint string, baseParams map[string
 			params[k] = v
 		}
 
-		body, err := c.callDMSEnterprise(dmsEndpoint, "ListTagMetaAsset", "2018-11-01", params)
+		body, err := c.callDMSEnterprise(ctx, dmsEndpoint, "ListTagMetaAsset", "2018-11-01", params)
 		if err != nil {
 			return nil, err
 		}
@@ -452,13 +491,13 @@ func tagMetaAttrs(m map[string]interface{}) map[string]interface{} {
 // ListDatabases calls ListTagMetaAsset on the dms-enterprise endpoint to
 // list databases imported into a workspace's Data Center.
 // An empty workspaceID falls back to the configured/default workspace.
-func (c *Client) ListDatabases(workspaceID string) ([]DatabaseInfo, error) {
+func (c *Client) ListDatabases(ctx context.Context, workspaceID string) ([]DatabaseInfo, error) {
 	dmsEndpoint := c.DMSEnterpriseEndpoint()
 
-	tid := c.resolveTid(dmsEndpoint)
+	tid := c.resolveTid(ctx, dmsEndpoint)
 	ws := workspaceID
 	if ws == "" {
-		ws = c.ResolveWorkspaceID()
+		ws = c.ResolveWorkspaceID(ctx)
 	}
 
 	tagName := fmt.Sprintf("sys::DMS-DA::%s::space:%s", c.region, ws)
@@ -471,7 +510,7 @@ func (c *Client) ListDatabases(workspaceID string) ([]DatabaseInfo, error) {
 		params["Tid"] = tid
 	}
 
-	items, err := c.listTagMetaAssetPages(dmsEndpoint, params)
+	items, err := c.listTagMetaAssetPages(ctx, dmsEndpoint, params)
 	if err != nil {
 		return nil, fmt.Errorf("ListDatabases: %w", err)
 	}
@@ -493,11 +532,11 @@ func (c *Client) ListDatabases(workspaceID string) ([]DatabaseInfo, error) {
 }
 
 // ListFiles returns uploaded files for a session.
-func (c *Client) ListFiles(sessionID, agentID, workspaceID, category string) ([]FileInfo, error) {
+func (c *Client) ListFiles(ctx context.Context, sessionID, agentID, workspaceID, category string) ([]FileInfo, error) {
 	params := map[string]string{
 		"SessionId": sessionID,
 	}
-	c.setDmsUnit(params)
+	c.setDmsUnit(ctx, params)
 	if agentID != "" {
 		params["AgentId"] = agentID
 	}
@@ -508,7 +547,7 @@ func (c *Client) ListFiles(sessionID, agentID, workspaceID, category string) ([]
 		params["FileCategory"] = category
 	}
 
-	body, err := c.callAPI(c.endpoint, "ListFileUpload", "2025-04-14", params)
+	body, err := c.callAPI(ctx, c.endpoint, "ListFileUpload", "2025-04-14", params)
 	if err != nil {
 		return nil, fmt.Errorf("ListFiles: %w", err)
 	}
@@ -547,9 +586,9 @@ func (c *Client) ListFiles(sessionID, agentID, workspaceID, category string) ([]
 // ListTables queries DMS Enterprise for all tables in a database.
 // This returns tables from DMS directly (not workspace-scoped), suitable for
 // discovering tables before importing them via import_database.
-func (c *Client) ListTables(databaseID string) ([]TableInfo, error) {
+func (c *Client) ListTables(ctx context.Context, databaseID string) ([]TableInfo, error) {
 	dmsEndpoint := c.DMSEnterpriseEndpoint()
-	tid := c.resolveTid(dmsEndpoint)
+	tid := c.resolveTid(ctx, dmsEndpoint)
 
 	params := map[string]string{
 		"DatabaseId": databaseID,
@@ -560,7 +599,7 @@ func (c *Client) ListTables(databaseID string) ([]TableInfo, error) {
 		params["Tid"] = tid
 	}
 
-	body, err := c.callDMSEnterprise(dmsEndpoint, "ListTables", "2018-11-01", params)
+	body, err := c.callDMSEnterprise(ctx, dmsEndpoint, "ListTables", "2018-11-01", params)
 	if err != nil {
 		return nil, fmt.Errorf("ListTables: %w", err)
 	}
@@ -597,12 +636,12 @@ func (c *Client) ListTables(databaseID string) ([]TableInfo, error) {
 // ListImportedTables queries tables already imported into a workspace via ListTagMetaAsset.
 // An empty workspaceID falls back to the configured/default workspace; an empty
 // databaseID lists imported tables across all databases in the workspace.
-func (c *Client) ListImportedTables(databaseID, workspaceID string) ([]TableInfo, error) {
+func (c *Client) ListImportedTables(ctx context.Context, databaseID, workspaceID string) ([]TableInfo, error) {
 	dmsEndpoint := c.DMSEnterpriseEndpoint()
-	tid := c.resolveTid(dmsEndpoint)
+	tid := c.resolveTid(ctx, dmsEndpoint)
 	ws := workspaceID
 	if ws == "" {
-		ws = c.ResolveWorkspaceID()
+		ws = c.ResolveWorkspaceID(ctx)
 	}
 	tagName := fmt.Sprintf("sys::DMS-DA::%s::space:%s", c.region, ws)
 
@@ -617,7 +656,7 @@ func (c *Client) ListImportedTables(databaseID, workspaceID string) ([]TableInfo
 		params["Tid"] = tid
 	}
 
-	items, err := c.listTagMetaAssetPages(dmsEndpoint, params)
+	items, err := c.listTagMetaAssetPages(ctx, dmsEndpoint, params)
 	if err != nil {
 		return nil, fmt.Errorf("ListImportedTables: %w", err)
 	}
@@ -646,14 +685,14 @@ type ImportDatabaseOpts struct {
 // ImportDatabase tags DMS database tables into a Data Agent workspace using
 // dms-enterprise TagMetaAsset. This makes the tables visible in the workspace's
 // data center. Each table is tagged as a META_TABLE item with MetaId = "{dbId},{tableName}".
-func (c *Client) ImportDatabase(opts ImportDatabaseOpts) error {
+func (c *Client) ImportDatabase(ctx context.Context, opts ImportDatabaseOpts) error {
 	wsID := opts.WorkspaceID
 	if wsID == "" {
-		wsID = c.ResolveWorkspaceID()
+		wsID = c.ResolveWorkspaceID(ctx)
 	}
 
 	dmsEndpoint := c.DMSEnterpriseEndpoint()
-	tid := c.resolveTid(dmsEndpoint)
+	tid := c.resolveTid(ctx, dmsEndpoint)
 	tagName := fmt.Sprintf("sys::DMS-DA::%s::space:%s", c.region, wsID)
 
 	// Build metaItems: each table is "{dbId},{tableName}"
@@ -678,7 +717,7 @@ func (c *Client) ImportDatabase(opts ImportDatabaseOpts) error {
 		params["Tid"] = tid
 	}
 
-	_, err := c.callDMSEnterprise(dmsEndpoint, "TagMetaAsset", "2018-11-01", params)
+	_, err := c.callDMSEnterprise(ctx, dmsEndpoint, "TagMetaAsset", "2018-11-01", params)
 	if err != nil {
 		return fmt.Errorf("ImportDatabase: %w", err)
 	}
@@ -686,9 +725,9 @@ func (c *Client) ImportDatabase(opts ImportDatabaseOpts) error {
 }
 
 // ListInstances lists DMS instances with optional filters.
-func (c *Client) ListInstances(searchKey, dbType string, page, size int) ([]InstanceInfo, error) {
+func (c *Client) ListInstances(ctx context.Context, searchKey, dbType string, page, size int) ([]InstanceInfo, error) {
 	dmsEndpoint := c.DMSEnterpriseEndpoint()
-	tid := c.resolveTid(dmsEndpoint)
+	tid := c.resolveTid(ctx, dmsEndpoint)
 
 	params := map[string]string{
 		"PageNumber": strconv.Itoa(page),
@@ -704,7 +743,7 @@ func (c *Client) ListInstances(searchKey, dbType string, page, size int) ([]Inst
 		params["Tid"] = tid
 	}
 
-	body, err := c.callDMSEnterprise(dmsEndpoint, "ListInstances", "2018-11-01", params)
+	body, err := c.callDMSEnterprise(ctx, dmsEndpoint, "ListInstances", "2018-11-01", params)
 	if err != nil {
 		return nil, fmt.Errorf("ListInstances: %w", err)
 	}
@@ -753,9 +792,9 @@ func (c *Client) ListInstances(searchKey, dbType string, page, size int) ([]Inst
 }
 
 // SearchDatabases searches DMS databases by keyword.
-func (c *Client) SearchDatabases(searchKey string, page, size int) ([]SearchDBInfo, error) {
+func (c *Client) SearchDatabases(ctx context.Context, searchKey string, page, size int) ([]SearchDBInfo, error) {
 	dmsEndpoint := c.DMSEnterpriseEndpoint()
-	tid := c.resolveTid(dmsEndpoint)
+	tid := c.resolveTid(ctx, dmsEndpoint)
 
 	params := map[string]string{
 		"SearchKey":  searchKey,
@@ -766,7 +805,7 @@ func (c *Client) SearchDatabases(searchKey string, page, size int) ([]SearchDBIn
 		params["Tid"] = tid
 	}
 
-	body, err := c.callDMSEnterprise(dmsEndpoint, "SearchDatabase", "2018-11-01", params)
+	body, err := c.callDMSEnterprise(ctx, dmsEndpoint, "SearchDatabase", "2018-11-01", params)
 	if err != nil {
 		return nil, fmt.Errorf("SearchDatabases: %w", err)
 	}
@@ -809,7 +848,7 @@ func (c *Client) SearchDatabases(searchKey string, page, size int) ([]SearchDBIn
 }
 
 // ListWorkspaces lists Data Agent workspaces.
-func (c *Client) ListWorkspaces(wsType string) ([]WorkspaceInfo, error) {
+func (c *Client) ListWorkspaces(ctx context.Context, wsType string) ([]WorkspaceInfo, error) {
 	if wsType == "" {
 		wsType = "MY"
 	}
@@ -822,9 +861,9 @@ func (c *Client) ListWorkspaces(wsType string) ([]WorkspaceInfo, error) {
 			"PageNumber":    strconv.Itoa(page),
 			"PageSize":      strconv.Itoa(dataAgentListPageSize),
 		}
-		c.setDmsUnit(params)
+		c.setDmsUnit(ctx, params)
 
-		body, err := c.callAPI(c.endpoint, "ListDataAgentWorkspace", "2025-04-14", params)
+		body, err := c.callAPI(ctx, c.endpoint, "ListDataAgentWorkspace", "2025-04-14", params)
 		if err != nil {
 			return nil, fmt.Errorf("ListWorkspaces: %w", err)
 		}
@@ -875,12 +914,12 @@ func (c *Client) ListWorkspaces(wsType string) ([]WorkspaceInfo, error) {
 }
 
 // ListCustomAgents lists custom agents in the user's workspace.
-func (c *Client) ListCustomAgents(status, workspaceID string) ([]AgentInfo, error) {
+func (c *Client) ListCustomAgents(ctx context.Context, status, workspaceID string) ([]AgentInfo, error) {
 	if status == "" {
 		status = "RELEASED"
 	}
 	if workspaceID == "" {
-		workspaceID = c.ResolveWorkspaceID()
+		workspaceID = c.ResolveWorkspaceID(ctx)
 	}
 
 	var result []AgentInfo
@@ -892,9 +931,9 @@ func (c *Client) ListCustomAgents(status, workspaceID string) ([]AgentInfo, erro
 			"PageSize":    strconv.Itoa(dataAgentListPageSize),
 			"WorkspaceId": workspaceID,
 		}
-		c.setDmsUnit(params)
+		c.setDmsUnit(ctx, params)
 
-		body, err := c.callAPI(c.endpoint, "ListCustomAgent", "2025-04-14", params)
+		body, err := c.callAPI(ctx, c.endpoint, "ListCustomAgent", "2025-04-14", params)
 		if err != nil {
 			return nil, fmt.Errorf("ListCustomAgents: %w", err)
 		}
@@ -958,9 +997,9 @@ func (c *Client) ListCustomAgents(status, workspaceID string) ([]AgentInfo, erro
 
 // ListRemoteSessions calls ListDataAgentSession and returns all sessions accessible
 // to the current API key. Paginates until all results are fetched.
-func (c *Client) ListRemoteSessions(workspaceID string) ([]RemoteSessionSummary, error) {
+func (c *Client) ListRemoteSessions(ctx context.Context, workspaceID string) ([]RemoteSessionSummary, error) {
 	if workspaceID == "" {
-		workspaceID = c.ResolveWorkspaceID()
+		workspaceID = c.ResolveWorkspaceID(ctx)
 	}
 	var result []RemoteSessionSummary
 	listCred := c.credential()
@@ -971,11 +1010,11 @@ func (c *Client) ListRemoteSessions(workspaceID string) ([]RemoteSessionSummary,
 			"PageNumber":  strconv.Itoa(page),
 			"PageSize":    strconv.Itoa(dataAgentListPageSize),
 		}
-		c.setDmsUnit(params)
+		c.setDmsUnit(ctx, params)
 		for k, v := range timeParams {
 			params[k] = v
 		}
-		body, err := c.callAPI(c.endpoint, "ListDataAgentSession", "2025-04-14", params)
+		body, err := c.callAPI(ctx, c.endpoint, "ListDataAgentSession", "2025-04-14", params)
 		if err != nil {
 			return nil, fmt.Errorf("ListRemoteSessions: %w", err)
 		}
@@ -1038,14 +1077,14 @@ func sessionListTimeParams(apiKeyAuth bool) map[string]string {
 }
 
 // GetFileUploadSignature returns a pre-signed upload URL for a file.
-func (c *Client) GetFileUploadSignature(fileName string, fileSize int64) (*UploadSignature, error) {
+func (c *Client) GetFileUploadSignature(ctx context.Context, fileName string, fileSize int64) (*UploadSignature, error) {
 	params := map[string]string{
 		"FileName": fileName,
 		"FileSize": strconv.FormatInt(fileSize, 10),
 	}
-	c.setDmsUnit(params)
+	c.setDmsUnit(ctx, params)
 
-	body, err := c.callAPI(c.endpoint, "DescribeFileUploadSignature", "2025-04-14", params)
+	body, err := c.callAPI(ctx, c.endpoint, "DescribeFileUploadSignature", "2025-04-14", params)
 	if err != nil {
 		return nil, fmt.Errorf("GetFileUploadSignature: %w", err)
 	}
@@ -1074,16 +1113,16 @@ func (c *Client) GetFileUploadSignature(fileName string, fileSize int64) (*Uploa
 
 // FileUploadCallback notifies the server that a file upload is complete.
 // Returns the Data Center file ID (e.g. "f-xxx") from the API response.
-func (c *Client) FileUploadCallback(filename, uploadLocation string, fileSize int64) (string, error) {
+func (c *Client) FileUploadCallback(ctx context.Context, filename, uploadLocation string, fileSize int64) (string, error) {
 	params := map[string]string{
 		"Filename":       filename,
 		"UploadLocation": uploadLocation,
 		"FileSize":       strconv.FormatInt(fileSize, 10),
 		"FileFrom":       "Skill",
 	}
-	c.setDmsUnit(params)
+	c.setDmsUnit(ctx, params)
 
-	body, err := c.callAPI(c.endpoint, "FileUploadCallback", "2025-04-14", params)
+	body, err := c.callAPI(ctx, c.endpoint, "FileUploadCallback", "2025-04-14", params)
 	if err != nil {
 		return "", fmt.Errorf("FileUploadCallback: %w", err)
 	}
@@ -1103,7 +1142,7 @@ func (c *Client) FileUploadCallback(filename, uploadLocation string, fileSize in
 
 // ResolveDMSUnit returns the configured or auto-resolved DMSUnit.
 // DMSUnit is independent from region — this method never falls back to region.
-func (c *Client) ResolveDMSUnit() string {
+func (c *Client) ResolveDMSUnit(ctx context.Context) string {
 	c.dmsUnitMu.Lock()
 	defer c.dmsUnitMu.Unlock()
 
@@ -1116,7 +1155,7 @@ func (c *Client) ResolveDMSUnit() string {
 	}
 
 	dmsEndpoint := c.DMSEnterpriseEndpoint()
-	body, err := c.callDMSEnterprise(dmsEndpoint, "GetActiveRouteUnit", "2018-11-01", nil)
+	body, err := c.callDMSEnterprise(ctx, dmsEndpoint, "GetActiveRouteUnit", "2018-11-01", nil)
 	if err == nil && body != nil {
 		route := jsonObj(body, "Route")
 		if route == nil {
@@ -1134,8 +1173,8 @@ func (c *Client) ResolveDMSUnit() string {
 }
 
 // setDmsUnit conditionally adds DmsUnit to params if configured or auto-resolved.
-func (c *Client) setDmsUnit(params map[string]string) {
-	if u := c.ResolveDMSUnit(); u != "" {
+func (c *Client) setDmsUnit(ctx context.Context, params map[string]string) {
+	if u := c.ResolveDMSUnit(ctx); u != "" {
 		params["DmsUnit"] = u
 	}
 }
@@ -1277,23 +1316,27 @@ func readAPIResponse(action string, resp *http.Response) (map[string]interface{}
 	if apiErr := responseAPIError(result, resp.StatusCode, requestID, true); apiErr != nil {
 		return nil, fmt.Errorf("%s failed: %w", action, apiErr)
 	}
+	// Normalize only validated successes; error attribution remains unchanged.
+	if id := apiKeyRequestID(result, resp); id != "" {
+		result["RequestId"] = id
+	}
 	return result, nil
 }
 
 // callAPI makes a signed POST to the Data Agent endpoint (version 2025-04-14).
-func (c *Client) callAPI(host, action, version string, params map[string]string) (map[string]interface{}, error) {
+func (c *Client) callAPI(ctx context.Context, host, action, version string, params map[string]string) (map[string]interface{}, error) {
 	if c.credential().IsAPIKey() {
-		return c.doAPIKeyPost(action, version, params)
+		return c.doAPIKeyPost(ctx, action, version, params)
 	}
-	return c.doSignedPost(host, action, version, params)
+	return c.doSignedPost(ctx, host, action, version, params)
 }
 
 // resolveTid calls GetUserActiveTenant to obtain the DMS tenant ID.
-func (c *Client) resolveTid(dmsEndpoint string) string {
+func (c *Client) resolveTid(ctx context.Context, dmsEndpoint string) string {
 	if c.credential().IsAPIKey() {
 		return ""
 	}
-	body, err := c.callDMSEnterprise(dmsEndpoint, "GetUserActiveTenant", "2018-11-01", nil)
+	body, err := c.callDMSEnterprise(ctx, dmsEndpoint, "GetUserActiveTenant", "2018-11-01", nil)
 	if err != nil {
 		return ""
 	}
@@ -1321,14 +1364,14 @@ var apiKeyDMSActions = map[string]string{
 }
 
 // callDMSEnterprise makes a signed POST to a dms-enterprise endpoint.
-func (c *Client) callDMSEnterprise(host, action, version string, params map[string]string) (map[string]interface{}, error) {
+func (c *Client) callDMSEnterprise(ctx context.Context, host, action, version string, params map[string]string) (map[string]interface{}, error) {
 	if c.credential().IsAPIKey() {
 		if apiKeyAction, ok := apiKeyDMSActions[action]; ok {
-			return c.doAPIKeyPost(apiKeyAction, version, params)
+			return c.doAPIKeyPost(ctx, apiKeyAction, version, params)
 		}
 		return nil, fmt.Errorf("%s: %w", action, ErrAPIKeyUnsupported)
 	}
-	return c.doSignedPostVersioned(host, action, version, params)
+	return c.doSignedPostVersioned(ctx, host, action, version, params)
 }
 
 // apiKeyActionRenames maps AK/SK action names to API Key gateway action names
@@ -1348,7 +1391,7 @@ var apiKeyDataPlaneActions = map[string]bool{
 
 // doAPIKeyPost performs an API Key authenticated POST request.
 // Uses x-api-key header with no HMAC signing. Different endpoints than AK/SK.
-func (c *Client) doAPIKeyPost(action, version string, params map[string]string) (map[string]interface{}, error) {
+func (c *Client) doAPIKeyPost(ctx context.Context, action, version string, params map[string]string) (map[string]interface{}, error) {
 	if renamed, ok := apiKeyActionRenames[action]; ok {
 		action = renamed
 	}
@@ -1379,7 +1422,7 @@ func (c *Client) doAPIKeyPost(action, version string, params map[string]string) 
 	bodyBytes, _ := json.Marshal(bodyMap)
 
 	reqURL := fmt.Sprintf("https://%s/apikey", host)
-	req, err := http.NewRequest("POST", reqURL, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("build API Key request for %s: %w", action, err)
 	}
@@ -1411,20 +1454,29 @@ func (c *Client) doAPIKeyPost(action, version string, params map[string]string) 
 			if apiErr := responseAPIError(inner, resp.StatusCode, apiKeyRequestID(result, resp), false); apiErr != nil {
 				return nil, fmt.Errorf("%s failed: %w", action, apiErr)
 			}
-			return inner, nil
+			// Unwrapping must retain the envelope/header ID when the backend omits its own.
+			id := firstStr(inner, "RequestId", "requestId", "request_id", "RequestID")
+			if id == "" {
+				id = jsonStr(result, "RequestId")
+			}
+			if id != "" {
+				inner["RequestId"] = id
+			}
+			result = inner
 		}
 	}
 
+	recordRequestID(ctx, action, jsonStr(result, "RequestId"))
 	return result, nil
 }
 
 // doSignedPost performs a signed POST request using the default API version 2025-04-14.
-func (c *Client) doSignedPost(host, action, version string, params map[string]string) (map[string]interface{}, error) {
-	return c.doSignedPostVersioned(host, action, version, params)
+func (c *Client) doSignedPost(ctx context.Context, host, action, version string, params map[string]string) (map[string]interface{}, error) {
+	return c.doSignedPostVersioned(ctx, host, action, version, params)
 }
 
 // doSignedPostVersioned performs a signed POST request with the specified API version.
-func (c *Client) doSignedPostVersioned(host, action, version string, params map[string]string) (map[string]interface{}, error) {
+func (c *Client) doSignedPostVersioned(ctx context.Context, host, action, version string, params map[string]string) (map[string]interface{}, error) {
 	if params == nil {
 		params = map[string]string{}
 	}
@@ -1437,7 +1489,7 @@ func (c *Client) doSignedPostVersioned(host, action, version string, params map[
 	qs := BuildSignedQueryStringVersioned(action, version, params)
 	reqURL := fmt.Sprintf("https://%s/?%s", host, qs)
 
-	req, err := http.NewRequest("POST", reqURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request for %s: %w", action, err)
 	}
@@ -1451,7 +1503,12 @@ func (c *Client) doSignedPostVersioned(host, action, version string, params map[
 	}
 	defer resp.Body.Close()
 
-	return readAPIResponse(action, resp)
+	result, err := readAPIResponse(action, resp)
+	if err != nil {
+		return nil, err
+	}
+	recordRequestID(ctx, action, jsonStr(result, "RequestId"))
+	return result, nil
 }
 
 // ---------- signing helpers with version support ----------
@@ -1626,9 +1683,6 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-// apiKeyRequestID extracts the backend request id from an API Key gateway
-// response for error attribution: the envelope carries requestId in the body;
-// fall back to the x-acs-request-id header.
 func apiKeyRequestID(body map[string]interface{}, resp *http.Response) string {
 	if id := firstStr(body, "requestId", "RequestId", "request_id", "RequestID"); id != "" {
 		return id

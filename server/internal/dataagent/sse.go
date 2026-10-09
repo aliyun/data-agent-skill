@@ -26,9 +26,9 @@ type SSEEvent struct {
 type SSEClient struct {
 	httpClient *http.Client
 	cred       *Credential
-	credFn     func() *Credential // optional dynamic credential provider
-	dmsUnitFn  func() string      // optional DMSUnit resolver (set by Client)
-	endpoint   string             // AK/SK signed host, e.g. "dms.cn-hangzhou.aliyuncs.com"
+	credFn     func() *Credential           // optional dynamic credential provider
+	dmsUnitFn  func(context.Context) string // optional DMSUnit resolver (set by Client)
+	endpoint   string                       // AK/SK signed host, e.g. "dms.cn-hangzhou.aliyuncs.com"
 	// streamEndpoint is the API Key data-plane host, e.g.
 	// "dataagent-stream-cn-hangzhou.aliyuncs.com". Client keeps it in sync
 	// with its own endpoint overrides.
@@ -80,7 +80,7 @@ func (c *SSEClient) doStream(
 		"SessionId": sessionID,
 	}
 	if c.dmsUnitFn != nil {
-		if u := c.dmsUnitFn(); u != "" {
+		if u := c.dmsUnitFn(ctx); u != "" {
 			params["DmsUnit"] = u
 		}
 	}

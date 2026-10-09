@@ -23,7 +23,7 @@ type confirmationClient struct {
 	messages []dataagent.SendMessageOpts
 }
 
-func (c *confirmationClient) SendMessage(opts dataagent.SendMessageOpts) error {
+func (c *confirmationClient) SendMessage(_ context.Context, opts dataagent.SendMessageOpts) error {
 	c.messages = append(c.messages, opts)
 	c.calls.Add(1)
 	if c.send != nil {
@@ -42,7 +42,7 @@ func applyAsk(w *Watcher, ev dataagent.SSEEvent) string {
 	w.opMu.Lock()
 	defer w.opMu.Unlock()
 	key, stable := w.eventKey(ev)
-	w.handleConfirmation(event.Parse(ev.EventType, ev.Category, ev.Content, ev.ContentType), key, stable)
+	w.handleConfirmation(context.Background(), event.Parse(ev.EventType, ev.Category, ev.Content, ev.ContentType), key, stable)
 	return key
 }
 
@@ -53,7 +53,7 @@ func TestReplyBindsOriginalAskWhenCheckpointAdvancesDuringSend(t *testing.T) {
 		w.state.SetCheckpoint(211)
 		return nil
 	}
-	if err := w.SendMessage("confirm"); err != nil {
+	if err := w.SendMessage(context.Background(), "confirm"); err != nil {
 		t.Fatal(err)
 	}
 	second := applyAsk(w, eventWithCheckpoint("chat_finish", "ask_human", "choose a region", 211))
@@ -85,12 +85,12 @@ func TestFailedReplyPreservesWaitingAndDoesNotAutoRetry(t *testing.T) {
 				t.Fatalf("failed reply state=%+v, calls=%d", snap, client.calls.Load())
 			}
 			if tc.status == SendUnknown {
-				if err := w.SendMessage("confirm"); err == nil || client.calls.Load() != 1 {
+				if err := w.SendMessage(context.Background(), "confirm"); err == nil || client.calls.Load() != 1 {
 					t.Fatal("unknown send must not retry")
 				}
 			} else {
 				client.send = nil
-				if err := w.SendMessage("confirm"); err != nil {
+				if err := w.SendMessage(context.Background(), "confirm"); err != nil {
 					t.Fatal(err)
 				}
 				if client.calls.Load() != 2 || w.state.GetStatus() != StatusRunning {
@@ -121,7 +121,7 @@ func TestSendingIntentRestoresAsUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.state = stateFromSnapshot(LoadState(w.sessDir, "test-session"))
-	if err := w.SendMessage("confirm"); err == nil || client.calls.Load() != 0 || w.state.Snapshot().Requests[key].Status != SendUnknown {
+	if err := w.SendMessage(context.Background(), "confirm"); err == nil || client.calls.Load() != 0 || w.state.Snapshot().Requests[key].Status != SendUnknown {
 		t.Fatal("uncertain crash recovery resent the message")
 	}
 }
@@ -134,7 +134,7 @@ func TestSendIntentMustPersistBeforeNetworkCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.sessDir = blocker
-	if err := w.SendMessage("answer"); err == nil || client.calls.Load() != 0 {
+	if err := w.SendMessage(context.Background(), "answer"); err == nil || client.calls.Load() != 0 {
 		t.Fatal("sent without durable intent")
 	}
 	if w.state.GetWaitingFor() != "ask_human" {
@@ -150,7 +150,7 @@ func TestConcurrentManualAndAutomaticReplySendOnce(t *testing.T) {
 	go func() { defer close(autoDone); applyAsk(w, eventWithCheckpoint("chat_finish", "ask_plan", "plan", 2)) }()
 	<-entered
 	manualDone := make(chan error, 1)
-	go func() { manualDone <- w.SendMessage("confirm") }()
+	go func() { manualDone <- w.SendMessage(context.Background(), "confirm") }()
 	close(release)
 	<-autoDone
 	<-manualDone
@@ -176,7 +176,7 @@ func TestFollowUpIgnoresPreviousTurnCompletion(t *testing.T) {
 	client.events = []dataagent.SSEEvent{eventWithCheckpoint("chat_finish", "chat", "", 4)}
 	w.streamOnce(context.Background())
 	w = &Watcher{state: stateFromSnapshot(LoadState(w.sessDir, "test-session")), client: client, sessDir: w.sessDir}
-	if err := w.SendMessage("follow-up"); err != nil {
+	if err := w.SendMessage(context.Background(), "follow-up"); err != nil {
 		t.Fatal(err)
 	}
 	client.events = []dataagent.SSEEvent{
@@ -332,13 +332,13 @@ func TestAcknowledgementPersistenceFailureDoesNotResend(t *testing.T) {
 		}
 		return nil
 	}
-	if err := w.SendMessage("confirm"); err == nil || !strings.Contains(err.Error(), "accepted") {
+	if err := w.SendMessage(context.Background(), "confirm"); err == nil || !strings.Contains(err.Error(), "accepted") {
 		t.Fatalf("expected explicit accepted-but-unpersisted error, got %v", err)
 	}
 	if w.state.Snapshot().Requests[key].Status != SendAcknowledged {
 		t.Fatal("forgot accepted delivery")
 	}
-	if err := w.SendMessage("confirm"); err == nil || client.calls.Load() != 1 {
+	if err := w.SendMessage(context.Background(), "confirm"); err == nil || client.calls.Load() != 1 {
 		t.Fatal("resent accepted confirmation")
 	}
 	saved := LoadState(filepath.Dir(backup), filepath.Base(backup))
@@ -346,7 +346,7 @@ func TestAcknowledgementPersistenceFailureDoesNotResend(t *testing.T) {
 		t.Fatal("missing durable sending intent")
 	}
 	w.state = stateFromSnapshot(saved)
-	if err := w.SendMessage("confirm"); err == nil || client.calls.Load() != 1 {
+	if err := w.SendMessage(context.Background(), "confirm"); err == nil || client.calls.Load() != 1 {
 		t.Fatal("resent uncertain confirmation after crash")
 	}
 }
@@ -396,7 +396,7 @@ func TestTerminalErrorAndCancellationDetachUnknownRequest(t *testing.T) {
 			}
 			client.send = nil
 			w = &Watcher{state: stateFromSnapshot(&snap), client: client, sessDir: w.sessDir}
-			if err := w.SendMessage("new question"); err != nil {
+			if err := w.SendMessage(context.Background(), "new question"); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -427,7 +427,7 @@ func TestReportRequiresManualConfirmationAfterAnalysis(t *testing.T) {
 	if pending.Checkpoint != 5 || len(pending.Conclusions) != 1 || len(pending.Artifacts) != 1 || resultReason(&pending) != "waiting_input" {
 		t.Fatalf("analysis tail was not available before manual approval: %+v", pending)
 	}
-	if err := w.SendMessage("confirm"); err != nil {
+	if err := w.SendMessage(context.Background(), "confirm"); err != nil {
 		t.Fatal(err)
 	}
 	if client.calls.Load() != 1 || w.state.GetStatus() != StatusRunning {
@@ -468,7 +468,7 @@ func TestReportOfferRequiresAnalysisCompletion(t *testing.T) {
 			if finished || !isError || client.calls.Load() != 0 {
 				t.Fatal("stream end must not authorize report rendering or stop draining")
 			}
-			if err := w.SendMessage("confirm"); err == nil || client.calls.Load() != 0 {
+			if err := w.SendMessage(context.Background(), "confirm"); err == nil || client.calls.Load() != 0 {
 				t.Fatal("manual approval interrupted the analysis tail")
 			}
 			client.events = []dataagent.SSEEvent{eventWithCheckpoint("chat_finish", "chat", "", 3)}
@@ -477,7 +477,7 @@ func TestReportOfferRequiresAnalysisCompletion(t *testing.T) {
 			if client.calls.Load() != 0 || snap.Status != StatusWaitingInput || !snap.Requests[snap.PendingAsk].Ready || resultReason(&snap) != "waiting_input" {
 				t.Fatalf("report must wait for manual approval after analysis: %+v", snap)
 			}
-			if err := w.SendMessage("confirm"); err != nil || client.calls.Load() != 1 {
+			if err := w.SendMessage(context.Background(), "confirm"); err != nil || client.calls.Load() != 1 {
 				t.Fatalf("ready report manual approval failed: %v", err)
 			}
 		})
@@ -519,10 +519,10 @@ func TestReadyReportRestoresWithoutAutomaticSend(t *testing.T) {
 				if resultReason(&restored) != "waiting_input" {
 					t.Fatalf("restored report must request manual approval: %+v", restored)
 				}
-				if err := w.SendMessage("confirm"); err != nil || client.calls.Load() != 1 {
+				if err := w.SendMessage(context.Background(), "confirm"); err != nil || client.calls.Load() != 1 {
 					t.Fatalf("restored report manual approval failed: %v", err)
 				}
-			} else if err := w.SendMessage("confirm"); err == nil || client.calls.Load() != 0 {
+			} else if err := w.SendMessage(context.Background(), "confirm"); err == nil || client.calls.Load() != 0 {
 				t.Fatal("accepted or uncertain report was sent again")
 			}
 		})
@@ -551,7 +551,7 @@ func TestReportSendFailureAndManualMessageType(t *testing.T) {
 				t.Fatal("report sent without manual approval")
 			}
 			client.send = func() error { return tc.err }
-			err := w.SendMessage(tc.message)
+			err := w.SendMessage(context.Background(), tc.message)
 			if (err != nil) != (tc.err != nil) || client.calls.Load() != 1 || client.messages[0].MessageType != tc.wantType || w.state.Snapshot().Requests[key].Status != tc.wantStatus {
 				t.Fatalf("unexpected report delivery: err=%v state=%+v", err, w.state.Snapshot())
 			}
@@ -561,7 +561,7 @@ func TestReportSendFailureAndManualMessageType(t *testing.T) {
 				t.Fatal("old analysis completion ended or repeated report request")
 			}
 			if tc.wantStatus == SendUnknown {
-				if err := w.SendMessage("confirm"); err == nil || client.calls.Load() != 1 {
+				if err := w.SendMessage(context.Background(), "confirm"); err == nil || client.calls.Load() != 1 {
 					t.Fatal("unknown report delivery was resent")
 				}
 				client.events = []dataagent.SSEEvent{

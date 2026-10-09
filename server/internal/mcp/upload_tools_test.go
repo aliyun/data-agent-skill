@@ -25,12 +25,12 @@ type uploadClient struct {
 	cbID   string
 }
 
-func (c *uploadClient) GetFileUploadSignature(name string, size int64) (*dataagent.UploadSignature, error) {
+func (c *uploadClient) GetFileUploadSignature(_ context.Context, name string, size int64) (*dataagent.UploadSignature, error) {
 	c.sigName, c.sigSize = name, size
 	return c.sig, nil
 }
 
-func (c *uploadClient) FileUploadCallback(name, key string, size int64) (string, error) {
+func (c *uploadClient) FileUploadCallback(_ context.Context, name, key string, size int64) (string, error) {
 	c.cbName, c.cbKey, c.cbSize = name, key, size
 	return c.cbID, nil
 }

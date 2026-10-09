@@ -39,7 +39,7 @@ type Watcher struct {
 
 type watcherClient interface {
 	StreamSSE(ctx context.Context, agentID, sessionID string, checkpoint int) (<-chan dataagent.SSEEvent, error)
-	SendMessage(dataagent.SendMessageOpts) error
+	SendMessage(context.Context, dataagent.SendMessageOpts) error
 }
 
 // NewWatcher creates a new session watcher. The watcher does not start
@@ -141,7 +141,7 @@ func (w *Watcher) Stop() {
 
 var errWatcherExited = errors.New("session watcher has exited")
 
-func (w *Watcher) SendMessage(message string) error {
+func (w *Watcher) SendMessage(ctx context.Context, message string) error {
 	before := w.state.Snapshot()
 	if before.MessageStatus == SendSending || before.Requests[before.PendingAsk].Status == SendSending {
 		return fmt.Errorf("another message is being sent; inspect session status before retrying")
@@ -155,11 +155,11 @@ func (w *Watcher) SendMessage(message string) error {
 	if before.PendingAsk != snap.PendingAsk || before.SendGeneration != snap.SendGeneration {
 		return fmt.Errorf("session changed while waiting to send; inspect the current pending request")
 	}
-	return w.sendMessage(snap.PendingAsk, message, false)
+	return w.sendMessage(ctx, snap.PendingAsk, message, false)
 }
 
 // The caller holds opMu across event application and sending to bind replies to one ask.
-func (w *Watcher) sendMessage(key, message string, auto bool) error {
+func (w *Watcher) sendMessage(ctx context.Context, key, message string, auto bool) error {
 	snap := w.state.Snapshot()
 	if key == "" && strings.EqualFold(strings.TrimSpace(message), "confirm") {
 		return fmt.Errorf("no pending confirmation request; inspect session status before sending")
@@ -191,7 +191,7 @@ func (w *Watcher) sendMessage(key, message string, auto bool) error {
 	if snap.Requests[key].Kind == "ask_report_render" && strings.EqualFold(strings.TrimSpace(message), "confirm") {
 		messageType, message = "report", "绘制网页报告"
 	}
-	err := w.client.SendMessage(dataagent.SendMessageOpts{
+	err := w.client.SendMessage(ctx, dataagent.SendMessageOpts{
 		AgentID: snap.AgentID, SessionID: snap.SessionID, Message: message,
 		MessageType: messageType, Mode: snap.Mode, WorkspaceID: snap.WorkspaceID,
 	})
@@ -276,15 +276,15 @@ func (w *Watcher) streamOnce(ctx context.Context) (bool, bool) {
 				accum = append(accum, ev.Content...)
 			}
 			return
+		case "data":
+			if (ev.Category == "llm" || ev.Category == "tool_call_response") && contentCategory == ev.Category {
+				accum = []byte(ev.Content)
+				return
+			}
 		case "content_finish":
 			if len(accum) > 0 {
 				ev.Category, ev.Content = contentCategory, string(accum)
 				key, stable = w.eventKey(ev)
-			}
-			if ev.Category == "llm" && !w.state.EventApplied(key) {
-				w.state.MarkEventApplied(key)
-				w.state.AppendLLMFallback(ev.Content)
-				w.state.Persist(w.sessDir)
 			}
 			contentCategory, accum = "", nil
 		}
@@ -311,18 +311,22 @@ func (w *Watcher) streamOnce(ctx context.Context) (bool, bool) {
 			if legacyReplay && (ev.Checkpoint == nil || *ev.Checkpoint <= checkpoint) {
 				stable = false
 			}
-			return false, w.handleConfirmation(parsed, key, stable), false
+			return false, w.handleConfirmation(ctx, parsed, key, stable), false
 		}
 		w.state.MarkEventApplied(key)
 		if parsed.Action.IsTerminal() {
-			if contentCategory == "output_conclusion" && len(accum) > 0 {
+			if len(accum) > 0 {
 				w.handleParsedEvent(event.Parse("content_finish", contentCategory, string(accum), ""))
-			} else if contentCategory == "llm" {
-				w.state.AppendLLMFallback(string(accum))
 			}
 			snap := w.state.Snapshot()
-			if snap.PendingLLM != "" && !snap.HasTurnConclusion {
-				w.state.AddConclusion(snap.PendingLLM)
+			if !snap.HasTurnConclusion {
+				fallback := snap.PendingToolOutput
+				if fallback == "" {
+					fallback = event.Parse("content_finish", "llm", snap.PendingLLM, "").Content
+				}
+				if fallback != "" {
+					w.state.AddConclusion(fallback)
+				}
 			}
 			if parsed.Action == event.ActionCompleted && snap.Requests[snap.PendingAsk].Kind == "ask_report_render" {
 				// The report offer precedes the analysis tail; rendering starts a separate turn.
@@ -375,7 +379,7 @@ func (w *Watcher) eventKey(ev dataagent.SSEEvent) (string, bool) {
 	return fmt.Sprintf("%x", sha256.Sum256(payload)), stable
 }
 
-func (w *Watcher) handleConfirmation(pe event.ParsedEvent, key string, stable bool) bool {
+func (w *Watcher) handleConfirmation(ctx context.Context, pe event.ParsedEvent, key string, stable bool) bool {
 	request, fresh := w.state.RegisterAsk(ConfirmationRequest{Key: key, Kind: pe.Category, Content: pe.Content, Stable: stable})
 	if !fresh {
 		return false
@@ -387,7 +391,7 @@ func (w *Watcher) handleConfirmation(pe event.ParsedEvent, key string, stable bo
 	if pe.Action == event.ActionHumanInput || pe.Action == event.ActionConfirmReport || !w.state.GetAutoConfirm() || !request.Stable {
 		return false
 	}
-	if err := w.sendMessage(key, "confirm", true); err != nil {
+	if err := w.sendMessage(ctx, key, "confirm", true); err != nil {
 		log.Printf("[session:%s] confirmation request=%s delivery=%s", w.state.GetSessionID(), key[:12], w.state.Snapshot().Requests[key].Status)
 	}
 	return w.state.Snapshot().Requests[key].Status == SendAcknowledged
@@ -397,6 +401,14 @@ func (w *Watcher) handleParsedEvent(pe event.ParsedEvent) {
 	switch pe.Action {
 	case event.ActionStepProgress:
 		w.state.SetStepProgress(pe.StepCurrent, pe.StepTotal, pe.StepName)
+	case event.ActionFallback:
+		if pe.Content != "" {
+			if pe.Category == event.CatToolCallResponse {
+				w.state.AppendToolOutput(pe.Content)
+			} else {
+				w.state.AppendLLMFallback(pe.Content)
+			}
+		}
 	case event.ActionConclusion:
 		if pe.Content != "" {
 			w.state.UpsertConclusion(pe.DedupKey, pe.Content)
