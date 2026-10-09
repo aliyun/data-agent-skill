@@ -50,6 +50,7 @@ type SendMessageOpts struct {
 	AgentID     string
 	SessionID   string
 	Message     string
+	MessageType string
 	DataSource  *DataSource
 	WorkspaceID string
 	Mode        string

@@ -11,56 +11,57 @@ package event
 
 // SSE event types emitted by the Data Agent server.
 const (
-	EventChatStart    = "chat_start"
-	EventContentStart = "content_start"
-	EventDelta        = "delta"
-	EventData         = "data"
+	EventChatStart     = "chat_start"
+	EventContentStart  = "content_start"
+	EventDelta         = "delta"
+	EventData          = "data"
 	EventContentFinish = "content_finish"
-	EventStatusChange = "status_change"
-	EventChatFinish   = "chat_finish"
-	EventChatCanceled = "chat_canceled"
-	EventSSEFinish    = "SSE_FINISH"
-	EventSSEFailure   = "SSE_FAILURE"
-	EventSSEVersion   = "SSE_VERSION"
-	EventHeartbeat    = "HEARTBEAT"
-	EventStream       = "STREAM"
+	EventStatusChange  = "status_change"
+	EventChatFinish    = "chat_finish"
+	EventChatCanceled  = "chat_canceled"
+	EventSSEFinish     = "SSE_FINISH"
+	EventSSEFailure    = "SSE_FAILURE"
+	EventSSEVersion    = "SSE_VERSION"
+	EventHeartbeat     = "HEARTBEAT"
+	EventStream        = "STREAM"
 )
 
 // Category constants for the SSE event category field.
 // Categories qualify the event_type and carry domain-specific semantics.
 const (
-	CatAskPlan            = "ask_plan"
-	CatAskSQL             = "ask_sql"
-	CatAskReportRender    = "ask_report_render"
-	CatAskHuman           = "ask_human"
-	CatChat               = "chat"
-	CatPlan               = "plan"
-	CatOutputConclusion   = "output_conclusion"
-	CatToolCallResponse   = "tool_call_response"
-	CatToolCallChoices    = "tool_call_choices"
-	CatRequestDatasource  = "request_datasource"
+	CatAskPlan             = "ask_plan"
+	CatAskSQL              = "ask_sql"
+	CatAskReportRender     = "ask_report_render"
+	CatAskHuman            = "ask_human"
+	CatChat                = "chat"
+	CatPlan                = "plan"
+	CatOutputConclusion    = "output_conclusion"
+	CatToolCallResponse    = "tool_call_response"
+	CatToolCallChoices     = "tool_call_choices"
+	CatRequestDatasource   = "request_datasource"
 	CatRecommendedQuestion = "recommended_question"
-	CatLLM                = "llm"
-	CatThink              = "think"
+	CatLLM                 = "llm"
+	CatThink               = "think"
 )
 
 // Action tells the session watcher what to do with a parsed event.
 type Action int
 
 const (
-	ActionNone          Action = iota // Ignore; no action needed
-	ActionConfirmPlan                 // Server wants plan confirmation
-	ActionConfirmSQL                  // Server wants SQL execution confirmation
-	ActionConfirmReport               // Server wants report render confirmation
-	ActionHumanInput                  // Server needs free-form human input
-	ActionStepProgress                // Plan step progress update
-	ActionConclusion                  // Analysis conclusion / result
-	ActionCompleted                   // Stream completed normally
-	ActionError                       // Stream error
-	ActionCanceled                    // Stream canceled
-	ActionRecommendedQuestion         // Server sent recommended follow-up questions
-	ActionReportGenerated             // jsx_report or mission_report generated
-	ActionArtifact                    // A generated file artifact finished uploading
+	ActionNone                Action = iota // Ignore; no action needed
+	ActionConfirmPlan                       // Server wants plan confirmation
+	ActionConfirmSQL                        // Server wants SQL execution confirmation
+	ActionConfirmReport                     // Server wants report render confirmation
+	ActionHumanInput                        // Server needs free-form human input
+	ActionStepProgress                      // Plan step progress update
+	ActionConclusion                        // Analysis conclusion / result
+	ActionCompleted                         // Current turn completed normally
+	ActionError                             // Stream error
+	ActionCanceled                          // Stream canceled
+	ActionRecommendedQuestion               // Server sent recommended follow-up questions
+	ActionReportGenerated                   // jsx_report or mission_report generated
+	ActionArtifact                          // A generated file artifact finished uploading
+	ActionStreamEnded
 )
 
 // String returns a human-readable name for the action.
@@ -92,6 +93,8 @@ func (a Action) String() string {
 		return "report_generated"
 	case ActionArtifact:
 		return "artifact"
+	case ActionStreamEnded:
+		return "stream_ended"
 	default:
 		return "unknown"
 	}
@@ -103,8 +106,7 @@ func (a Action) NeedsConfirmation() bool {
 	return a == ActionConfirmPlan || a == ActionConfirmSQL || a == ActionConfirmReport || a == ActionHumanInput
 }
 
-// IsTerminal returns true if this action means the SSE stream has ended and
-// no further events should be expected.
+// IsTerminal reports turn termination, not a stream ending while waiting for input.
 func (a Action) IsTerminal() bool {
 	return a == ActionCompleted || a == ActionError || a == ActionCanceled
 }

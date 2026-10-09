@@ -64,25 +64,48 @@ func (m *Manager) doHousekeeping() {
 // reconcileWithServer checks the server-side session status and updates the
 // local state if the server reports the session as finished.
 func (m *Manager) reconcileWithServer(sessionID string, entry *watcherEntry) {
-	info, err := m.client.DescribeSession(sessionID, entry.state.GetWorkspaceID())
+	before := entry.state.Snapshot()
+	info, err := m.client.DescribeSession(sessionID, before.WorkspaceID)
 	if err != nil {
 		log.Printf("[housekeeping] DescribeSession(%s) error: %v", sessionID, err)
 		return
 	}
-
+	if info == nil {
+		return
+	}
 	serverStatus := info.SessionStatus
 	if serverStatus == "" {
 		serverStatus = info.AgentStatus
 	}
-
-	switch serverStatus {
-	case "IDLE", "STOPPED", "FINISHED", "COMPLETED":
-		localStatus := entry.state.GetStatus()
-		if localStatus == StatusRunning || localStatus == StatusWaitingInput {
-			log.Printf("[housekeeping] session %s: server=%s, local=%s -> marking completed",
-				sessionID, serverStatus, localStatus)
-			entry.state.SetCompleted()
-			entry.state.Persist(m.sessDir)
-		}
+	// IDLE also means waiting for confirmation; only explicit completion is terminal.
+	if serverStatus != "STOPPED" && serverStatus != "FINISHED" && serverStatus != "COMPLETED" {
+		return
+	}
+	operation := m.sessionOperation(sessionID)
+	operation.Lock()
+	defer operation.Unlock()
+	m.mu.RLock()
+	current := m.watchers[sessionID]
+	m.mu.RUnlock()
+	if current != entry {
+		return
+	}
+	entry.watcher.opMu.Lock()
+	snap := entry.state.Snapshot()
+	if !snap.UpdatedAt.Equal(before.UpdatedAt) || (snap.Status != StatusRunning && snap.Status != StatusWaitingInput) {
+		entry.watcher.opMu.Unlock()
+		return
+	}
+	if snap.AwaitingTurn || snap.Requests[snap.PendingAsk].Kind == "ask_report_render" {
+		entry.watcher.opMu.Unlock()
+		return
+	}
+	entry.state.SetCompleted()
+	entry.state.Persist(m.sessDir)
+	entry.watcher.exited = true
+	entry.cancel()
+	entry.watcher.opMu.Unlock()
+	if entry.done != nil {
+		<-entry.done
 	}
 }

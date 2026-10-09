@@ -10,7 +10,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // SSEEvent represents a single Server-Sent Events event from Data Agent.
@@ -58,72 +57,23 @@ func (c *SSEClient) credential() *Credential {
 	return c.cred
 }
 
-// StreamEvents connects to the Data Agent SSE endpoint and yields events via a channel.
-// It supports checkpoint-based resumption and auto-reconnect with exponential backoff
-// (2s, 4s, 8s ... capped at 30s, max 3 retries) for network errors.
+// Reconnection belongs to the watcher, whose cursor tracks applied rather than buffered events.
 func (c *SSEClient) StreamEvents(ctx context.Context, agentID, sessionID string, checkpoint int) (<-chan SSEEvent, error) {
 	ch := make(chan SSEEvent, 64)
-
 	go func() {
 		defer close(ch)
-
-		currentCheckpoint := checkpoint
-		retryCount := 0
-		const maxRetries = 3
-
-		for {
-			finished, err := c.doStream(ctx, agentID, sessionID, currentCheckpoint, ch, &currentCheckpoint)
-			if finished || err == nil {
-				return
-			}
-
-			// Check if the context was cancelled.
-			if ctx.Err() != nil {
-				return
-			}
-
-			// Retry on network errors.
-			retryCount++
-			if retryCount > maxRetries {
-				// Send an error event so the caller knows.
-				select {
-				case ch <- SSEEvent{
-					EventType: "ERROR",
-					Data:      map[string]interface{}{"error": err.Error()},
-					Content:   fmt.Sprintf("SSE connection failed after %d retries: %v", maxRetries, err),
-				}:
-				case <-ctx.Done():
-				}
-				return
-			}
-
-			wait := time.Duration(1<<uint(retryCount)) * time.Second // 2s, 4s, 8s
-			if wait > 30*time.Second {
-				wait = 30 * time.Second
-			}
-
-			select {
-			case <-time.After(wait):
-				// Continue with retry using currentCheckpoint.
-			case <-ctx.Done():
-				return
-			}
+		if _, err := c.doStream(ctx, agentID, sessionID, checkpoint, ch); err != nil && ctx.Err() == nil {
+			log.Printf("[sse:%s] connection ended: %v", sessionID, err)
 		}
 	}()
-
 	return ch, nil
 }
 
-// doStream performs a single SSE connection attempt. It writes events to ch and
-// updates lastCheckpoint as checkpoints arrive. It returns (finished, error)
-// where finished=true means the stream completed normally (SSE_FINISH received
-// or clean EOF).
 func (c *SSEClient) doStream(
 	ctx context.Context,
 	agentID, sessionID string,
 	checkpoint int,
 	ch chan<- SSEEvent,
-	lastCheckpoint *int,
 ) (bool, error) {
 	params := map[string]string{
 		"AgentId":   agentID,
@@ -250,10 +200,6 @@ func (c *SSEClient) doStream(
 			}
 
 			event := parseSSEEvent(etype, dataStr)
-
-			if event.Checkpoint != nil {
-				*lastCheckpoint = *event.Checkpoint
-			}
 
 			select {
 			case ch <- event:

@@ -1,19 +1,21 @@
 package event
 
 import (
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
 
 func TestSSEFinish(t *testing.T) {
 	r := Parse(EventSSEFinish, "", "", "")
-	assertAction(t, r, ActionCompleted, "SSE_FINISH -> ActionCompleted")
-	if !r.Action.IsTerminal() {
-		t.Fatal("ActionCompleted should be terminal")
+	assertAction(t, r, ActionStreamEnded, "SSE_FINISH -> ActionStreamEnded")
+	if r.Action.IsTerminal() {
+		t.Fatal("ActionStreamEnded should not be terminal")
 	}
 	if r.Action.NeedsConfirmation() {
-		t.Fatal("ActionCompleted should not need confirmation")
+		t.Fatal("ActionStreamEnded should not need confirmation")
 	}
 }
 
@@ -122,19 +124,35 @@ func TestChatFinishAskReportRender(t *testing.T) {
 }
 
 func TestChatFinishAskHuman(t *testing.T) {
-	r := Parse(EventChatFinish, CatAskHuman, "Which database?", "text")
-	assertAction(t, r, ActionHumanInput, "chat_finish/ask_human -> ActionHumanInput")
-	if r.Content != "Which database?" {
-		t.Fatalf("expected question text, got %q", r.Content)
+	cases := []struct {
+		name, content, contentType string
+	}{
+		{"question", "Which database?", "text"},
+		{"plan", `{"result_type":"plan","plans":[{"plan":{"steps":[]}}]}`, "json"},
+		{"sql", `{"sql":"SELECT 1"}`, "json"},
+		{"report", `{"report":"data"}`, "json"},
+		{"empty", "", ""},
 	}
-	if !r.Action.NeedsConfirmation() {
-		t.Fatal("ActionHumanInput should need confirmation")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := Parse(EventChatFinish, CatAskHuman, tc.content, tc.contentType)
+			assertAction(t, r, ActionHumanInput, "chat_finish/ask_human -> ActionHumanInput")
+			if r.Content != tc.content {
+				t.Fatalf("expected question %q, got %q", tc.content, r.Content)
+			}
+			if !r.Action.NeedsConfirmation() {
+				t.Fatal("ActionHumanInput should need confirmation")
+			}
+		})
 	}
 }
 
 func TestChatFinishChat(t *testing.T) {
 	r := Parse(EventChatFinish, CatChat, "", "")
 	assertAction(t, r, ActionCompleted, "chat_finish/chat -> ActionCompleted")
+	if !r.Action.IsTerminal() {
+		t.Fatal("ActionCompleted should be terminal")
+	}
 }
 
 func TestDataPlanProgress(t *testing.T) {
@@ -184,10 +202,7 @@ func TestContentFinishOutputConclusion(t *testing.T) {
 func TestContentFinishToolCallResponsePlan(t *testing.T) {
 	tcrPlan := `{"result_type":"plan","result":"{\"plans\":[{\"plan\":{\"steps\":[{\"order\":1,\"name\":\"X\"}]}}]}"}`
 	r := Parse(EventContentFinish, CatToolCallResponse, tcrPlan, "json")
-	assertAction(t, r, ActionConfirmPlan, "content_finish/tool_call_response(plan) -> ActionConfirmPlan")
-	if r.StepTotal != 1 {
-		t.Fatalf("expected 1 inner plan step, got %d", r.StepTotal)
-	}
+	assertPlanPreview(t, r, tcrPlan, 1)
 }
 
 func TestContentFinishToolCallResponseOther(t *testing.T) {
@@ -202,31 +217,140 @@ func TestContentFinishToolCallResponseInvalidJSON(t *testing.T) {
 }
 
 func TestDataAskReportRender(t *testing.T) {
-	r := Parse(EventData, CatAskReportRender, `{"report":"data"}`, "json")
-	assertAction(t, r, ActionConfirmReport, "data/ask_report_render -> ActionConfirmReport")
+	for _, content := range []string{`{"report":"data"}`, "Report preview", ""} {
+		r := Parse(EventData, CatAskReportRender, content, "json")
+		assertAction(t, r, ActionNone, "data/ask_report_render -> ActionNone")
+		if r.Content != content {
+			t.Fatalf("preview content = %q, want %q", r.Content, content)
+		}
+	}
 }
 
 func TestDataAskPlan(t *testing.T) {
 	planJSON := `{"plan_id":"xyz","plans":[{"plan":{"steps":[{"order":1,"name":"Only step"}]}}]}`
 	r := Parse(EventData, CatAskPlan, planJSON, "json")
-	assertAction(t, r, ActionConfirmPlan, "data/ask_plan -> ActionConfirmPlan")
-	if r.StepTotal != 1 {
-		t.Fatalf("expected 1 step, got %d", r.StepTotal)
+	assertPlanPreview(t, r, planJSON, 1)
+}
+
+func TestProtocolMatrix(t *testing.T) {
+	cases := []struct {
+		category, content               string
+		data, contentFinish, chatFinish Action
+	}{
+		{CatAskPlan, `{"plans":[{"plan":{"steps":[{"order":1,"name":"Preview"}]}}]}`, ActionStepProgress, ActionNone, ActionConfirmPlan},
+		{CatAskSQL, `{"sql":"SELECT 1"}`, ActionNone, ActionNone, ActionConfirmSQL},
+		{CatAskReportRender, `{"report":"preview"}`, ActionNone, ActionNone, ActionConfirmReport},
+		{CatAskHuman, `{"result_type":"plan","sql":"SELECT 1"}`, ActionNone, ActionNone, ActionHumanInput},
+		{CatToolCallResponse, `{"result_type":"plan","result":{"plans":[{"plan":{"steps":[]}}]}}`, ActionNone, ActionStepProgress, ActionNone},
+		{CatPlan, `{"current_step":1,"plans":[{"plan":{"steps":[{"order":1,"name":"Query"}]}}]}`, ActionStepProgress, ActionNone, ActionNone},
+		{CatChat, "", ActionNone, ActionNone, ActionCompleted},
+		{CatOutputConclusion, `{"mission_idx":0,"objective_order":1,"result":"Conclusion"}`, ActionConclusion, ActionConclusion, ActionNone},
+		{"task_finish", `[{"title":"Title","summary":"Summary","data":[{"value":1}]}]`, ActionConclusion, ActionNone, ActionNone},
+		{"unknown", `{"result_type":"plan"}`, ActionNone, ActionNone, ActionNone},
+	}
+	eventTypes := []string{
+		EventChatStart, EventContentStart, EventDelta, EventData, EventContentFinish,
+		EventStatusChange, EventChatFinish, EventChatCanceled, EventSSEFinish,
+		EventSSEFailure, EventSSEVersion, EventHeartbeat, EventStream, "unknown",
+	}
+	for _, tc := range cases {
+		for _, eventType := range eventTypes {
+			t.Run(eventType+"/"+tc.category, func(t *testing.T) {
+				want := ActionNone
+				switch eventType {
+				case EventData:
+					want = tc.data
+				case EventContentFinish:
+					want = tc.contentFinish
+				case EventChatFinish:
+					want = tc.chatFinish
+				case EventChatCanceled:
+					want = ActionCanceled
+				case EventSSEFinish:
+					want = ActionStreamEnded
+				case EventSSEFailure:
+					want = ActionError
+				}
+				r := Parse(eventType, tc.category, tc.content, "json")
+				assertAction(t, r, want, "protocol action")
+				if r.Category != tc.category {
+					t.Fatalf("category = %q, want %q", r.Category, tc.category)
+				}
+				isAsk := tc.category == CatAskPlan || tc.category == CatAskSQL ||
+					tc.category == CatAskReportRender || tc.category == CatAskHuman
+				wantConfirmation := eventType == EventChatFinish && isAsk
+				if r.Action.NeedsConfirmation() != wantConfirmation {
+					t.Fatalf("NeedsConfirmation() = %v, want %v", r.Action.NeedsConfirmation(), wantConfirmation)
+				}
+				wantTerminal := eventType == EventSSEFailure || eventType == EventChatCanceled ||
+					(eventType == EventChatFinish && tc.category == CatChat)
+				if r.Action.IsTerminal() != wantTerminal {
+					t.Fatalf("IsTerminal() = %v, want %v", r.Action.IsTerminal(), wantTerminal)
+				}
+			})
+		}
+	}
+}
+
+func TestPlanPreviewFallbacks(t *testing.T) {
+	cases := []struct {
+		name, eventType, category, content string
+	}{
+		{"plan_text", EventData, CatAskPlan, "Plan preview"},
+		{"plan_empty", EventData, CatAskPlan, ""},
+		{"plan_invalid_json", EventData, CatAskPlan, `{"plans":`},
+		{"plan_null", EventData, CatAskPlan, "null"},
+		{"plan_no_steps", EventData, CatAskPlan, `{"plan_id":"preview"}`},
+		{"tool_result_text", EventContentFinish, CatToolCallResponse, `{"result_type":"plan","result":"Plan preview"}`},
+		{"tool_result_null", EventContentFinish, CatToolCallResponse, `{"result_type":"plan","result":null}`},
+		{"tool_result_number", EventContentFinish, CatToolCallResponse, `{"result_type":"plan","result":1}`},
+		{"tool_result_no_steps", EventContentFinish, CatToolCallResponse, `{"result_type":"plan","result":{"plan_id":"preview"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := Parse(tc.eventType, tc.category, tc.content, "json")
+			assertPlanPreview(t, r, tc.content, 0)
+			if tc.category == CatAskPlan {
+				confirmation := Parse(EventChatFinish, tc.category, tc.content, "json")
+				assertAction(t, confirmation, ActionConfirmPlan, "chat_finish/ask_plan fallback")
+				if confirmation.Content != tc.content {
+					t.Fatalf("confirmation content = %q, want %q", confirmation.Content, tc.content)
+				}
+			}
+		})
+	}
+}
+
+func TestActionValuesStable(t *testing.T) {
+	actions := []Action{
+		ActionNone, ActionConfirmPlan, ActionConfirmSQL, ActionConfirmReport,
+		ActionHumanInput, ActionStepProgress, ActionConclusion, ActionCompleted,
+		ActionError, ActionCanceled, ActionRecommendedQuestion, ActionReportGenerated,
+		ActionArtifact, ActionStreamEnded,
+	}
+	for want, action := range actions {
+		if int(action) != want {
+			t.Fatalf("%s = %d, want %d", action, action, want)
+		}
 	}
 }
 
 func TestActionString(t *testing.T) {
 	cases := map[Action]string{
-		ActionNone:          "none",
-		ActionConfirmPlan:   "confirm_plan",
-		ActionConfirmSQL:    "confirm_sql",
-		ActionConfirmReport: "confirm_report",
-		ActionHumanInput:    "human_input",
-		ActionStepProgress:  "step_progress",
-		ActionConclusion:    "conclusion",
-		ActionCompleted:     "completed",
-		ActionError:         "error",
-		ActionCanceled:      "canceled",
+		ActionNone:                "none",
+		ActionConfirmPlan:         "confirm_plan",
+		ActionConfirmSQL:          "confirm_sql",
+		ActionConfirmReport:       "confirm_report",
+		ActionHumanInput:          "human_input",
+		ActionStepProgress:        "step_progress",
+		ActionConclusion:          "conclusion",
+		ActionCompleted:           "completed",
+		ActionError:               "error",
+		ActionCanceled:            "canceled",
+		ActionRecommendedQuestion: "recommended_question",
+		ActionReportGenerated:     "report_generated",
+		ActionArtifact:            "artifact",
+		ActionStreamEnded:         "stream_ended",
 	}
 	for action, expected := range cases {
 		if action.String() != expected {
@@ -259,21 +383,19 @@ func TestToolCallResponsePlanWithMapResult(t *testing.T) {
 	// result as an object (not string)
 	tcrPlan := `{"result_type":"plan","result":{"plans":[{"plan":{"steps":[{"order":1,"name":"A"},{"order":2,"name":"B"}]}}]}}`
 	r := Parse(EventContentFinish, CatToolCallResponse, tcrPlan, "json")
-	assertAction(t, r, ActionConfirmPlan, "tool_call_response plan with map result")
-	if r.StepTotal != 2 {
-		t.Fatalf("expected 2 steps from map result, got %d", r.StepTotal)
-	}
+	assertPlanPreview(t, r, tcrPlan, 2)
 }
 
 func TestToolCallResponsePlanNoResult(t *testing.T) {
 	tcrPlan := `{"result_type":"plan"}`
 	r := Parse(EventContentFinish, CatToolCallResponse, tcrPlan, "json")
-	assertAction(t, r, ActionConfirmPlan, "tool_call_response plan with no result field")
+	assertPlanPreview(t, r, tcrPlan, 0)
 }
 
 func TestNeedsConfirmationExhaustive(t *testing.T) {
 	confirm := []Action{ActionConfirmPlan, ActionConfirmSQL, ActionConfirmReport, ActionHumanInput}
-	noConfirm := []Action{ActionNone, ActionStepProgress, ActionConclusion, ActionCompleted, ActionError, ActionCanceled}
+	noConfirm := []Action{ActionNone, ActionStepProgress, ActionConclusion, ActionCompleted, ActionError, ActionCanceled,
+		ActionRecommendedQuestion, ActionReportGenerated, ActionArtifact, ActionStreamEnded}
 
 	for _, a := range confirm {
 		if !a.NeedsConfirmation() {
@@ -289,7 +411,8 @@ func TestNeedsConfirmationExhaustive(t *testing.T) {
 
 func TestIsTerminalExhaustive(t *testing.T) {
 	terminal := []Action{ActionCompleted, ActionError, ActionCanceled}
-	nonTerminal := []Action{ActionNone, ActionConfirmPlan, ActionConfirmSQL, ActionConfirmReport, ActionHumanInput, ActionStepProgress, ActionConclusion}
+	nonTerminal := []Action{ActionNone, ActionConfirmPlan, ActionConfirmSQL, ActionConfirmReport, ActionHumanInput, ActionStepProgress, ActionConclusion,
+		ActionRecommendedQuestion, ActionReportGenerated, ActionArtifact, ActionStreamEnded}
 
 	for _, a := range terminal {
 		if !a.IsTerminal() {
@@ -418,6 +541,27 @@ func TestExtractBase64Images_MixedRealAndMocked(t *testing.T) {
 	}
 	if images[0].Alt != "real" {
 		t.Errorf("expected alt 'real', got %q", images[0].Alt)
+	}
+}
+
+func assertPlanPreview(t *testing.T, pe ParsedEvent, content string, stepTotal int) {
+	t.Helper()
+	assertAction(t, pe, ActionStepProgress, "plan preview")
+	if pe.Action.NeedsConfirmation() || pe.Action.IsTerminal() {
+		t.Fatal("plan preview must not confirm or terminate the turn")
+	}
+	if pe.Content != content {
+		t.Fatalf("preview content = %q, want %q", pe.Content, content)
+	}
+	if pe.StepTotal != stepTotal {
+		t.Fatalf("preview step total = %d, want %d", pe.StepTotal, stepTotal)
+	}
+	var wantRaw map[string]interface{}
+	if err := json.Unmarshal([]byte(content), &wantRaw); err != nil {
+		wantRaw = nil
+	}
+	if !reflect.DeepEqual(pe.RawData, wantRaw) {
+		t.Fatalf("preview raw data = %#v, want %#v", pe.RawData, wantRaw)
 	}
 }
 

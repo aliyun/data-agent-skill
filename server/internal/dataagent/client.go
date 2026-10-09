@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -297,11 +298,15 @@ func (c *Client) DescribeSession(sessionID string, workspaceID ...string) (*Sess
 
 // SendMessage sends a chat message to an active Data Agent session.
 func (c *Client) SendMessage(opts SendMessageOpts) error {
+	messageType := opts.MessageType
+	if messageType == "" {
+		messageType = "primary"
+	}
 	params := map[string]string{
 		"AgentId":     opts.AgentID,
 		"SessionId":   opts.SessionID,
 		"Message":     opts.Message,
-		"MessageType": "primary",
+		"MessageType": messageType,
 	}
 	c.setDmsUnit(params)
 	if opts.WorkspaceID != "" {
@@ -1143,6 +1148,138 @@ func (c *Client) StreamSSE(ctx context.Context, agentID, sessionID string, check
 
 // ---------- internal HTTP helpers ----------
 
+type APIError struct {
+	Code       string
+	Message    string
+	RequestID  string
+	StatusCode int
+
+	definiteRejection bool
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("API error (HTTP %d, code: %s, request-id: %s): %s",
+		e.StatusCode, e.Code, e.RequestID, e.Message)
+}
+
+func IsDefiniteRejection(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr == nil || apiErr.StatusCode >= 500 {
+		return false
+	}
+	if apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+		return true
+	}
+	return apiErr.StatusCode >= 200 && apiErr.StatusCode < 300 && apiErr.definiteRejection
+}
+
+func isSuccessCode(code string) bool {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "", "success", "ok", "200", "0":
+		return true
+	default:
+		return false
+	}
+}
+
+func firstFailureCode(body map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if code := firstStr(body, key); !isSuccessCode(code) {
+			return code
+		}
+	}
+	return ""
+}
+
+func responseAPIError(body map[string]interface{}, statusCode int, requestID string, topLevel bool) *APIError {
+	bodyRequestID := firstStr(body, "RequestId", "requestId", "request_id", "RequestID")
+	if bodyRequestID != "" {
+		requestID = bodyRequestID
+	}
+	failed, succeeded := false, false
+	for _, key := range []string{"Success", "success"} {
+		if success, ok := body[key].(bool); ok {
+			failed = failed || !success
+			succeeded = succeeded || success
+		}
+	}
+	errorCode := firstFailureCode(body, "error_code", "ErrorCode", "errorCode")
+	code := firstFailureCode(body, "Code", "code")
+	message := firstStr(body, "error_message", "ErrorMessage", "errorMessage", "Message", "message", "msg")
+	httpCode := int(firstInt64(body, "HttpStatusCode", "httpStatusCode"))
+	standardError := code != "" && message != "" && !succeeded &&
+		(topLevel || bodyRequestID != "" || (jsonStr(body, "Code") != "" && jsonStr(body, "Message") != ""))
+	var apiErr *APIError
+	if errorCode != "" || failed || httpCode >= 400 || standardError {
+		errorStatus := statusCode
+		if statusCode == http.StatusOK && httpCode >= 400 {
+			errorStatus = httpCode
+		}
+		if errorCode != "" {
+			code = errorCode
+		}
+		if code == "" {
+			code = firstStr(body, "error_code", "ErrorCode", "errorCode", "Code", "code")
+		}
+		if message == "" {
+			message = "API request failed"
+		}
+		apiErr = &APIError{
+			Code: code, Message: message, RequestID: requestID, StatusCode: errorStatus,
+			definiteRejection: true,
+		}
+	}
+	for _, key := range []string{"Data", "data"} {
+		if inner := jsonObj(body, key); inner != nil {
+			if innerErr := responseAPIError(inner, statusCode, requestID, false); innerErr != nil {
+				if apiErr == nil || (apiErr.StatusCode < 500 && innerErr.StatusCode >= 500) {
+					apiErr = innerErr
+				}
+			}
+		}
+	}
+	return apiErr
+}
+
+func readAPIResponse(action string, resp *http.Response) (map[string]interface{}, error) {
+	requestID := apiKeyRequestID(nil, resp)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response for %s (request-id: %s): %w", action, requestID, err)
+	}
+
+	var result map[string]interface{}
+	parseErr := json.Unmarshal(respBody, &result)
+	if parseErr != nil {
+		result = nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		apiErr := responseAPIError(result, resp.StatusCode, requestID, true)
+		if apiErr == nil {
+			apiErr = &APIError{
+				Code:       firstStr(result, "error_code", "ErrorCode", "errorCode", "Code", "code"),
+				Message:    firstStr(result, "error_message", "ErrorMessage", "errorMessage", "Message", "message", "msg"),
+				RequestID:  apiKeyRequestID(result, resp),
+				StatusCode: resp.StatusCode,
+			}
+			if apiErr.Message == "" {
+				apiErr.Message = http.StatusText(resp.StatusCode)
+			}
+		}
+		return nil, fmt.Errorf("%s returned HTTP %d: %w", action, resp.StatusCode, apiErr)
+	}
+	if parseErr != nil {
+		return nil, fmt.Errorf("parse JSON for %s (request-id: %s): %w", action, requestID, parseErr)
+	}
+	if result == nil {
+		return nil, fmt.Errorf("parse JSON for %s (request-id: %s): expected an object", action, requestID)
+	}
+	if apiErr := responseAPIError(result, resp.StatusCode, requestID, true); apiErr != nil {
+		return nil, fmt.Errorf("%s failed: %w", action, apiErr)
+	}
+	return result, nil
+}
+
 // callAPI makes a signed POST to the Data Agent endpoint (version 2025-04-14).
 func (c *Client) callAPI(host, action, version string, params map[string]string) (map[string]interface{}, error) {
 	if c.credential().IsAPIKey() {
@@ -1257,37 +1394,9 @@ func (c *Client) doAPIKeyPost(action, version string, params map[string]string) 
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	result, err := readAPIResponse(action, resp)
 	if err != nil {
-		return nil, fmt.Errorf("read response for %s: %w", action, err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf(
-			"%s returned HTTP %d (request-id: %s): %s",
-			action, resp.StatusCode, resp.Header.Get("x-acs-request-id"), truncate(string(respBody), 500),
-		)
-	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("parse JSON for %s: %w", action, err)
-	}
-
-	// The API Key gateway returns errors with HTTP 200 but success=false (or a
-	// raw {HttpStatusCode, Code, Message} body on the stream endpoint). Surface
-	// these as errors so callers don't silently see empty results. Carry the
-	// gateway requestId so backend failures can be traced in support tickets.
-	if success, ok := result["success"].(bool); ok && !success {
-		code := firstStr(result, "code", "Code")
-		msg := firstStr(result, "msg", "Message", "message")
-		return nil, fmt.Errorf("%s failed (%s, request-id: %s): %s",
-			action, code, apiKeyRequestID(result, resp), msg)
-	}
-	if httpCode := firstInt64(result, "HttpStatusCode", "httpStatusCode"); httpCode >= 400 {
-		msg := firstStr(result, "Message", "message", "msg")
-		return nil, fmt.Errorf("%s failed (HTTP %d, request-id: %s): %s",
-			action, httpCode, apiKeyRequestID(result, resp), msg)
+		return nil, err
 	}
 
 	// The API Key gateway wraps successful responses in an envelope:
@@ -1299,6 +1408,9 @@ func (c *Client) doAPIKeyPost(action, version string, params map[string]string) 
 	// which the downstream parsers already handle via their data=body fallback.
 	if _, hasCode := result["code"]; hasCode {
 		if inner, ok := result["data"].(map[string]interface{}); ok {
+			if apiErr := responseAPIError(inner, resp.StatusCode, apiKeyRequestID(result, resp), false); apiErr != nil {
+				return nil, fmt.Errorf("%s failed: %w", action, apiErr)
+			}
 			return inner, nil
 		}
 	}
@@ -1339,25 +1451,7 @@ func (c *Client) doSignedPostVersioned(host, action, version string, params map[
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response for %s: %w", action, err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		requestID := resp.Header.Get("x-acs-request-id")
-		return nil, fmt.Errorf(
-			"%s returned HTTP %d (request-id: %s): %s",
-			action, resp.StatusCode, requestID, truncate(string(respBody), 500),
-		)
-	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("parse JSON for %s: %w", action, err)
-	}
-
-	return result, nil
+	return readAPIResponse(action, resp)
 }
 
 // ---------- signing helpers with version support ----------
@@ -1536,10 +1630,13 @@ func truncate(s string, maxLen int) string {
 // response for error attribution: the envelope carries requestId in the body;
 // fall back to the x-acs-request-id header.
 func apiKeyRequestID(body map[string]interface{}, resp *http.Response) string {
-	if id := firstStr(body, "requestId", "RequestId"); id != "" {
+	if id := firstStr(body, "requestId", "RequestId", "request_id", "RequestID"); id != "" {
 		return id
 	}
-	return resp.Header.Get("x-acs-request-id")
+	if id := resp.Header.Get("x-acs-request-id"); id != "" {
+		return id
+	}
+	return resp.Header.Get("x-request-id")
 }
 
 // firstStr tries multiple keys and returns the first non-empty string value.

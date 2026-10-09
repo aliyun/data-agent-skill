@@ -25,7 +25,7 @@ func Parse(eventType, category, content, contentType string) ParsedEvent {
 	// ----- terminal / lifecycle events -----
 
 	case EventSSEFinish:
-		return ParsedEvent{Action: ActionCompleted, Category: category}
+		return ParsedEvent{Action: ActionStreamEnded, Category: category}
 
 	case EventSSEFailure:
 		msg := content
@@ -106,7 +106,7 @@ func parseDataEvent(category, content, contentType string) ParsedEvent {
 
 	case CatAskReportRender:
 		return ParsedEvent{
-			Action:   ActionConfirmReport,
+			Action:   ActionNone,
 			Category: category,
 			Content:  content,
 		}
@@ -225,7 +225,9 @@ func parseChatFinish(category, content, contentType string) ParsedEvent {
 		return ParsedEvent{Action: ActionCompleted, Category: category}
 
 	case CatAskPlan:
-		return parsePlanContent(content, category)
+		pe := parsePlanContent(content, category)
+		pe.Action = ActionConfirmPlan
+		return pe
 
 	case CatAskSQL:
 		return parseSQLContent(content, category)
@@ -253,15 +255,6 @@ func parseChatFinish(category, content, contentType string) ParsedEvent {
 // Domain-specific parsers
 // ---------------------------------------------------------------------------
 
-// parsePlanContent extracts plan steps from the content JSON and returns
-// an ActionConfirmPlan event.
-//
-// Expected JSON shape:
-//
-//	{
-//	  "plan_id": "...",
-//	  "plans": [{ "plan": { "steps": [{ "order":1, "name":"...", ... }] } }]
-//	}
 // parseTaskFinish extracts insights from task_finish events (ASK_DATA mode).
 // Wire protocol (mirrors @dmsfe/data-agent-sdk parseTaskFinishContent):
 //   - content_type "str" (or empty): content is a markdown report — keep it whole.
@@ -375,14 +368,14 @@ func parsePlanContent(content, category string) ParsedEvent {
 	parsed, ok := tryParseJSON(content)
 	if !ok {
 		return ParsedEvent{
-			Action:   ActionConfirmPlan,
+			Action:   ActionStepProgress,
 			Category: category,
 			Content:  content,
 		}
 	}
 
 	pe := ParsedEvent{
-		Action:   ActionConfirmPlan,
+		Action:   ActionStepProgress,
 		Category: category,
 		Content:  content,
 		RawData:  parsed,
@@ -468,8 +461,6 @@ func parsePlanProgress(content string) ParsedEvent {
 }
 
 // parseToolCallResponse inspects accumulated tool_call_response content.
-// If result_type is "plan", the inner result is parsed as a plan and
-// ActionConfirmPlan is returned. Otherwise ActionNone.
 func parseToolCallResponse(content string) ParsedEvent {
 	parsed, ok := tryParseJSON(content)
 	if !ok {
@@ -485,7 +476,7 @@ func parseToolCallResponse(content string) ParsedEvent {
 	resultRaw, hasResult := parsed["result"]
 	if !hasResult {
 		return ParsedEvent{
-			Action:   ActionConfirmPlan,
+			Action:   ActionStepProgress,
 			Category: CatToolCallResponse,
 			Content:  content,
 			RawData:  parsed,
@@ -503,7 +494,7 @@ func parseToolCallResponse(content string) ParsedEvent {
 	steps := planSteps(innerPlan)
 
 	return ParsedEvent{
-		Action:    ActionConfirmPlan,
+		Action:    ActionStepProgress,
 		Category:  CatToolCallResponse,
 		Content:   content,
 		StepTotal: len(steps),

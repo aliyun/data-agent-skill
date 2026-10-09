@@ -2,7 +2,10 @@ package session
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -22,6 +25,8 @@ type Watcher struct {
 	state   *State
 	client  watcherClient
 	sessDir string
+	opMu    sync.Mutex
+	exited  bool
 
 	cancelMu sync.Mutex
 	cancel   context.CancelFunc
@@ -58,6 +63,11 @@ func (w *Watcher) Run(ctx context.Context) {
 	w.cancelMu.Unlock()
 
 	defer cancel()
+	defer func() {
+		w.opMu.Lock()
+		w.exited = true
+		w.opMu.Unlock()
+	}()
 
 	consecutiveErrors := 0
 	const maxConsecutiveErrors = 10
@@ -72,13 +82,38 @@ func (w *Watcher) Run(ctx context.Context) {
 			return
 		}
 
+		changed := w.state.Changed()
+		snap := w.state.Snapshot()
+		reportDraining := snap.Requests[snap.PendingAsk].Kind == "ask_report_render" && !snap.Requests[snap.PendingAsk].Ready
+		if resultReason(&snap) == "waiting_input" && !reportDraining {
+			var retry <-chan time.Time
+			var timer *time.Timer
+			if snap.MessageStatus == SendUnknown || snap.Requests[snap.PendingAsk].Status == SendUnknown {
+				// Unknown delivery forbids resending, not observing the accepted remote turn.
+				timer = time.NewTimer(2 * time.Second)
+				retry = timer.C
+			}
+			select {
+			case <-changed:
+			case <-retry:
+			case <-ctx.Done():
+			}
+			if timer != nil {
+				timer.Stop()
+			}
+			continue
+		}
+
 		if isError {
 			consecutiveErrors++
 			if consecutiveErrors > maxConsecutiveErrors {
 				log.Printf("[session:%s] giving up after %d consecutive SSE errors",
 					w.state.GetSessionID(), maxConsecutiveErrors)
+				w.opMu.Lock()
+				w.exited = true
 				w.state.SetError("SSE connection failed: too many consecutive errors")
 				w.state.Persist(w.sessDir)
+				w.opMu.Unlock()
 				return
 			}
 			wait := time.Duration(min(1<<uint(consecutiveErrors), 60)) * time.Second
@@ -104,33 +139,84 @@ func (w *Watcher) Stop() {
 	}
 }
 
-// SendMessage sends a message to the session on behalf of the user (manual
-// confirmation or free-form input). It clears the waiting state, sends the
-// message, and triggers an SSE reconnect from the current checkpoint.
-func (w *Watcher) SendMessage(message string) error {
-	w.state.ClearWaiting()
+var errWatcherExited = errors.New("session watcher has exited")
 
+func (w *Watcher) SendMessage(message string) error {
+	before := w.state.Snapshot()
+	if before.MessageStatus == SendSending || before.Requests[before.PendingAsk].Status == SendSending {
+		return fmt.Errorf("another message is being sent; inspect session status before retrying")
+	}
+	w.opMu.Lock()
+	defer w.opMu.Unlock()
+	if w.exited {
+		return errWatcherExited
+	}
+	snap := w.state.Snapshot()
+	if before.PendingAsk != snap.PendingAsk || before.SendGeneration != snap.SendGeneration {
+		return fmt.Errorf("session changed while waiting to send; inspect the current pending request")
+	}
+	return w.sendMessage(snap.PendingAsk, message, false)
+}
+
+// The caller holds opMu across event application and sending to bind replies to one ask.
+func (w *Watcher) sendMessage(key, message string, auto bool) error {
+	snap := w.state.Snapshot()
+	if key == "" && strings.EqualFold(strings.TrimSpace(message), "confirm") {
+		return fmt.Errorf("no pending confirmation request; inspect session status before sending")
+	}
+	if key != "" {
+		request, ok := snap.Requests[key]
+		if !ok || snap.PendingAsk != key {
+			return fmt.Errorf("confirmation request is no longer pending")
+		}
+		if request.Status == SendUnknown || request.Status == SendSending {
+			return fmt.Errorf("message delivery is unknown; verify remote state before retrying")
+		}
+		if request.Status == SendAcknowledged || (auto && request.Status != SendPending) {
+			return fmt.Errorf("confirmation request has already been attempted")
+		}
+		if request.Kind == "ask_report_render" && !request.Ready {
+			return fmt.Errorf("analysis output is still being received; wait before requesting a report")
+		}
+	} else if snap.MessageStatus == SendUnknown || snap.MessageStatus == SendSending {
+		return fmt.Errorf("message delivery is unknown; verify remote state before retrying")
+	}
+
+	w.state.SetSendStatus(key, SendSending, auto)
+	if err := w.state.Persist(w.sessDir); err != nil {
+		w.state.SetSendStatus(key, SendFailed, auto)
+		return fmt.Errorf("persist send intent: %w", err)
+	}
+	messageType := "primary"
+	if snap.Requests[key].Kind == "ask_report_render" && strings.EqualFold(strings.TrimSpace(message), "confirm") {
+		messageType, message = "report", "绘制网页报告"
+	}
 	err := w.client.SendMessage(dataagent.SendMessageOpts{
-		AgentID:     w.state.GetAgentID(),
-		SessionID:   w.state.GetSessionID(),
-		Message:     message,
-		Mode:        w.state.GetMode(),
-		WorkspaceID: w.state.GetWorkspaceID(),
+		AgentID: snap.AgentID, SessionID: snap.SessionID, Message: message,
+		MessageType: messageType, Mode: snap.Mode, WorkspaceID: snap.WorkspaceID,
 	})
 	if err != nil {
+		status := SendUnknown
+		if dataagent.IsDefiniteRejection(err) {
+			status = SendFailed
+		}
+		w.state.SetSendStatus(key, status, auto)
+		if persistErr := w.state.Persist(w.sessDir); persistErr != nil {
+			return fmt.Errorf("send message: %w (cannot persist delivery state: %v)", err, persistErr)
+		}
 		return fmt.Errorf("send message: %w", err)
 	}
 
-	w.state.Persist(w.sessDir)
-
-	// Cancel the current SSE stream so the Run loop reconnects with the
-	// updated checkpoint and picks up new events.
+	w.state.SetSendStatus(key, SendAcknowledged, auto)
+	persistErr := w.state.Persist(w.sessDir)
 	w.sseCancelMu.Lock()
 	if w.sseCancel != nil {
 		w.sseCancel()
 	}
 	w.sseCancelMu.Unlock()
-
+	if persistErr != nil {
+		return fmt.Errorf("message accepted but acknowledgement could not be persisted; do not resend: %w", persistErr)
+	}
 	return nil
 }
 
@@ -140,236 +226,219 @@ func (w *Watcher) SendMessage(message string) error {
 //   - (false, false): caller should reconnect (e.g. after auto-confirmation)
 //   - (false, true): transient SSE error, caller should retry with backoff
 func (w *Watcher) streamOnce(ctx context.Context) (bool, bool) {
-	agentID := w.state.GetAgentID()
-	sessionID := w.state.GetSessionID()
-	checkpoint := w.state.GetCheckpoint()
-
-	// Create a child context so we can cancel just this SSE stream when we
-	// need to reconnect after sending a confirmation.
+	w.opMu.Lock()
+	if ctx.Err() != nil {
+		w.opMu.Unlock()
+		return true, false
+	}
+	if w.sendPendingReport() {
+		w.opMu.Unlock()
+		return false, false
+	}
 	sseCtx, sseCancel := context.WithCancel(ctx)
 	w.sseCancelMu.Lock()
 	w.sseCancel = sseCancel
 	w.sseCancelMu.Unlock()
-
+	initial := w.state.Snapshot()
+	checkpoint := initial.Checkpoint
+	legacyReplay := checkpoint > 0 && len(initial.Requests) == 0 && len(initial.Confirmations) > 0
+	w.opMu.Unlock()
 	defer sseCancel()
 
-	ch, err := w.client.StreamSSE(sseCtx, agentID, sessionID, checkpoint)
+	ch, err := w.client.StreamSSE(sseCtx, w.state.GetAgentID(), w.state.GetSessionID(), checkpoint)
 	if err != nil {
-		if ctx.Err() != nil {
-			return true, false
-		}
-		log.Printf("[session:%s] SSE connect error: %v", sessionID, err)
-		return false, true // transient error, retry
+		return ctx.Err() != nil, ctx.Err() == nil
 	}
 
-	// Cross-event accumulation for content lifecycle (output_conclusion, tool_call_response).
-	// ASK_DATA sessions may deliver the final answer as llm deltas instead of
-	// output_conclusion; keep those as a terminal fallback so ANALYSIS results
-	// with explicit conclusions still win. Compare against the conclusion count
-	// at stream start so follow-up turns on revived sessions (which already
-	// carry conclusions from earlier turns) still get their new answer.
 	var contentCategory string
 	var accum []byte
-	var llmFallback []byte
-	baselineConclusions := len(w.state.GetConclusions())
+	latestCheckpoint := checkpoint
 
-	flushLLMFallback := func() {
-		if contentCategory == "llm" && len(accum) > 0 {
-			llmFallback = append(llmFallback, accum...)
+	process := func(ev dataagent.SSEEvent) (finished, reconnect, streamEnded bool) {
+		w.opMu.Lock()
+		defer w.opMu.Unlock()
+		if sseCtx.Err() != nil {
+			return ctx.Err() != nil, ctx.Err() == nil, false
 		}
-	}
-
-	for ev := range ch {
-		if ctx.Err() != nil {
-			return true, false
+		if ev.Checkpoint != nil && *ev.Checkpoint > latestCheckpoint {
+			latestCheckpoint = *ev.Checkpoint
 		}
-
-		// Update checkpoint.
-		if ev.Checkpoint != nil {
-			w.state.SetCheckpoint(*ev.Checkpoint)
+		key, stable := w.eventKey(ev)
+		if ev.EventType == "chat_start" {
+			if !w.state.EventApplied(key) {
+				w.state.MarkEventApplied(key)
+				w.state.StartTurn(key)
+				w.state.Persist(w.sessDir)
+			}
 		}
-
-		// Track content lifecycle for delta accumulation.
 		switch ev.EventType {
 		case "content_start":
-			flushLLMFallback()
-			contentCategory = ev.Category
-			accum = accum[:0]
+			contentCategory, accum = ev.Category, nil
+			return
 		case "delta":
 			if contentCategory == "output_conclusion" || contentCategory == "tool_call_response" || contentCategory == "llm" {
 				accum = append(accum, ev.Content...)
 			}
-			continue // deltas are accumulated, not parsed individually
-		case "data":
-			// data events inside content lifecycle (e.g. task_finish, output_conclusion)
-			// are self-contained — parse them directly without accumulation.
-			// Route through handleParsedEvent so every action is honored
-			// (conclusions, recommended questions, ...), not just conclusions.
-			if contentCategory != "" {
-				parsed := event.Parse(ev.EventType, ev.Category, ev.Content, ev.ContentType)
-				if w.handleParsedEvent(parsed) {
-					return false, false
-				}
-				continue
-			}
+			return
 		case "content_finish":
 			if len(accum) > 0 {
-				if contentCategory == "llm" {
-					llmFallback = append(llmFallback, accum...)
-					contentCategory = ""
-					accum = accum[:0]
-					continue
-				}
-				// Feed accumulated content to parser at content_finish boundary.
-				parsed := event.Parse("content_finish", contentCategory, string(accum), ev.ContentType)
-				if w.handleParsedEvent(parsed) {
-					return false, false
-				}
+				ev.Category, ev.Content = contentCategory, string(accum)
+				key, stable = w.eventKey(ev)
 			}
-			contentCategory = ""
-			accum = accum[:0]
-			continue
+			if ev.Category == "llm" && !w.state.EventApplied(key) {
+				w.state.MarkEventApplied(key)
+				w.state.AppendLLMFallback(ev.Content)
+				w.state.Persist(w.sessDir)
+			}
+			contentCategory, accum = "", nil
 		}
 
-		// Parse the event (non-delta, non-content-lifecycle events).
+		// Keep the resume cursor before an unfinished content lifecycle so reconnect can rebuild it.
+		if contentCategory == "" && latestCheckpoint > w.state.GetCheckpoint() {
+			w.state.SetCheckpoint(latestCheckpoint)
+		}
 		parsed := event.Parse(ev.EventType, ev.Category, ev.Content, ev.ContentType)
-
-		shouldReconnect := w.handleParsedEvent(parsed)
-		if shouldReconnect {
-			return false, false
+		if parsed.Action == event.ActionStreamEnded {
+			return false, false, true
 		}
-
-		// Check for terminal actions.
+		if parsed.Action == event.ActionNone {
+			return
+		}
+		if w.state.EventApplied(key) {
+			return
+		}
+		if w.state.Snapshot().AwaitingTurn {
+			return
+		}
+		if parsed.Action.NeedsConfirmation() {
+			// Old snapshots have no request ledger, so replay cannot prove an ask is unanswered.
+			if legacyReplay && (ev.Checkpoint == nil || *ev.Checkpoint <= checkpoint) {
+				stable = false
+			}
+			return false, w.handleConfirmation(parsed, key, stable), false
+		}
+		w.state.MarkEventApplied(key)
 		if parsed.Action.IsTerminal() {
-			// Flush any pending accumulation.
-			if len(accum) > 0 && contentCategory == "output_conclusion" {
-				accText := string(accum)
-				w.state.AddConclusion(accText)
-				// Extract and persist images from raw accumulated text
-				images := event.ExtractBase64Images(accText)
-				if len(images) > 0 {
-					filenames := w.persistImages(images)
-					for _, fn := range filenames {
-						w.state.AddArtifact("image:" + fn)
-					}
+			if contentCategory == "output_conclusion" && len(accum) > 0 {
+				w.handleParsedEvent(event.Parse("content_finish", contentCategory, string(accum), ""))
+			} else if contentCategory == "llm" {
+				w.state.AppendLLMFallback(string(accum))
+			}
+			snap := w.state.Snapshot()
+			if snap.PendingLLM != "" && !snap.HasTurnConclusion {
+				w.state.AddConclusion(snap.PendingLLM)
+			}
+			if parsed.Action == event.ActionCompleted && snap.Requests[snap.PendingAsk].Kind == "ask_report_render" {
+				// The report offer precedes the analysis tail; rendering starts a separate turn.
+				w.state.MarkReportReady(snap.PendingAsk)
+				if err := w.state.Persist(w.sessDir); err != nil {
+					w.state.SetSendStatus(snap.PendingAsk, SendFailed, false)
+					return false, false, true
 				}
-			} else if len(accum) > 0 && contentCategory == "llm" {
-				// ASK_DATA: answer accumulated in llm deltas, no content_finish received
-				llmFallback = append(llmFallback, accum...)
-			} else {
-				flushLLMFallback()
+				return false, w.sendPendingReport(), true
 			}
-			if len(llmFallback) > 0 && len(w.state.GetConclusions()) == baselineConclusions {
-				w.state.AddConclusion(string(llmFallback))
-			}
-			w.state.Persist(w.sessDir)
-			return true, false
 		}
+		w.handleParsedEvent(parsed)
+		w.state.Persist(w.sessDir)
+		w.exited = parsed.Action.IsTerminal()
+		return w.exited, false, false
 	}
 
-	// Channel closed without SSE_FINISH.
-	if sseCtx.Err() != nil && ctx.Err() == nil {
-		// SSE child context canceled (reconnect after auto-confirm).
+	for ev := range ch {
+		finished, reconnect, streamEnded := process(ev)
+		if finished || reconnect {
+			return finished, false
+		}
+		if streamEnded {
+			break
+		}
+	}
+	if ctx.Err() != nil {
+		return true, false
+	}
+	if sseCtx.Err() != nil {
 		return false, false
 	}
-
-	// Channel closed unexpectedly (network drop, server closed connection).
-	// Treat as transient error — caller will retry with backoff.
-	log.Printf("[session:%s] SSE channel closed unexpectedly, will retry", w.state.GetSessionID())
-	return false, true
+	snap := w.state.Snapshot()
+	request := snap.Requests[snap.PendingAsk]
+	return false, resultReason(&snap) == "" || (request.Kind == "ask_report_render" && !request.Ready)
 }
 
-// handleParsedEvent applies a parsed event to state. Returns true if the
-// caller should reconnect the SSE stream (because we auto-confirmed and
-// sent a message).
-func (w *Watcher) handleParsedEvent(pe event.ParsedEvent) bool {
+func (w *Watcher) eventKey(ev dataagent.SSEEvent) (string, bool) {
+	eventID := ev.Data["event_id"]
+	checkpoint := ev.Checkpoint
+	if eventID != nil && eventID != "" {
+		checkpoint = nil
+	}
+	stable := checkpoint != nil || (eventID != nil && eventID != "")
+	turn := ""
+	if !stable && ev.EventType != "chat_start" {
+		turn = w.state.Snapshot().TurnKey
+	}
+	payload, _ := json.Marshal([]any{checkpoint, eventID, ev.Data["channel"], ev.EventType, ev.Category, ev.Content, turn})
+	return fmt.Sprintf("%x", sha256.Sum256(payload)), stable
+}
+
+func (w *Watcher) handleConfirmation(pe event.ParsedEvent, key string, stable bool) bool {
+	request, fresh := w.state.RegisterAsk(ConfirmationRequest{Key: key, Kind: pe.Category, Content: pe.Content, Stable: stable})
+	if !fresh {
+		return false
+	}
+	if err := w.state.Persist(w.sessDir); err != nil {
+		w.state.SetSendStatus(key, SendFailed, false)
+		return false
+	}
+	if pe.Action == event.ActionHumanInput || pe.Action == event.ActionConfirmReport || !w.state.GetAutoConfirm() || !request.Stable {
+		return false
+	}
+	if err := w.sendMessage(key, "confirm", true); err != nil {
+		log.Printf("[session:%s] confirmation request=%s delivery=%s", w.state.GetSessionID(), key[:12], w.state.Snapshot().Requests[key].Status)
+	}
+	return w.state.Snapshot().Requests[key].Status == SendAcknowledged
+}
+
+func (w *Watcher) sendPendingReport() bool {
+	snap := w.state.Snapshot()
+	request := snap.Requests[snap.PendingAsk]
+	if !snap.AutoConfirm || request.Kind != "ask_report_render" || !request.Ready || !request.Stable || request.Status != SendPending {
+		return false
+	}
+	if err := w.sendMessage(request.Key, "confirm", true); err != nil {
+		log.Printf("[session:%s] report request=%s delivery=%s", snap.SessionID, request.Key, w.state.Snapshot().Requests[request.Key].Status)
+	}
+	return w.state.Snapshot().Requests[request.Key].Status == SendAcknowledged
+}
+
+func (w *Watcher) handleParsedEvent(pe event.ParsedEvent) {
 	switch pe.Action {
-
-	case event.ActionConfirmPlan:
-		if w.state.GetAutoConfirm() {
-			return w.autoConfirm("ask_plan", "confirm")
-		}
-		w.state.SetWaiting("ask_plan", pe.Content)
-		w.state.Persist(w.sessDir)
-
-	case event.ActionConfirmSQL:
-		if w.state.GetAutoConfirm() {
-			return w.autoConfirm("ask_sql", "confirm")
-		}
-		w.state.SetWaiting("ask_sql", pe.Content)
-		w.state.Persist(w.sessDir)
-
-	case event.ActionConfirmReport:
-		if w.state.GetAutoConfirm() {
-			return w.autoConfirm("ask_report_render", "confirm")
-		}
-		w.state.SetWaiting("ask_report_render", pe.Content)
-		w.state.Persist(w.sessDir)
-
-	case event.ActionHumanInput:
-		// Human input always requires manual input; never auto-confirm.
-		w.state.SetWaiting("ask_human", pe.Content)
-		w.state.Persist(w.sessDir)
-
 	case event.ActionStepProgress:
 		w.state.SetStepProgress(pe.StepCurrent, pe.StepTotal, pe.StepName)
-		w.state.Persist(w.sessDir)
-
 	case event.ActionConclusion:
 		if pe.Content != "" {
 			w.state.UpsertConclusion(pe.DedupKey, pe.Content)
-			// Persist extracted images
-			if len(pe.Images) > 0 {
-				filenames := w.persistImages(pe.Images)
-				for _, fn := range filenames {
-					w.state.AddArtifact("image:" + fn)
-				}
+			for _, filename := range w.persistImages(pe.Images) {
+				w.state.AddArtifact("image:" + filename)
 			}
-			w.state.Persist(w.sessDir)
 		}
-
 	case event.ActionArtifact:
-		// A generated file (data export / report file) finished uploading.
-		for _, a := range pe.Artifacts {
-			w.state.AddArtifact(a)
+		for _, artifact := range pe.Artifacts {
+			w.state.AddArtifact(artifact)
 		}
-		if len(pe.Artifacts) > 0 {
-			w.state.Persist(w.sessDir)
-		}
-
 	case event.ActionReportGenerated:
-		// jsx_report / mission_report rendered; record the reference so
-		// callers know a report exists (fetch via data_agent_list_files).
 		if pe.Content != "" {
 			w.state.AddArtifact(pe.Content)
-			w.state.Persist(w.sessDir)
 		}
-
 	case event.ActionRecommendedQuestion:
-		// Follow-up questions suggested by the backend (newline-joined by the
-		// parser); surfaced through the result tool's recommended_questions.
 		if pe.Content != "" {
 			w.state.SetRecommendedQuestions(strings.Split(pe.Content, "\n"))
-			w.state.Persist(w.sessDir)
 		}
-
 	case event.ActionCompleted:
 		w.state.SetCompleted()
-		w.state.Persist(w.sessDir)
-
 	case event.ActionError:
 		w.state.SetError(pe.Content)
-		w.state.Persist(w.sessDir)
-
 	case event.ActionCanceled:
 		w.state.SetCanceled()
-		w.state.Persist(w.sessDir)
-
-	case event.ActionNone:
-		// No action required.
 	}
-
-	return false
 }
 
 // persistImages decodes base64 images and writes them to the session images directory.
@@ -419,37 +488,4 @@ func (w *Watcher) persistImages(images []event.Base64Image) []string {
 	}
 
 	return persisted
-}
-
-// autoConfirm sends a confirmation message and records it. Returns true to
-// signal the caller to reconnect the SSE stream.
-func (w *Watcher) autoConfirm(confirmType, message string) bool {
-	sessionID := w.state.GetSessionID()
-
-	err := w.client.SendMessage(dataagent.SendMessageOpts{
-		AgentID:     w.state.GetAgentID(),
-		SessionID:   sessionID,
-		Message:     message,
-		Mode:        w.state.GetMode(),
-		WorkspaceID: w.state.GetWorkspaceID(),
-	})
-	if err != nil {
-		log.Printf("[session:%s] auto-confirm %s failed: %v", sessionID, confirmType, err)
-		// Fall back to waiting for manual input.
-		w.state.SetWaiting(confirmType, fmt.Sprintf("auto-confirm failed: %v", err))
-		w.state.Persist(w.sessDir)
-		return false
-	}
-
-	w.state.AddConfirmation(confirmType, true)
-	w.state.Persist(w.sessDir)
-
-	// Cancel the current SSE stream so the Run loop reconnects.
-	w.sseCancelMu.Lock()
-	if w.sseCancel != nil {
-		w.sseCancel()
-	}
-	w.sseCancelMu.Unlock()
-
-	return true
 }

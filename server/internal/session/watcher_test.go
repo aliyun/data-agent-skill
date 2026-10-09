@@ -2,9 +2,12 @@ package session
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/alibabacloud/data-agent-mcp-server/internal/dataagent"
+	"github.com/alibabacloud/data-agent-mcp-server/internal/event"
 )
 
 func TestStreamOnceUsesLLMDeltaAsASKDataConclusionFallback(t *testing.T) {
@@ -101,5 +104,103 @@ func (c fakeWatcherClient) StreamSSE(context.Context, string, string, int) (<-ch
 }
 
 func (c fakeWatcherClient) SendMessage(dataagent.SendMessageOpts) error {
+	return nil
+}
+
+// GetChatContent replays the requested checkpoint inclusively.
+func TestAutoConfirmNotRepeatedOnInclusiveCheckpointReplay(t *testing.T) {
+	state := &State{
+		SessionID:   "session-1",
+		AgentID:     "agent-1",
+		Status:      StatusRunning,
+		Mode:        "pro",
+		AutoConfirm: true,
+	}
+	client := &replayWatcherClient{
+		events: []dataagent.SSEEvent{
+			eventWithCheckpoint("chat_start", "chat", "", 1),
+			eventWithCheckpoint("chat_finish", "ask_plan", `{"plan_id":"p1","plans":[]}`, 2),
+			eventWithCheckpoint("chat_start", "chat", "", 3),
+			eventWithCheckpoint("chat_finish", "chat", "", 4),
+		},
+		askCheckpoint: 2,
+	}
+	watcher := &Watcher{state: state, client: client, sessDir: t.TempDir()}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	watcher.Run(ctx)
+
+	if got := client.sendCount(); got != 1 {
+		t.Fatalf("SendMessage called %d times, want 1", got)
+	}
+	if snap := state.Snapshot(); snap.Status != StatusCompleted {
+		t.Fatalf("status = %s, want completed", snap.Status)
+	}
+}
+
+func TestManualReplyDoesNotReenterWaitingOnReplay(t *testing.T) {
+	state := &State{SessionID: "session-1", AgentID: "agent-1", Status: StatusRunning, Mode: "pro"}
+	ask := eventWithCheckpoint("chat_finish", "ask_plan", `{"plan_id":"p1","plans":[]}`, 2)
+	watcher := &Watcher{state: state, client: fakeWatcherClient{}, sessDir: t.TempDir()}
+
+	state.SetCheckpoint(2)
+	key, stable := watcher.eventKey(ask)
+	watcher.handleConfirmation(event.Parse(ask.EventType, ask.Category, ask.Content, ask.ContentType), key, stable)
+	if state.GetStatus() != StatusWaitingInput {
+		t.Fatalf("status = %s, want waiting_input", state.GetStatus())
+	}
+	if err := watcher.SendMessage("confirm"); err != nil {
+		t.Fatal(err)
+	}
+	watcher.handleConfirmation(event.Parse(ask.EventType, ask.Category, ask.Content, ask.ContentType), key, stable)
+	if state.GetStatus() != StatusRunning {
+		t.Fatalf("status after replayed ask = %s, want running", state.GetStatus())
+	}
+}
+
+// replayWatcherClient mimics GetChatContent: a stream resumes at the requested
+// checkpoint inclusively and stays open at the ask until it is answered.
+type replayWatcherClient struct {
+	events        []dataagent.SSEEvent
+	askCheckpoint int
+
+	mu    sync.Mutex
+	sends int
+}
+
+func (c *replayWatcherClient) sendCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sends
+}
+
+func (c *replayWatcherClient) StreamSSE(ctx context.Context, _, _ string, checkpoint int) (<-chan dataagent.SSEEvent, error) {
+	answered := c.sendCount() > 0
+	ch := make(chan dataagent.SSEEvent)
+	go func() {
+		defer close(ch)
+		for _, ev := range c.events {
+			if *ev.Checkpoint < checkpoint {
+				continue
+			}
+			if !answered && *ev.Checkpoint > c.askCheckpoint {
+				<-ctx.Done()
+				return
+			}
+			select {
+			case ch <- ev:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch, nil
+}
+
+func (c *replayWatcherClient) SendMessage(dataagent.SendMessageOpts) error {
+	c.mu.Lock()
+	c.sends++
+	c.mu.Unlock()
 	return nil
 }

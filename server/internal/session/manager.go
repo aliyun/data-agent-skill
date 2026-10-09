@@ -50,13 +50,50 @@ type Manager struct {
 	client   *dataagent.Client
 	sessDir  string
 	baseCtx  context.Context // process-lifetime context for watcher goroutines
+
+	// Session locks must survive watcher replacement.
+	operations sync.Map // session ID -> *sync.Mutex
 }
 
-// watcherEntry bundles a Watcher with its cancel function.
+// watcherEntry bundles a Watcher with its cancellation and completion signals.
 type watcherEntry struct {
 	watcher *Watcher
 	state   *State
 	cancel  context.CancelFunc
+	done    chan struct{} // nil when Run has never been launched
+}
+
+func (e *watcherEntry) cancelAndWait() {
+	if e.cancel != nil {
+		e.cancel()
+	}
+	if e.done != nil {
+		<-e.done
+	}
+}
+
+func (m *Manager) sessionOperation(sessionID string) *sync.Mutex {
+	operation, _ := m.operations.LoadOrStore(sessionID, &sync.Mutex{})
+	return operation.(*sync.Mutex)
+}
+
+// The session operation lock must be held before publishing a watcher.
+func (m *Manager) startWatcher(watcher *Watcher) {
+	ctx, cancel := context.WithCancel(m.watchContext())
+	entry := &watcherEntry{
+		watcher: watcher,
+		state:   watcher.state,
+		cancel:  cancel,
+		done:    make(chan struct{}),
+	}
+
+	m.mu.Lock()
+	m.watchers[entry.state.GetSessionID()] = entry
+	go func() {
+		defer close(entry.done)
+		watcher.Run(ctx)
+	}()
+	m.mu.Unlock()
 }
 
 // NewManager creates a Manager that uses the given client and persists state
@@ -73,6 +110,8 @@ func NewManager(client *dataagent.Client, sessDir string) *Manager {
 // must be derived from. Request-scoped contexts are unsuitable: the HTTP
 // transports cancel them right after the tool response is written.
 func (m *Manager) watchContext() context.Context {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.baseCtx != nil {
 		return m.baseCtx
 	}
@@ -87,7 +126,9 @@ func (m *Manager) watchContext() context.Context {
 // (Streamable HTTP cancels the request context as soon as the response is
 // written, which would otherwise kill the SSE stream immediately).
 func (m *Manager) RestoreSessions(ctx context.Context) {
+	m.mu.Lock()
 	m.baseCtx = ctx
+	m.mu.Unlock()
 	entries, err := os.ReadDir(m.sessDir)
 	if err != nil {
 		return
@@ -95,54 +136,50 @@ func (m *Manager) RestoreSessions(ctx context.Context) {
 
 	restored := 0
 	for _, e := range entries {
-		if !e.IsDir() {
-			continue
+		if e.IsDir() && m.restoreSession(e.Name()) {
+			restored++
 		}
-		sessionID := e.Name()
-		snap := LoadState(m.sessDir, sessionID)
-		if snap == nil {
-			continue
-		}
-
-		if snap.Status != StatusRunning && snap.Status != StatusWaitingInput {
-			continue
-		}
-		if snap.AgentID == "" {
-			continue
-		}
-
-		// Verify session is still active on server side.
-		info, err := m.client.DescribeSession(sessionID, snap.WorkspaceID)
-		if err != nil || info == nil {
-			continue
-		}
-		serverStatus := strings.ToUpper(info.SessionStatus)
-		if serverStatus == "STOPPED" || serverStatus == "FAILED" {
-			continue
-		}
-
-		state := stateFromSnapshot(snap)
-		watcher := NewWatcher(state, m.client, m.sessDir)
-		watchCtx, watchCancel := context.WithCancel(ctx)
-
-		entry := &watcherEntry{
-			watcher: watcher,
-			state:   state,
-			cancel:  watchCancel,
-		}
-
-		m.mu.Lock()
-		m.watchers[sessionID] = entry
-		m.mu.Unlock()
-
-		go watcher.Run(watchCtx)
-		restored++
-		log.Printf("restored session %s (status=%s, checkpoint=%d)", sessionID, snap.Status, snap.Checkpoint)
 	}
 
 	if restored > 0 {
 		log.Printf("restored %d active session(s) from %s", restored, m.sessDir)
 	}
+}
+
+func (m *Manager) restoreSession(sessionID string) bool {
+	operation := m.sessionOperation(sessionID)
+	operation.Lock()
+	defer operation.Unlock()
+
+	m.mu.RLock()
+	_, exists := m.watchers[sessionID]
+	m.mu.RUnlock()
+	if exists {
+		return false
+	}
+
+	snap := LoadState(m.sessDir, sessionID)
+	if snap == nil || snap.AgentID == "" {
+		return false
+	}
+	state := stateFromSnapshot(snap)
+	if state.GetStatus() != StatusRunning && state.GetStatus() != StatusWaitingInput {
+		return false
+	}
+
+	// IDLE can also mean an unanswered question.
+	info, err := m.client.DescribeSession(sessionID, snap.WorkspaceID)
+	if err != nil || info == nil {
+		return false
+	}
+	serverStatus := strings.ToUpper(info.SessionStatus)
+	if serverStatus == "STOPPED" || serverStatus == "FAILED" {
+		return false
+	}
+
+	m.startWatcher(NewWatcher(state, m.client, m.sessDir))
+	log.Printf("restored session %s (status=%s, checkpoint=%d)", sessionID, state.GetStatus(), snap.Checkpoint)
+	return true
 }
 
 // CreateSession creates a new Data Agent session, waits for it to become
@@ -169,6 +206,9 @@ func (m *Manager) CreateSession(ctx context.Context, opts CreateOpts) (*State, e
 
 	sessionID := info.SessionID
 	agentID := info.AgentID
+	operation := m.sessionOperation(sessionID)
+	operation.Lock()
+	defer operation.Unlock()
 
 	// 2. Wait for session to become RUNNING (poll up to 60s).
 	if err := m.waitForRunning(ctx, sessionID, opts.WorkspaceID, 60*time.Second); err != nil {
@@ -230,25 +270,9 @@ func (m *Manager) CreateSession(ctx context.Context, opts CreateOpts) (*State, e
 		changed:     make(chan struct{}),
 	}
 
-	// 6. Create and start watcher.
-	watcher := NewWatcher(state, m.client, m.sessDir)
-
-	watchCtx, watchCancel := context.WithCancel(m.watchContext())
-
-	entry := &watcherEntry{
-		watcher: watcher,
-		state:   state,
-		cancel:  watchCancel,
-	}
-
-	m.mu.Lock()
-	m.watchers[sessionID] = entry
-	m.mu.Unlock()
-
-	go watcher.Run(watchCtx)
-
-	// 7. Persist initial state.
+	// Persist before launching Run to avoid racing the initial snapshot.
 	state.Persist(m.sessDir)
+	m.startWatcher(NewWatcher(state, m.client, m.sessDir))
 
 	return state, nil
 }
@@ -259,6 +283,10 @@ func (m *Manager) WatchSession(ctx context.Context, opts WatchOpts) (*StateSnaps
 	if opts.SessionID == "" {
 		return nil, fmt.Errorf("session_id is required")
 	}
+	operation := m.sessionOperation(opts.SessionID)
+	operation.Lock()
+	defer operation.Unlock()
+
 	if opts.WorkspaceID == "" {
 		opts.WorkspaceID = m.client.ResolveWorkspaceID()
 	}
@@ -295,6 +323,10 @@ func (m *Manager) WatchSession(ctx context.Context, opts WatchOpts) (*StateSnaps
 	var state *State
 	if snap := LoadState(m.sessDir, opts.SessionID); snap != nil {
 		state = stateFromSnapshot(snap)
+		if state.GetStatus() == StatusWaitingInput && state.GetWaitingFor() != "" && (strings.EqualFold(info.SessionStatus, "IDLE") || status == StatusRunning || status == StatusWaitingInput) {
+			// Coarse remote status cannot resolve a pending or uncertain local reply.
+			status = StatusWaitingInput
+		}
 		state.SetStatus(status)
 		if state.GetAgentID() == "" {
 			state.AgentID = agentID
@@ -322,26 +354,8 @@ func (m *Manager) WatchSession(ctx context.Context, opts WatchOpts) (*StateSnaps
 		return &snap, nil
 	}
 
-	watcher := NewWatcher(state, m.client, m.sessDir)
-	watchCtx, watchCancel := context.WithCancel(m.watchContext())
-	entry := &watcherEntry{
-		watcher: watcher,
-		state:   state,
-		cancel:  watchCancel,
-	}
-
-	m.mu.Lock()
-	if existing, ok := m.watchers[opts.SessionID]; ok {
-		snap := existing.state.Snapshot()
-		m.mu.Unlock()
-		watchCancel()
-		return &snap, nil
-	}
-	m.watchers[opts.SessionID] = entry
-	m.mu.Unlock()
-
-	go watcher.Run(watchCtx)
 	state.Persist(m.sessDir)
+	m.startWatcher(NewWatcher(state, m.client, m.sessDir))
 
 	snap := state.Snapshot()
 	return &snap, nil
@@ -500,6 +514,19 @@ func resultReason(snap *StateSnapshot) string {
 		return "canceled"
 	case StatusWaitingInput:
 		if snap.WaitingFor != "" {
+			request, ok := snap.Requests[snap.PendingAsk]
+			if ok && request.Kind == "ask_report_render" && !request.Ready && request.Status == SendPending {
+				return ""
+			}
+			if snap.AutoConfirm && snap.PendingAsk != "" && ok && request.Stable {
+				switch request.Kind {
+				case "ask_plan", "ask_sql", "ask_report_render":
+					// RegisterAsk notifies waiters before auto-confirmation starts.
+					if request.Status == SendPending || request.Status == SendSending {
+						return ""
+					}
+				}
+			}
 			return "waiting_input"
 		}
 	}
@@ -509,28 +536,32 @@ func resultReason(snap *StateSnapshot) string {
 // SendMessage sends a user message to an active session (for manual
 // confirmation or free-form input).
 func (m *Manager) SendMessage(sessionID, message string) error {
+	before, _ := m.GetStatus(sessionID)
+	operation := m.sessionOperation(sessionID)
+	operation.Lock()
+	defer operation.Unlock()
+	current, _ := m.GetStatus(sessionID)
+	if before != nil && current != nil && (before.PendingAsk != current.PendingAsk || before.SendGeneration != current.SendGeneration || before.MessageStatus != current.MessageStatus || before.Requests[before.PendingAsk].Status != current.Requests[current.PendingAsk].Status) {
+		return fmt.Errorf("session changed while waiting to send; inspect the current pending request")
+	}
+
 	m.mu.RLock()
 	entry, ok := m.watchers[sessionID]
 	m.mu.RUnlock()
 
 	if ok {
-		// A terminal session means the watcher goroutine has already exited
-		// (Run returns on completion/error/cancel) — sending through the dead
-		// watcher would deliver the message but leave nobody listening for
-		// the follow-up's SSE events, stranding the session as "running"
-		// until housekeeping reconciles minutes later. Drop the stale entry
-		// and revive with a fresh watcher instead.
 		switch entry.state.GetStatus() {
 		case StatusCompleted, StatusError, StatusCanceled:
-			m.mu.Lock()
-			if m.watchers[sessionID] == entry {
-				delete(m.watchers, sessionID)
-			}
-			m.mu.Unlock()
-			entry.cancel()
 		default:
-			return entry.watcher.SendMessage(message)
+			if err := entry.watcher.SendMessage(message); err != errWatcherExited {
+				return err
+			}
 		}
+		// Join before loading the final snapshot, including when Run finished during SendMessage.
+		entry.cancelAndWait()
+		m.mu.Lock()
+		delete(m.watchers, sessionID)
+		m.mu.Unlock()
 	}
 
 	// No live watcher: the session may have completed (watcher exited) or
@@ -540,8 +571,7 @@ func (m *Manager) SendMessage(sessionID, message string) error {
 	return m.reviveAndSend(sessionID, message)
 }
 
-// reviveAndSend reloads a persisted session, restarts its SSE watcher, and
-// sends the follow-up message within the restored conversation context.
+// The session operation lock must be held while reviving and sending.
 func (m *Manager) reviveAndSend(sessionID, message string) error {
 	snap := LoadState(m.sessDir, sessionID)
 	if snap == nil {
@@ -552,32 +582,18 @@ func (m *Manager) reviveAndSend(sessionID, message string) error {
 	}
 
 	state := stateFromSnapshot(snap)
-	state.SetStatus(StatusRunning)
-
 	watcher := NewWatcher(state, m.client, m.sessDir)
-	watchCtx, watchCancel := context.WithCancel(m.watchContext())
-	entry := &watcherEntry{watcher: watcher, state: state, cancel: watchCancel}
 
-	m.mu.Lock()
-	if existing, ok := m.watchers[sessionID]; ok {
-		// Lost the race against a concurrent revive/watch; reuse the winner.
-		m.mu.Unlock()
-		watchCancel()
-		return existing.watcher.SendMessage(message)
-	}
-	m.watchers[sessionID] = entry
-	m.mu.Unlock()
-
-	// Send first so a rejected message doesn't leave a zombie watcher.
+	// Rejected sends stay unpublished; uncertain delivery still needs an observer.
 	if err := watcher.SendMessage(message); err != nil {
-		m.mu.Lock()
-		delete(m.watchers, sessionID)
-		m.mu.Unlock()
-		watchCancel()
+		after := state.Snapshot()
+		if after.MessageStatus == SendUnknown || after.Requests[after.PendingAsk].Status == SendUnknown || after.Status == StatusRunning {
+			m.startWatcher(watcher)
+		}
 		return err
 	}
 
-	go watcher.Run(watchCtx)
+	m.startWatcher(watcher)
 	log.Printf("revived session %s for follow-up (checkpoint=%d)", sessionID, snap.Checkpoint)
 	return nil
 }
@@ -661,6 +677,10 @@ func (m *Manager) ListAllSessions() []*StateSnapshot {
 
 // StopSession stops watching a session and removes it from the active map.
 func (m *Manager) StopSession(sessionID string) error {
+	operation := m.sessionOperation(sessionID)
+	operation.Lock()
+	defer operation.Unlock()
+
 	m.mu.Lock()
 	entry, ok := m.watchers[sessionID]
 	if !ok {
@@ -671,7 +691,7 @@ func (m *Manager) StopSession(sessionID string) error {
 	m.mu.Unlock()
 
 	entry.watcher.Stop()
-	entry.cancel()
+	entry.cancelAndWait()
 	return nil
 }
 
@@ -763,14 +783,29 @@ func (m *Manager) SessionDir(sessionID string) string {
 	return m.sessDir + "/" + sessionID
 }
 
-// removeEntry removes a session from the watchers map. Used by housekeeping.
+// removeEntry removes a stale session from the watchers map. Used by housekeeping.
 func (m *Manager) removeEntry(sessionID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	operation := m.sessionOperation(sessionID)
+	operation.Lock()
+	defer operation.Unlock()
 
-	if entry, ok := m.watchers[sessionID]; ok {
-		entry.cancel()
-		delete(m.watchers, sessionID)
-		log.Printf("[housekeeping] removed session %s", sessionID)
+	m.mu.RLock()
+	entry, ok := m.watchers[sessionID]
+	m.mu.RUnlock()
+	if !ok {
+		return
 	}
+
+	// Housekeeping inspected an earlier map snapshot. A send/watch may have
+	// revived this session while it waited for the operation lock.
+	snap := entry.state.Snapshot()
+	if (snap.Status != StatusCompleted && snap.Status != StatusError) || time.Since(snap.UpdatedAt) <= staleTimeout {
+		return
+	}
+
+	entry.cancelAndWait()
+	m.mu.Lock()
+	delete(m.watchers, sessionID)
+	m.mu.Unlock()
+	log.Printf("[housekeeping] removed session %s", sessionID)
 }
