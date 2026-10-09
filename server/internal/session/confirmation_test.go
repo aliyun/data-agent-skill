@@ -208,14 +208,14 @@ func TestSharedCheckpointPreservesDistinctAsksAndBatchData(t *testing.T) {
 		eventWithCheckpoint("chat_finish", "chat", "", 3),
 	}
 	w.streamOnce(context.Background())
-	if client.calls.Load() != 3 {
-		t.Fatalf("report request suppressed: %d", client.calls.Load())
+	if client.calls.Load() != 2 {
+		t.Fatalf("report automatically confirmed: %d", client.calls.Load())
 	}
 	w.state = stateFromSnapshot(LoadState(w.sessDir, "test-session"))
 	w.streamOnce(context.Background())
 	snap := w.state.Snapshot()
-	if len(snap.Conclusions) != 1 || len(snap.Artifacts) != 1 {
-		t.Fatalf("batch data duplicated or lost: %+v", snap)
+	if len(snap.Conclusions) != 1 || len(snap.Artifacts) != 1 || client.calls.Load() != 2 || resultReason(&snap) != "waiting_input" {
+		t.Fatalf("batch data or pending report lost: %+v", snap)
 	}
 }
 
@@ -403,7 +403,7 @@ func TestTerminalErrorAndCancellationDetachUnknownRequest(t *testing.T) {
 	}
 }
 
-func TestReportRequestDrainsAnalysisAndWaitsForReportTurn(t *testing.T) {
+func TestReportRequiresManualConfirmationAfterAnalysis(t *testing.T) {
 	w, client := confirmationWatcher(t, true)
 	client.events = []dataagent.SSEEvent{
 		eventWithCheckpoint("chat_start", "chat", "", 1),
@@ -420,11 +420,25 @@ func TestReportRequestDrainsAnalysisAndWaitsForReportTurn(t *testing.T) {
 		return nil
 	}
 	finished, isError := w.streamOnce(context.Background())
-	if finished || isError || w.state.GetStatus() != StatusRunning || client.calls.Load() != 1 {
-		t.Fatalf("analysis ended watcher: finished=%v error=%v calls=%d", finished, isError, client.calls.Load())
+	pending := w.state.Snapshot()
+	if finished || isError || pending.Status != StatusWaitingInput || pending.WaitingFor != "ask_report_render" || !pending.Requests[pending.PendingAsk].Ready || pending.AwaitingTurn || client.calls.Load() != 0 {
+		t.Fatalf("report did not wait for manual approval: finished=%v error=%v state=%+v calls=%d", finished, isError, pending, client.calls.Load())
+	}
+	if pending.Checkpoint != 5 || len(pending.Conclusions) != 1 || len(pending.Artifacts) != 1 || resultReason(&pending) != "waiting_input" {
+		t.Fatalf("analysis tail was not available before manual approval: %+v", pending)
+	}
+	if err := w.SendMessage("confirm"); err != nil {
+		t.Fatal(err)
+	}
+	if client.calls.Load() != 1 || w.state.GetStatus() != StatusRunning {
+		t.Fatalf("manual report request not sent: calls=%d state=%+v", client.calls.Load(), w.state.Snapshot())
 	}
 	if got := client.messages[0]; got.MessageType != "report" || got.Message != "绘制网页报告" {
 		t.Fatalf("report request = %+v", got)
+	}
+	confirmation := w.state.Snapshot().Confirmations
+	if len(confirmation) != 1 || confirmation[0].AutoConfirmed || confirmation[0].Type != "ask_report_render" {
+		t.Fatalf("manual report confirmation recorded incorrectly: %+v", confirmation)
 	}
 	w.state = stateFromSnapshot(LoadState(w.sessDir, "test-session"))
 	client.events = []dataagent.SSEEvent{
@@ -459,40 +473,57 @@ func TestReportOfferRequiresAnalysisCompletion(t *testing.T) {
 			}
 			client.events = []dataagent.SSEEvent{eventWithCheckpoint("chat_finish", "chat", "", 3)}
 			w.streamOnce(context.Background())
-			if auto && client.calls.Load() != 1 {
-				t.Fatal("ready automatic report not sent")
+			snap := w.state.Snapshot()
+			if client.calls.Load() != 0 || snap.Status != StatusWaitingInput || !snap.Requests[snap.PendingAsk].Ready || resultReason(&snap) != "waiting_input" {
+				t.Fatalf("report must wait for manual approval after analysis: %+v", snap)
 			}
-			if !auto && (client.calls.Load() != 0 || w.state.GetStatus() != StatusWaitingInput) {
-				t.Fatal("manual report offer lost at analysis completion")
+			if err := w.SendMessage("confirm"); err != nil || client.calls.Load() != 1 {
+				t.Fatalf("ready report manual approval failed: %v", err)
 			}
 		})
 	}
 }
 
-func TestReadyReportRestoresWithoutLosingOrRepeatingSend(t *testing.T) {
-	for _, status := range []SendStatus{SendPending, SendSending, SendFailed} {
+func TestReadyReportRestoresWithoutAutomaticSend(t *testing.T) {
+	for _, status := range []SendStatus{SendPending, SendSending, SendFailed, SendUnknown, SendAcknowledged} {
 		t.Run(string(status), func(t *testing.T) {
 			w, client := confirmationWatcher(t, false)
-			key := applyAsk(w, eventWithCheckpoint("chat_finish", "ask_report_render", "report", 2))
+			ask := eventWithCheckpoint("chat_finish", "ask_report_render", "report", 2)
+			key := applyAsk(w, ask)
 			client.events = []dataagent.SSEEvent{eventWithCheckpoint("chat_finish", "chat", "", 3)}
 			w.streamOnce(context.Background())
 			if status != SendPending {
+				w.state.SetSendStatus(key, SendSending, true)
 				w.state.SetSendStatus(key, status, true)
 			}
 			snap := w.state.Snapshot()
 			snap.AutoConfirm = true
 			w.state = stateFromSnapshot(&snap)
-			w.streamOnce(context.Background())
-			wantCalls := int32(0)
-			if status == SendPending {
-				wantCalls = 1
+			if err := w.state.Persist(w.sessDir); err != nil {
+				t.Fatal(err)
 			}
-			if client.calls.Load() != wantCalls || !w.state.Snapshot().Requests[key].Ready {
-				t.Fatalf("restored ready report: calls=%d state=%+v", client.calls.Load(), w.state.Snapshot())
+			w.state = stateFromSnapshot(LoadState(w.sessDir, "test-session"))
+			client.events = []dataagent.SSEEvent{ask, eventWithCheckpoint("chat_finish", "chat", "", 3)}
+			for i := 0; i < 3; i++ {
+				w.streamOnce(context.Background())
 			}
-			w.streamOnce(context.Background())
-			if client.calls.Load() != wantCalls {
-				t.Fatal("report resent on replay")
+			restored := w.state.Snapshot()
+			wantStatus := status
+			if status == SendSending {
+				wantStatus = SendUnknown
+			}
+			if client.calls.Load() != 0 || !restored.Requests[key].Ready || restored.Requests[key].Status != wantStatus {
+				t.Fatalf("restored report changed or sent automatically: calls=%d state=%+v", client.calls.Load(), restored)
+			}
+			if status == SendPending || status == SendFailed {
+				if resultReason(&restored) != "waiting_input" {
+					t.Fatalf("restored report must request manual approval: %+v", restored)
+				}
+				if err := w.SendMessage("confirm"); err != nil || client.calls.Load() != 1 {
+					t.Fatalf("restored report manual approval failed: %v", err)
+				}
+			} else if err := w.SendMessage("confirm"); err == nil || client.calls.Load() != 0 {
+				t.Fatal("accepted or uncertain report was sent again")
 			}
 		})
 	}
@@ -512,13 +543,16 @@ func TestReportSendFailureAndManualMessageType(t *testing.T) {
 		{"unknown", "confirm", errors.New("response lost"), "report", SendUnknown},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			w, client := confirmationWatcher(t, false)
+			w, client := confirmationWatcher(t, true)
 			key := applyAsk(w, eventWithCheckpoint("chat_finish", "ask_report_render", "report", 2))
 			client.events = []dataagent.SSEEvent{eventWithCheckpoint("chat_finish", "chat", "", 3)}
 			w.streamOnce(context.Background())
+			if client.calls.Load() != 0 {
+				t.Fatal("report sent without manual approval")
+			}
 			client.send = func() error { return tc.err }
 			err := w.SendMessage(tc.message)
-			if (err != nil) != (tc.err != nil) || client.messages[0].MessageType != tc.wantType || w.state.Snapshot().Requests[key].Status != tc.wantStatus {
+			if (err != nil) != (tc.err != nil) || client.calls.Load() != 1 || client.messages[0].MessageType != tc.wantType || w.state.Snapshot().Requests[key].Status != tc.wantStatus {
 				t.Fatalf("unexpected report delivery: err=%v state=%+v", err, w.state.Snapshot())
 			}
 			client.events = []dataagent.SSEEvent{eventWithCheckpoint("chat_finish", "chat", "", 3), {EventType: "SSE_FINISH"}}

@@ -56,8 +56,8 @@ func TestResultReasonAutoConfirm(t *testing.T) {
 		{"plan sending", "ask_plan", SendSending, true, true, ""},
 		{"sql pending", "ask_sql", SendPending, true, true, ""},
 		{"sql sending", "ask_sql", SendSending, true, true, ""},
-		{"report pending", "ask_report_render", SendPending, true, true, ""},
-		{"report sending", "ask_report_render", SendSending, true, true, ""},
+		{"report pending", "ask_report_render", SendPending, true, true, "waiting_input"},
+		{"report sending", "ask_report_render", SendSending, true, true, "waiting_input"},
 		{"human pending", "ask_human", SendPending, true, true, "waiting_input"},
 		{"human sending", "ask_human", SendSending, true, true, "waiting_input"},
 		{"other kind", "other", SendPending, true, true, "waiting_input"},
@@ -76,7 +76,7 @@ func TestResultReasonAutoConfirm(t *testing.T) {
 				Status: StatusWaitingInput, WaitingFor: "ask_plan",
 				AutoConfirm: tc.autoConfirm, PendingAsk: "ask",
 				Requests: map[string]ConfirmationRequest{
-					"ask": {Key: "ask", Kind: tc.kind, Status: tc.sendStatus, Stable: tc.stable},
+					"ask": {Key: "ask", Kind: tc.kind, Status: tc.sendStatus, Stable: tc.stable, Ready: true},
 				},
 			}
 			if got := resultReason(&snap); got != tc.want {
@@ -120,7 +120,7 @@ func TestResultReasonAutoConfirm(t *testing.T) {
 }
 
 func TestWaitForResultAutoConfirmLifecycle(t *testing.T) {
-	for _, kind := range []string{"ask_plan", "ask_sql", "ask_report_render"} {
+	for _, kind := range []string{"ask_plan", "ask_sql"} {
 		for _, outcome := range []SendStatus{SendAcknowledged, SendFailed, SendUnknown} {
 			t.Run(kind+"/"+string(outcome), func(t *testing.T) {
 				m, state := newWaitTestManager(t)
@@ -171,22 +171,38 @@ func TestWaitForResultAutoConfirmLifecycle(t *testing.T) {
 	}
 }
 
-func TestWaitForResultManualReportWaitsUntilReady(t *testing.T) {
-	for _, stable := range []bool{true, false} {
-		m, state := newWaitTestManager(t)
-		state.RegisterAsk(ConfirmationRequest{Key: "report", Kind: "ask_report_render", Stable: stable})
-		done := make(chan string, 1)
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		go func() {
-			_, reason, _ := m.WaitForResult(ctx, "s1", time.Second)
-			done <- reason
-		}()
-		managerAssertBlocked(t, done)
-		state.MarkReportReady("report")
-		if got := managerReceive(t, done); got != "waiting_input" {
-			t.Fatalf("ready manual report reason=%q", got)
-		}
+func TestWaitForResultReportRequiresManualConfirmation(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		autoConfirm bool
+		stable      bool
+	}{
+		{"auto stable", true, true},
+		{"auto unstable", true, false},
+		{"manual stable", false, true},
+		{"manual unstable", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, state := newWaitTestManager(t)
+			state.AutoConfirm = tc.autoConfirm
+			state.RegisterAsk(ConfirmationRequest{Key: "report", Kind: "ask_report_render", Stable: tc.stable})
+			done := make(chan string, 1)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go func() {
+				_, reason, _ := m.WaitForResult(ctx, "s1", time.Second)
+				done <- reason
+			}()
+			managerAssertBlocked(t, done)
+			state.MarkReportReady("report")
+			if got := managerReceive(t, done); got != "waiting_input" {
+				t.Fatalf("ready report reason=%q", got)
+			}
+			snap := state.Snapshot()
+			if snap.Status != StatusWaitingInput || snap.WaitingFor != "ask_report_render" || snap.Requests["report"].Status != SendPending || snap.SendGeneration != 0 {
+				t.Fatalf("report must await manual confirmation: %+v", snap)
+			}
+		})
 	}
 }
 

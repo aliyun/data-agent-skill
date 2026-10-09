@@ -446,8 +446,6 @@ func (m *Manager) WaitForChange(ctx context.Context, sessionID string, fromCheck
 
 // WaitForResult blocks until the session reaches a state that requires LLM
 // attention: completed, error, canceled, or waiting for manual input.
-// For auto_confirm=true sessions this typically fires only on completion/error,
-// eliminating all intermediate status polling by the LLM.
 // Returns (snapshot, reason, error) where reason is one of:
 // "completed", "error", "canceled", "waiting_input", "timeout",
 // "client_canceled" (transport canceled the request mid-wait).
@@ -520,7 +518,7 @@ func resultReason(snap *StateSnapshot) string {
 			}
 			if snap.AutoConfirm && snap.PendingAsk != "" && ok && request.Stable {
 				switch request.Kind {
-				case "ask_plan", "ask_sql", "ask_report_render":
+				case "ask_plan", "ask_sql":
 					// RegisterAsk notifies waiters before auto-confirmation starts.
 					if request.Status == SendPending || request.Status == SendSending {
 						return ""

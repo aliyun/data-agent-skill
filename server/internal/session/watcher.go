@@ -231,10 +231,6 @@ func (w *Watcher) streamOnce(ctx context.Context) (bool, bool) {
 		w.opMu.Unlock()
 		return true, false
 	}
-	if w.sendPendingReport() {
-		w.opMu.Unlock()
-		return false, false
-	}
 	sseCtx, sseCancel := context.WithCancel(ctx)
 	w.sseCancelMu.Lock()
 	w.sseCancel = sseCancel
@@ -335,7 +331,7 @@ func (w *Watcher) streamOnce(ctx context.Context) (bool, bool) {
 					w.state.SetSendStatus(snap.PendingAsk, SendFailed, false)
 					return false, false, true
 				}
-				return false, w.sendPendingReport(), true
+				return false, false, true
 			}
 		}
 		w.handleParsedEvent(parsed)
@@ -395,18 +391,6 @@ func (w *Watcher) handleConfirmation(pe event.ParsedEvent, key string, stable bo
 		log.Printf("[session:%s] confirmation request=%s delivery=%s", w.state.GetSessionID(), key[:12], w.state.Snapshot().Requests[key].Status)
 	}
 	return w.state.Snapshot().Requests[key].Status == SendAcknowledged
-}
-
-func (w *Watcher) sendPendingReport() bool {
-	snap := w.state.Snapshot()
-	request := snap.Requests[snap.PendingAsk]
-	if !snap.AutoConfirm || request.Kind != "ask_report_render" || !request.Ready || !request.Stable || request.Status != SendPending {
-		return false
-	}
-	if err := w.sendMessage(request.Key, "confirm", true); err != nil {
-		log.Printf("[session:%s] report request=%s delivery=%s", snap.SessionID, request.Key, w.state.Snapshot().Requests[request.Key].Status)
-	}
-	return w.state.Snapshot().Requests[request.Key].Status == SendAcknowledged
 }
 
 func (w *Watcher) handleParsedEvent(pe event.ParsedEvent) {

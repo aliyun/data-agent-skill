@@ -277,7 +277,7 @@ var listWorkspaceDatabasesTool = mcp.NewTool(
 
 var createSessionTool = mcp.NewTool(
 	"data_agent_create_session",
-	mcp.WithDescription("Create a Data Agent analysis session. Supports database analysis (database_id) or file analysis (file_id from data_agent_upload_callback). MANDATORY: before calling this tool for database analysis, you MUST call data_agent_list_workspace_databases in this same turn and use its returned values — never guess or reuse database_id/instance_id/engine from memory or prior conversations. Mode selection: quick factual question → mode=lite; deep analysis/report requested → mode=pro (or ultra for the most thorough); unsure → omit mode and the backend decides. For pro/ultra mode with auto_confirm=true, all plan/SQL/report confirmations are handled automatically."),
+	mcp.WithDescription("Create a Data Agent analysis session. Supports database analysis (database_id) or file analysis (file_id from data_agent_upload_callback). MANDATORY: before calling this tool for database analysis, you MUST call data_agent_list_workspace_databases in this same turn and use its returned values — never guess or reuse database_id/instance_id/engine from memory or prior conversations. Mode selection: quick factual question → mode=lite; deep analysis/report requested → mode=pro (or ultra for the most thorough); unsure → omit mode and the backend decides. For pro/ultra mode with auto_confirm=true, only plan/SQL confirmations are handled automatically; web report rendering (ask_report_render) requires explicit user confirmation."),
 	mcp.WithString("database_id", mcp.Description("DMS database ID — MUST come from a data_agent_list_workspace_databases call in this turn (required for database analysis, or use file_id for file analysis; not needed when a custom agent supplies the data source)")),
 	mcp.WithString("db_name", mcp.Description("Database schema name from data_agent_list_workspace_databases (required for database analysis, unless a custom agent supplies the data source)")),
 	mcp.WithString("tables", mcp.Description("Comma-separated table names to analyze (required for database analysis, unless a custom agent supplies the data source)")),
@@ -286,7 +286,7 @@ var createSessionTool = mcp.NewTool(
 	mcp.WithString("file_name", mcp.Description("Original filename (e.g. sales.csv). Required when using file_id.")),
 	mcp.WithString("mode", mcp.Description("Session mode tier: auto (default for database — backend decides), lite (quick Q&A, single SQL, ~seconds), pro (deep multi-step analysis with reports, minutes; default for file), ultra (most thorough multi-dimensional insights). Legacy values ASK_DATA/ANALYSIS/INSIGHT are auto-mapped to lite/pro/ultra.")),
 	mcp.WithString("plan_mode", mcp.Description("Plan mode for pro/ultra sessions: 'force' (always generate an execution plan) or 'disable' (skip planning, execute directly). Empty = server default.")),
-	mcp.WithBoolean("auto_confirm", mcp.Description("Auto-confirm plans/SQL/reports (default true)")),
+	mcp.WithBoolean("auto_confirm", mcp.Description("Auto-confirm plans/SQL only (default true); web reports require explicit user confirmation")),
 	mcp.WithString("instance_id", mcp.Description("DMS instance ID from data_agent_list_workspace_databases, not from DMS search results")),
 	mcp.WithString("instance_name", mcp.Description("Instance resource ID from data_agent_list_workspace_databases.instance_resource_id (e.g. rm-xxx)")),
 	mcp.WithString("engine", mcp.Description("Database engine from data_agent_list_workspace_databases.db_type (default mysql)")),
@@ -304,7 +304,7 @@ var statusTool = mcp.NewTool(
 
 var waitResultTool = mcp.NewTool(
 	"data_agent_wait_result",
-	mcp.WithDescription("Block until the session needs LLM attention: completed, error, canceled, or waiting for manual input. For auto_confirm=true sessions this returns only on completion/error, eliminating all intermediate status polling. Returns reason: 'completed'|'error'|'canceled'|'waiting_input'|'timeout'. On reason=timeout the session is still running: report the returned progress (checkpoint_delta, new_conclusions) to the user, then call this tool again with the same session_id. Never call in parallel for the same session."),
+	mcp.WithDescription("Block until the session needs LLM attention: completed, error, canceled, or waiting for manual input. Even with auto_confirm=true, human-input requests and ready web-report confirmations (ask_report_render) return waiting_input. Web reports require explicit user confirmation. Returns reason: 'completed'|'error'|'canceled'|'waiting_input'|'timeout'. On reason=timeout the session is still running: report the returned progress (checkpoint_delta, new_conclusions) to the user, then call this tool again with the same session_id. Never call in parallel for the same session."),
 	mcp.WithString("session_id", mcp.Required(), mcp.Description("Session ID to wait for")),
 	mcp.WithNumber("timeout", mcp.Description("Max seconds to block. Default and ceiling: the server wait cap (55s unless DATA_AGENT_WAIT_CAP overrides it), chosen to finish before nginx default proxy_read_timeout (60s) and MCP client transport timeouts (~120s); larger values are clamped. On reason=timeout just call again.")),
 )
@@ -316,12 +316,12 @@ var watchSessionTool = mcp.NewTool(
 	mcp.WithString("agent_id", mcp.Description("Agent ID for the session. Optional; resolved via DescribeDataAgentSession when omitted.")),
 	mcp.WithString("workspace_id", mcp.Description("Workspace ID for the session. Defaults to configured workspace.")),
 	mcp.WithString("mode", mcp.Description("Session mode tier (auto/lite/pro/ultra). Optional metadata for follow-up sends; legacy ASK_DATA/ANALYSIS values are auto-mapped.")),
-	mcp.WithBoolean("auto_confirm", mcp.Description("Auto-confirm plans/SQL/reports while watching (default true)")),
+	mcp.WithBoolean("auto_confirm", mcp.Description("Auto-confirm plans/SQL only while watching (default true); web reports require explicit user confirmation")),
 )
 
 var sendTool = mcp.NewTool(
 	"data_agent_send",
-	mcp.WithDescription("Send a message to a Data Agent session: confirm a plan, answer a question, or ask a follow-up. Works on finished sessions too — the server transparently revives a completed session and the remote session keeps the full conversation context, so pronouns resolve against earlier turns. Prefer this over creating a new session when the user follows up on the same data. After sending, use data_agent_wait_result as usual; each turn appends to conclusions."),
+	mcp.WithDescription("Send a message to a Data Agent session: confirm a plan, answer a question, or ask a follow-up. For a ready ask_report_render, send message='confirm' only after explicit user approval to request web report rendering. Works on finished sessions too — the server transparently revives a completed session and the remote session keeps the full conversation context, so pronouns resolve against earlier turns. Prefer this over creating a new session when the user follows up on the same data. After sending, use data_agent_wait_result as usual; each turn appends to conclusions."),
 	mcp.WithString("session_id", mcp.Required(), mcp.Description("Target session ID (running, waiting for input, or already completed)")),
 	mcp.WithString("message", mcp.Required(), mcp.Description("Message to send")),
 )

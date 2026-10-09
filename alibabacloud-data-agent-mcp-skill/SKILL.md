@@ -79,7 +79,7 @@ data_agent_list_workspace_databases(workspace_id?)
 Use this tool before `data_agent_create_session` for database analysis. Pass its `db_id`, `db_name`, `instance_id`, `instance_resource_id`, and `db_type` into the session options.
 
 ### data_agent_create_session
-Create an analysis session with automatic SSE monitoring. Supports **database analysis** (`database_id`) or **file analysis** (`file_id` from `data_agent_upload_callback`). For pro/ultra mode with `auto_confirm=true`, all plan/SQL/report confirmations are handled automatically.
+Create an analysis session with automatic SSE monitoring. Supports **database analysis** (`database_id`) or **file analysis** (`file_id` from `data_agent_upload_callback`). For pro/ultra mode with `auto_confirm=true`, only plan/SQL confirmations are handled automatically; web report rendering (`ask_report_render`) requires explicit user confirmation.
 ```
 data_agent_create_session(
   query,                                          # Required
@@ -89,7 +89,7 @@ data_agent_create_session(
                                                   # (legacy ASK_DATA/ANALYSIS/INSIGHT auto-map to lite/pro/ultra)
   plan_mode="force|disable",                      # pro/ultra only: force = always generate an execution plan,
                                                   # disable = skip planning and execute directly; empty = server default
-  auto_confirm=true,                              # Auto-confirm plans/SQL/reports
+  auto_confirm=true,                              # Auto-confirm plans/SQL only; web reports need user approval
   instance_id, instance_name, engine="mysql",     # Optional (database only)
   workspace_id, custom_agent_id                   # Optional
 )
@@ -108,7 +108,7 @@ data_agent_create_session(
 > If the database is not returned by `data_agent_list_workspace_databases()`, use `data_agent_search_dms_databases` → `data_agent_list_tables` → `data_agent_import_database`, then call `data_agent_list_workspace_databases()` again and use that row for `create_session`.
 
 ### data_agent_wait_result
-Block until the session needs LLM attention: completed, error, canceled, or waiting for manual input. For `auto_confirm=true` sessions this fires only on completion/error, collapsing all intermediate polling into a single blocking call. **Preferred over looping `data_agent_status` where this tool is exposed.**
+Block until the session needs LLM attention: completed, error, canceled, or waiting for manual input. With `auto_confirm=true`, only plan/SQL confirmations are automatic; human-input requests and ready web-report confirmations still return `waiting_input`. **Preferred over looping `data_agent_status` where this tool is exposed.**
 
 > **May be unavailable.** Non-blocking deployments (e.g. DataBuddy IM) disable this tool via `tools.exclude` because a long internal block can exceed the outer MCP call timeout. If `data_agent_wait_result` is not in your tool schema, do not call or invent it — fall back to the one-shot status snapshot protocol (create session, take at most one `data_agent_status` snapshot per user turn, end the turn if still running). See the Progress Tracking Protocol below.
 ```
@@ -120,7 +120,8 @@ data_agent_wait_result(session_id, timeout=55)
 - **reason**: `"completed"` | `"error"` | `"canceled"` | `"waiting_input"` | `"timeout"` | `"client_canceled"` | `"duplicate_wait"`
 - On `reason="timeout"` the session is still running and the response carries `checkpoint_delta`, `new_conclusions`, and `next_action`: briefly report that progress to the user, then call `data_agent_wait_result` again with the same `session_id`. Loop until a terminal reason (cap the loop, e.g. 20 rounds for pro/ultra).
 - **Never call in parallel** for the same session: a duplicate concurrent call returns immediately with `reason="duplicate_wait"` and a warning instead of blocking.
-- Returns immediately when the SSE watcher fires any terminal or input event — no polling.
+- Returns on terminal events or input readiness — no polling. For `ask_report_render`, the watcher drains trailing analysis output before marking the confirmation ready; then `waiting_input` is returned regardless of `auto_confirm`.
+- On `reason="waiting_input"` with `waiting_for="ask_report_render"`, show the existing analysis results and ask whether the user wants a web report. **Do not send `confirm` automatically.** Only after user approval, call `data_agent_send(session_id, message="confirm")` (internally `messageType=report` to render the web report), then call `data_agent_wait_result` again.
 
 ### data_agent_status
 Get current status snapshot. Use `wait_timeout` when you want incremental step-level progress during a long run.
@@ -318,16 +319,18 @@ data_agent_list_agents(
 
 > For database sessions, prefer `data_agent_list_workspace_databases()` over `data_agent_search_dms_databases()` as the source of `database_id`, `instance_id`, `instance_name`, and `engine`. DMS search can return `instance_id=0`; passing that to `create_session` may fail with `Specified parameter InstanceId is not valid`.
 
-## Deep Analysis (pro/ultra, auto-confirm)
+## Deep Analysis (pro/ultra, plan/SQL auto-confirm)
 ```
 1. data_agent_create_session(
-     ..., mode="pro", auto_confirm=true)          # All confirmations automatic ("ultra" for the most thorough tier)
+     ..., mode="pro", auto_confirm=true)          # Plan/SQL confirmations only ("ultra" for the most thorough tier)
 2. LOOP data_agent_wait_result(session_id, timeout=55)  # Server-capped block; pro/ultra runs need several rounds
      reason=="timeout" → report checkpoint_delta/new_conclusions to user, loop again (max ~20 rounds)
-     reason terminal   → exit loop
+     reason terminal or "waiting_input" → exit loop
                                                     # (if excluded: one-shot data_agent_status snapshot, then end turn if still running)
-3. data_agent_result(session_id)                  # Get multi-step conclusions
+3. data_agent_result(session_id)                  # Get and show existing multi-step conclusions
 4. data_agent_list_files(session_id)              # Get artifacts
+5. If waiting_for=="ask_report_render": ask whether the user wants a web report; do not auto-confirm
+   Only after user approval: data_agent_send(session_id, message="confirm") → repeat steps 2–4
 ```
 
 > **When to use `data_agent_status` instead**: use it when you want to push intermediate step progress to the user (plan text, per-step conclusions, chart images) during a long run. Call `data_agent_status(session_id, wait_timeout=30, poll_hint="check-N")` in a loop until `status != running`; see Status Check Protocol below.
@@ -467,15 +470,17 @@ Use this workflow when the user asks to query sessions, check progress, stop/can
 Created → RUNNING (SSE monitoring active)
   ├── lite: RUNNING → COMPLETED (auto)
   ├── pro/ultra (auto_confirm=true):
-  │     RUNNING → ask_plan (auto-confirm) → step execution → ask_sql (auto-confirm) → COMPLETED
+  │     RUNNING → ask_plan (auto-confirm) → step execution → ask_sql (auto-confirm) → analysis results
   ├── pro/ultra (auto_confirm=false):
-  │     RUNNING → WAIT_INPUT (ask_plan) → user confirms → RUNNING → ... → COMPLETED
+  │     RUNNING → WAIT_INPUT (ask_plan) → user confirms → RUNNING → ... → analysis results
+  ├── after analysis (either auto_confirm setting):
+  │     COMPLETED, or ask_report_render → drain → WAIT_INPUT (ready) → user confirms → render report → COMPLETED
   └── ERROR / CANCELED (on failure)
 ```
 
 The MCP Server's Session Daemon automatically:
 - Monitors SSE streams for all active sessions
-- Handles auto-confirmation (plan, SQL, report render)
+- Handles auto-confirmation (plan/SQL only; web report rendering requires explicit user confirmation)
 - Tracks step progress and extracts conclusions
 - Cleans up stale sessions (IDLE > 30 min)
 - Reconnects on SSE disconnection (exponential backoff, up to 10 retries)
@@ -519,6 +524,8 @@ Use `data_agent_wait_result` — the server blocks internally and wakes up insta
    IF reason == "canceled": → report to user → DONE
    IF reason == "waiting_input":
      → waiting_for == "ask_plan": show plan, ask user → data_agent_send → loop back to wait_result
+     → waiting_for == "ask_report_render": show existing analysis results, ask whether the user wants a web report
+       → do not auto-confirm; only after user approval: data_agent_send(session_id, message="confirm") → loop back to wait_result
      → else: show detail, ask user → data_agent_send → loop back to wait_result
    IF reason == "timeout" (or "client_canceled"):
      → session is still running; the response carries checkpoint_delta, new_conclusions, next_action
@@ -631,10 +638,10 @@ These are end-to-end durations, not poll intervals. Do NOT translate them into a
 When `status == "waiting_input"`:
 - `waiting_for == "ask_plan"` → Show the analysis plan and ask user to confirm or modify
 - `waiting_for == "ask_sql"` → Show the SQL to execute and ask user to confirm
-- `waiting_for == "ask_report"` → Show report format and ask user to confirm
+- `waiting_for == "ask_report_render"` → Show existing analysis results and ask whether the user wants a web report; never auto-confirm. Only after approval, send `message="confirm"`, then use `data_agent_wait_result` if available
 - `waiting_for == "human_input"` → Show the question and ask user for free-text input
 
-After getting the user's response, call `data_agent_send(session_id, message)`. Then check status once more per the protocol — do not resume a tight polling loop.
+After getting the user's response, call `data_agent_send(session_id, message)`. Then use `data_agent_wait_result` if available, otherwise check status once more per the protocol — do not resume a tight polling loop.
 
 ## Error Recovery
 
