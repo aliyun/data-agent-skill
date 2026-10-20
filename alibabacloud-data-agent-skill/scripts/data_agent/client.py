@@ -1322,10 +1322,12 @@ class DataAgentClient:
 
         For API_KEY authentication, uses startTime/endTime parameters.
         For AK/SK authentication, uses createStartTime/createEndTime parameters.
+        Time values are epoch milliseconds in both cases; RFC3339/ISO strings
+        are rejected by the gateway.
 
         Args:
-            start_time: Start time for filtering sessions (ISO format).
-            end_time: End time for filtering sessions (ISO format).
+            start_time: Start time for filtering sessions (epoch milliseconds).
+            end_time: End time for filtering sessions (epoch milliseconds).
             page_number: Page number (1-based).
             page_size: Number of results per page.
             custom_agent_id: Filter by custom agent ID.
