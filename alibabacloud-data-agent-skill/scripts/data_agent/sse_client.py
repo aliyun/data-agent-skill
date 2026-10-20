@@ -213,13 +213,12 @@ class SSEClient:
             'Action': 'GetChatContent',
             'Version': '2025-04-14',
             'RegionId': self._config.region,
-            'AgentId': agent_id,
             'SessionId': session_id,
         }
+        if agent_id:
+            body['AgentId'] = agent_id
         if checkpoint is not None:
             body['Checkpoint'] = str(checkpoint)
-        if self._config.dms_unit:
-            body['DMSUnit'] = self._config.dms_unit
 
         # Set up headers with API_KEY
         headers = {
@@ -296,21 +295,20 @@ class SSEClient:
     ) -> Iterator[SSEEvent]:
         """Stream with AK/SK authentication via default credential chain."""
         from alibabacloud_credentials.client import Client as CredentialClient
-
+        
         credential_client = CredentialClient()
         credential = credential_client.get_credential()
         access_key_id = credential.access_key_id
         access_key_secret = credential.access_key_secret
         security_token = credential.security_token
-
+        
         params = {
-            "AgentId": agent_id,
             "SessionId": session_id,
         }
+        if agent_id:
+            params["AgentId"] = agent_id
         if checkpoint is not None:
             params["Checkpoint"] = str(checkpoint)
-        if self._config.dms_unit:
-            params["DMSUnit"] = self._config.dms_unit
 
         host = self._config.endpoint
         headers = AliyunSignerV3.sign(
@@ -392,8 +390,8 @@ class SSEClient:
 
     def stream_chat_content(
         self,
-        agent_id: str,
         session_id: str,
+        agent_id: str = "",
         timeout: int = 120,
         checkpoint: Optional[int] = None,
         max_retries: int = 3,
@@ -401,11 +399,12 @@ class SSEClient:
         """Stream chat content from Data Agent using SSE.
 
         Automatically reconnects from the last checkpoint on SSL/connection
-        errors, enabling resilience during long-running analysis sessions.
+        errors, enabling resilience during long-running pro/ultra sessions.
 
         Args:
-            agent_id: The agent ID.
             session_id: The session ID.
+            agent_id: Deprecated — no longer needed. Omitted from the wire
+                when empty; kept only for backward compatibility.
             timeout: Request timeout in seconds.
             checkpoint: Optional starting checkpoint (0 to replay from beginning).
             max_retries: Maximum number of reconnection attempts on error.
@@ -471,8 +470,8 @@ class SSEClient:
 
     def get_full_response(
         self,
-        agent_id: str,
         session_id: str,
+        agent_id: str = "",
         timeout: int = 120,
     ) -> str:
         """Get complete response by collecting all SSE events.
@@ -482,8 +481,9 @@ class SSEClient:
         Also collects `delta/llm` events as supplementary streaming text.
 
         Args:
-            agent_id: The agent ID.
             session_id: The session ID.
+            agent_id: Deprecated — no longer needed. Omitted from the wire
+                when empty; kept only for backward compatibility.
             timeout: Request timeout in seconds.
 
         Returns:
@@ -491,7 +491,9 @@ class SSEClient:
         """
         content_parts = []
 
-        for event in self.stream_chat_content(agent_id, session_id, timeout):
+        for event in self.stream_chat_content(
+            session_id=session_id, agent_id=agent_id, timeout=timeout
+        ):
             # Collect all delta events (llm / tool_call_response / output_conclusion etc.)
             if event.event_type == "delta":
                 if event.content:
@@ -556,13 +558,12 @@ class AsyncSSEClient:
             'Action': 'GetChatContent',
             'Version': '2025-04-14',
             'RegionId': self._config.region,
-            'AgentId': agent_id,
             'SessionId': session_id,
         }
+        if agent_id:
+            body['AgentId'] = agent_id
         if checkpoint is not None:
             body['Checkpoint'] = str(checkpoint)
-        if self._config.dms_unit:
-            body['DMSUnit'] = self._config.dms_unit
 
         # Set up headers with API_KEY
         headers = {
@@ -628,21 +629,20 @@ class AsyncSSEClient:
     ) -> AsyncIterator[SSEEvent]:
         """Async stream with AK/SK authentication via default credential chain."""
         from alibabacloud_credentials.client import Client as CredentialClient
-
+        
         credential_client = CredentialClient()
         credential = credential_client.get_credential()
         access_key_id = credential.access_key_id
         access_key_secret = credential.access_key_secret
         security_token = credential.security_token
-
+        
         params = {
-            "AgentId": agent_id,
             "SessionId": session_id,
         }
+        if agent_id:
+            params["AgentId"] = agent_id
         if checkpoint is not None:
             params["Checkpoint"] = str(checkpoint)
-        if self._config.dms_unit:
-            params["DMSUnit"] = self._config.dms_unit
 
         host = self._config.endpoint
         headers = AliyunSignerV3.sign(
@@ -712,8 +712,8 @@ class AsyncSSEClient:
 
     async def stream_chat_content(
         self,
-        agent_id: str,
         session_id: str,
+        agent_id: str = "",
         timeout: int = 120,
         checkpoint: Optional[int] = None,
         max_retries: int = 3,
@@ -721,11 +721,12 @@ class AsyncSSEClient:
         """Stream chat content asynchronously.
 
         Automatically reconnects from the last checkpoint on SSL/connection
-        errors, enabling resilience during long-running analysis sessions.
+        errors, enabling resilience during long-running pro/ultra sessions.
 
         Args:
-            agent_id: The agent ID.
             session_id: The session ID.
+            agent_id: Deprecated — no longer needed. Omitted from the wire
+                when empty; kept only for backward compatibility.
             timeout: Request timeout in seconds.
             checkpoint: Optional starting checkpoint (0 to replay from beginning).
             max_retries: Maximum number of reconnection attempts on error.
@@ -785,8 +786,8 @@ class AsyncSSEClient:
 
     async def get_full_response(
         self,
-        agent_id: str,
         session_id: str,
+        agent_id: str = "",
         timeout: int = 120,
     ) -> str:
         """Get complete response asynchronously.
@@ -796,8 +797,9 @@ class AsyncSSEClient:
         Also collects `delta/llm` events as supplementary streaming text.
 
         Args:
-            agent_id: The agent ID.
             session_id: The session ID.
+            agent_id: Deprecated — no longer needed. Omitted from the wire
+                when empty; kept only for backward compatibility.
             timeout: Request timeout in seconds.
 
         Returns:
@@ -805,7 +807,9 @@ class AsyncSSEClient:
         """
         content_parts = []
 
-        async for event in self.stream_chat_content(agent_id, session_id, timeout):
+        async for event in self.stream_chat_content(
+            session_id=session_id, agent_id=agent_id, timeout=timeout
+        ):
             # Collect all delta events (llm / tool_call_response / output_conclusion etc.)
             if event.event_type == "delta":
                 if event.content:

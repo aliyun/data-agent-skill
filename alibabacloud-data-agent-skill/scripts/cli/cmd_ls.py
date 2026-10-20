@@ -81,15 +81,27 @@ def cmd_ls(args: argparse.Namespace) -> None:
         print(f"  Databases ({len(items)})")
         print(f"{'=' * 60}")
         for db in items:
-            attrs = db.get("MetaEntityAttrs") or db.get("metaEntityAttrs") or {}
+            # ListDataCenterDatabase items are flat dicts (databaseName/dbId/...);
+            # older shapes nested them under MetaEntityAttrs - support both.
+            attrs = db.get("MetaEntityAttrs") or db.get("metaEntityAttrs") or db
             db_id_val = _get_field(attrs, "dbId", "DbId", default="")
-            schema_name = _get_field(attrs, "schemaName", "SchemaName", default="")
+            schema_name = _get_field(attrs, "databaseName", "DatabaseName", "schemaName", "SchemaName", default="")
             catalog_name = _get_field(attrs, "catalogName", "CatalogName", default="")
             db_type = _get_field(attrs, "dbType", "DbType", default="")
+            instance_name = _get_field(attrs, "instanceName", "InstanceName", default="")
             instance_id = _get_field(attrs, "instanceId", "InstanceId", default="")
             instance_resource_id = _get_field(attrs, "instanceResourceId", "InstanceResourceId", default="")
 
-            print(f"  {schema_name} [{db_type}] dbId={db_id_val} instanceId={instance_id} instanceResourceId={instance_resource_id} catalogName={catalog_name}")
+            parts = [f"dbId={db_id_val}"]
+            if instance_id:
+                parts.append(f"instanceId={instance_id}")
+            if instance_name:
+                parts.append(f"instanceName={instance_name}")
+            if instance_resource_id:
+                parts.append(f"instanceResourceId={instance_resource_id}")
+            if catalog_name:
+                parts.append(f"catalogName={catalog_name}")
+            print(f"  {schema_name} [{db_type}] " + " ".join(parts))
         print()
         return
 
@@ -125,11 +137,11 @@ def cmd_ls(args: argparse.Namespace) -> None:
         db_resp = client.list_databases(workspace_id=workspace_id_arg)
         all_dbs = _extract_list(db_resp)
         for db in all_dbs:
-            attrs = db.get("MetaEntityAttrs") or db.get("metaEntityAttrs") or {}
+            attrs = db.get("MetaEntityAttrs") or db.get("metaEntityAttrs") or db
             if str(_get_field(attrs, "dbId", "DbId", default="")) == str(db_id):
-                schema_name = _get_field(attrs, "schemaName", "SchemaName", default="")
+                schema_name = _get_field(attrs, "databaseName", "DatabaseName", "schemaName", "SchemaName", default="")
                 db_type = _get_field(attrs, "dbType", "DbType", default="")
-                instance_id = _get_field(attrs, "instanceId", "InstanceId", default="")
+                instance_id = _get_field(attrs, "instanceId", "InstanceId", "instanceName", "InstanceName", default="")
                 break
     except Exception:
         pass

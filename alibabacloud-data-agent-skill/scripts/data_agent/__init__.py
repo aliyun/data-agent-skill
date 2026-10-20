@@ -29,7 +29,7 @@ from data_agent.exceptions import (
     ApiError,
 )
 
-__version__ = "1.8.6"
+__version__ = "2.5.0"
 
 __all__ = [
     # Config

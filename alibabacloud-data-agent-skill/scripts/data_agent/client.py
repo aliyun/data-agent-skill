@@ -218,7 +218,7 @@ class DataAgentClient:
         The dms-enterprise endpoint differs from the Data Agent endpoint, so
         we build a dedicated SDK client here (AK/SK mode only).
         """
-        if self._auth_type != "default_credential_chain":
+        if self._auth_type == "api_key":
             # API_KEY auth does not map to dms-enterprise; keep the fallback.
             return {}
 
@@ -330,7 +330,7 @@ class DataAgentClient:
         Raises:
             ApiError: If the API call fails.
         """
-        if self._auth_type != "default_credential_chain":
+        if self._auth_type == "api_key":
             # API_KEY mode has no AK/SK credentials for dms-enterprise
             import warnings
             warnings.warn(
@@ -395,25 +395,46 @@ class DataAgentClient:
             self._sdk_client = None
             self._auth_type = "api_key"
         else:
-            # Use Alibaba Cloud default credential chain
-            # Supports: env vars, ~/.aliyun/config.json, ECS role, OIDC role, etc.
+            # AK/SK authentication: static credentials from the plain
+            # credentials file when configured, otherwise the Alibaba Cloud
+            # default credential chain (env vars, ~/.aliyun/config.json,
+            # ECS role, OIDC role, etc.)
             from alibabacloud_credentials.client import Client as CredentialClient
-            
+
             try:
-                self._credential_client = CredentialClient()
-                credential = self._credential_client.get_credential()
-                
+                entry = getattr(self._config, "_credentials_entry", None)
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("access_key_id")
+                    and entry.get("access_key_secret")
+                ):
+                    from alibabacloud_credentials import models as cred_models
+
+                    cred_config = cred_models.Config(
+                        type="access_key",
+                        access_key_id=entry["access_key_id"],
+                        access_key_secret=entry["access_key_secret"],
+                    )
+                    self._credential_client = CredentialClient(cred_config)
+                    self._auth_type = "credential_file"
+                else:
+                    self._credential_client = CredentialClient()
+                    self._auth_type = "default_credential_chain"
+                # Force credential resolution early so misconfiguration
+                # fails here rather than at the first API call.
+                self._credential_client.get_credential()
+
                 sdk_config = open_api_models.Config()
                 sdk_config.endpoint = self._config.endpoint
                 sdk_config.user_agent = "AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill"
                 sdk_config.credential = self._credential_client
-                    
+
                 self._sdk_client = OpenApiClient(sdk_config)
-                self._auth_type = "default_credential_chain"
             except Exception as e:
                 raise AuthenticationError(
-                    f"Failed to get credentials from default credential chain: {e}. "
-                    "Please configure credentials via ~/.aliyun/config.json, "
+                    f"Failed to get credentials: {e}. "
+                    "Please configure credentials via the credentials file "
+                    "(DATA_AGENT_CREDENTIALS_FILE), ~/.aliyun/config.json, "
                     "environment variables, or instance role."
                 )
 
@@ -465,7 +486,8 @@ class DataAgentClient:
             'ListDataAgentSession', 'CreateDataAgentSession', 'DescribeDataAgentSession',
             'DescribeFileUploadSignature', 'FileUploadCallback',
             'ListDataAgentWorkspace', 'InitDataAgentPersonalWorkspace',
-            'ListCustomAgent', 'DescribeCustomAgent'
+            'ListCustomAgent', 'DescribeCustomAgent',
+            'CreateCustomAgent', 'ModifyCustomAgent', 'OperateCustomAgent',
         ]
 
         data_plane_actions = [
@@ -660,9 +682,10 @@ class DataAgentClient:
         title: str = "data-agent-session",
         mode: Optional[str] = None,
         enable_search: bool = False,
-        file_id: Optional[str] = None,
+        file_id: Optional[str] = None,  # 添加文件ID参数
         workspace_id: Optional[str] = None,
         custom_agent_id: Optional[str] = None,
+        custom_agent_stage: str = "prod",
         client_token: Optional[str] = None,
         plan_mode: Optional[str] = "force",
     ) -> SessionInfo:
@@ -676,6 +699,7 @@ class DataAgentClient:
             file_id: Optional file ID for file-based analysis session.
             workspace_id: Optional workspace ID to bind to the session.
             custom_agent_id: Optional custom agent ID to use for the session.
+            custom_agent_stage: Stage of the custom agent, "prod" (default) or "debug".
             client_token: Optional idempotency token, auto-generated for retries.
             plan_mode: Plan mode: "force" (default, always plan) or "disable" (skip planning).
 
@@ -709,7 +733,7 @@ class DataAgentClient:
             session_config["PlanMode"] = plan_mode
         if custom_agent_id:
             session_config["CustomAgentId"] = custom_agent_id
-            session_config["CustomAgentStage"] = "prod"
+            session_config["CustomAgentStage"] = custom_agent_stage
 
         # For API_KEY auth, SessionConfig should be a JSON object, not string
         # For AK/SK auth, SessionConfig should be a JSON string
@@ -814,43 +838,74 @@ class DataAgentClient:
     @retry_on_error(max_retries=3)
     def send_message(
         self,
-        agent_id: str,
-        session_id: str,
         message: str,
+        session_id: str = "",
+        agent_id: str = "",
         message_type: str = "primary",
         data_source: Optional[DataSource] = None,
         language: str = "CHINESE",
         workspace_id: str = "",
         mode: Optional[str] = None,
+        data_sources: Optional[list] = None,
+        report_config: Optional[dict] = None,
+        permission_config: Optional[dict] = None,
         plan_mode: Optional[str] = None,
     ) -> dict:
         """Send a message to the Data Agent.
 
         Args:
-            agent_id: The agent ID.
-            session_id: The session ID.
             message: The user's natural language query.
-            message_type: Message type (default: "primary").
+            session_id: The session ID. May be omitted for the first message
+                of a session — the backend then creates the session and the
+                response data carries the new AgentId / SessionId.
+            agent_id: Deprecated — no longer needed. The backend resolves the
+                agent automatically; kept only for backward compatibility and
+                omitted from the wire when empty.
+            message_type: Message type (default: "primary"; "report" for web
+                report generation requests, "cancel" to cancel the session,
+                "diag" for report-diagnosis requests where the message text
+                is the complaint about the session's report).
             data_source: Optional DataSource with database metadata.
             language: Response language (default: "CHINESE").
             workspace_id: The workspace ID (required for workspace-bound sessions).
             mode: Optional per-message analysis mode. Supported values:
-                ``auto``, ``lite``, ``pro``, ``ultra``. When provided
-                it is injected into ``SessionConfig.Mode`` and overrides
-                the session-level mode for this single request.
-            plan_mode: Optional per-message plan mode: "force" or "disable".
+                ``auto``, ``lite``, ``pro``, ``ultra``. When provided it is
+                injected into ``SessionConfig.Mode`` and overrides the
+                session-level mode for this single request.
+            plan_mode: Optional per-message plan mode, ``force`` (always
+                generate an execution plan) or ``disable`` (skip planning).
+                When provided it is injected into ``SessionConfig.PlanMode``;
+                omitted by default so the session-level setting applies.
+            data_sources: Optional list of message-level data sources, each a
+                dict like ``{"DataSourceType": "remote_data_center", "FileId":
+                "..."}``. Distinct from ``data_source`` (session-level).
+            report_config: Optional report configuration dict for
+                ``message_type="report"``, e.g. ``{"ReportType": "WebReport",
+                "ReportTheme": "default", "ReportPrompt": "..."}``. Injected
+                as ``TaskConfig.ReportConfig``.
+            permission_config: Optional session-level permission dict, e.g.
+                ``{"DefaultAction": "deny"}`` — the default action for tables
+                not declared in any data-source permission. Injected into
+                ``SessionConfig.PermissionConfig``.
 
         Returns:
             Response from the API.
         """
-        # Query parameters for RPC style API
+        # Query parameters for RPC style API.
+        # AgentId / SessionId are auto-filled by the backend when omitted, so
+        # the first SendChatMessage of a session can create it directly; the
+        # response then carries the new AgentId / SessionId.
         params = {
-            "AgentId": agent_id,
-            "SessionId": session_id,
             "Message": message,
             "MessageType": message_type,
-            "DMSUnit": self._resolve_dms_unit(),
         }
+        if agent_id:
+            params["AgentId"] = agent_id
+        if session_id:
+            params["SessionId"] = session_id
+        dms_unit = self._resolve_dms_unit()
+        if dms_unit:
+            params["DMSUnit"] = dms_unit
         if workspace_id:
             params["WorkspaceId"] = workspace_id
 
@@ -859,9 +914,12 @@ class DataAgentClient:
         # For AK/SK auth: JSON string
         session_config: dict = {"Language": language}
         if mode:
+            # Per-message mode override; supports auto / lite / pro / ultra.
             session_config["Mode"] = mode
         if plan_mode:
             session_config["PlanMode"] = plan_mode
+        if permission_config:
+            session_config["PermissionConfig"] = permission_config
         if self._auth_type == "api_key":
             params["SessionConfig"] = session_config
         else:
@@ -876,6 +934,19 @@ class DataAgentClient:
             else:
                 params["DataSource"] = json.dumps(data_source.to_api_dict())
 
+        if data_sources:
+            if self._auth_type == "api_key":
+                params["DataSources"] = data_sources
+            else:
+                params["DataSources"] = json.dumps(data_sources)
+
+        if report_config:
+            task_config = {"ReportConfig": report_config}
+            if self._auth_type == "api_key":
+                params["TaskConfig"] = task_config
+            else:
+                params["TaskConfig"] = json.dumps(task_config)
+
         return self._call_api(
             action="SendChatMessage",
             version="2025-04-14",
@@ -885,29 +956,28 @@ class DataAgentClient:
     @retry_on_error(max_retries=3)
     def get_chat_content(
         self,
-        agent_id: str,
         session_id: str,
+        agent_id: str = "",
         checkpoint: Optional[str] = None,
     ) -> dict:
         """Get chat content from the Data Agent.
 
         Args:
-            agent_id: The agent ID.
             session_id: The session ID.
+            agent_id: Deprecated — no longer needed. Omitted from the wire
+                when empty; kept only for backward compatibility.
             checkpoint: Optional checkpoint for incremental fetching.
 
         Returns:
             Response containing content blocks.
         """
         params = {
-            "AgentId": agent_id,
             "SessionId": session_id,
         }
+        if agent_id:
+            params["AgentId"] = agent_id
         if checkpoint:
             params["Checkpoint"] = checkpoint
-        dms_unit = self._resolve_dms_unit()
-        if dms_unit:
-            params["DMSUnit"] = dms_unit
 
         return self._call_api(
             action="GetChatContent",
@@ -920,12 +990,17 @@ class DataAgentClient:
         self,
         filename: str,
         file_size: int,
+        workspace_id: Optional[str] = None,
+        dms_unit: Optional[str] = None,
     ) -> dict:
         """Get OSS upload signature for file upload.
 
         Args:
             filename: Name of the file to upload.
             file_size: Size of the file in bytes.
+            workspace_id: Optional workspace ID to upload into (defaults to
+                the caller's personal workspace).
+            dms_unit: Optional DMSUnit override (defaults to auto resolution).
 
         Returns:
             Response containing upload URL and credentials.
@@ -933,7 +1008,10 @@ class DataAgentClient:
         params = {
             "FileName": filename,
             "FileSize": file_size,
+            "DMSUnit": dms_unit or self._resolve_dms_unit(),
         }
+        if workspace_id:
+            params["WorkspaceId"] = workspace_id
 
         return self._call_api(
             action="DescribeFileUploadSignature",
@@ -948,6 +1026,8 @@ class DataAgentClient:
         filename: str,
         upload_location: str,
         file_size: int = None,
+        workspace_id: Optional[str] = None,
+        dms_unit: Optional[str] = None,
         client_token: Optional[str] = None,
     ) -> dict:
         """Notify the service that file upload is complete.
@@ -957,6 +1037,8 @@ class DataAgentClient:
             filename: The original filename.
             upload_location: The full OSS path (UploadHost/UploadDir/Filename).
             file_size: The file size in bytes (required for API_KEY auth).
+            workspace_id: Optional workspace ID the file was uploaded into.
+            dms_unit: Optional DMSUnit override (defaults to auto resolution).
             client_token: Optional idempotency token, auto-generated for retries.
 
         Returns:
@@ -966,9 +1048,12 @@ class DataAgentClient:
             "Filename": filename,
             "UploadLocation": upload_location,
             "FileFrom": "Skill",
+            "DMSUnit": dms_unit or self._resolve_dms_unit(),
         }
         if file_size:
             params["FileSize"] = file_size
+        if workspace_id:
+            params["WorkspaceId"] = workspace_id
         if client_token:
             params["ClientToken"] = client_token
 
@@ -1237,10 +1322,12 @@ class DataAgentClient:
 
         For API_KEY authentication, uses startTime/endTime parameters.
         For AK/SK authentication, uses createStartTime/createEndTime parameters.
+        Time values are epoch milliseconds in both cases; RFC3339/ISO strings
+        are rejected by the gateway.
 
         Args:
-            start_time: Start time for filtering sessions (ISO format).
-            end_time: End time for filtering sessions (ISO format).
+            start_time: Start time for filtering sessions (epoch milliseconds).
+            end_time: End time for filtering sessions (epoch milliseconds).
             page_number: Page number (1-based).
             page_size: Number of results per page.
             custom_agent_id: Filter by custom agent ID.
@@ -1257,10 +1344,6 @@ class DataAgentClient:
             "PageNumber": page_number,
             "PageSize": page_size,
         }
-
-        dms_unit = self._resolve_dms_unit()
-        if dms_unit:
-            params["DMSUnit"] = dms_unit
 
         workspace_id = workspace_id or self._resolve_workspace_id()
         if workspace_id:
@@ -1408,6 +1491,179 @@ class DataAgentClient:
             method="POST",
         )
 
+    @retry_on_error(max_retries=3)
+    def create_custom_agent(
+        self,
+        workspace_id: str,
+        name: str,
+        description: str = "",
+        web_report_config: Optional[str] = None,
+        instruction: Optional[str] = None,
+        execution_config: Optional[dict] = None,
+        client_token: Optional[str] = None,
+    ) -> str:
+        """Create a custom agent.
+
+        Args:
+            workspace_id: Workspace ID to create the agent in.
+            name: Agent name (unique within the workspace).
+            description: Optional agent description.
+            web_report_config: Optional WebReport DSL JSON string.
+            instruction: Optional agent instruction text.
+            execution_config: Optional execution config dict; defaults to
+                skipping plan / SQL / report / human confirmations.
+            client_token: Optional idempotency token, auto-generated for retries.
+
+        Returns:
+            The new CustomAgentId.
+
+        Raises:
+            ApiError: If the API call fails or the response is invalid.
+        """
+        if execution_config is None:
+            execution_config = {
+                "SkipPlan": True,
+                "SkipSqlConfirm": True,
+                "SkipWebReportConfirm": True,
+                "SkipAskHuman": True,
+            }
+
+        params: dict = {
+            "WorkspaceId": workspace_id,
+            "DMSUnit": self._resolve_dms_unit(),
+            "Name": name,
+        }
+        if description:
+            params["Description"] = description
+        if web_report_config is not None:
+            params["WebReportConfig"] = web_report_config
+        if instruction is not None:
+            params["Instruction"] = instruction
+        if client_token:
+            params["ClientToken"] = client_token
+        if self._auth_type == "api_key":
+            params["ExecutionConfig"] = execution_config
+        else:
+            params["ExecutionConfig"] = json.dumps(execution_config)
+
+        response = self._call_api(
+            action="CreateCustomAgent",
+            version="2025-04-14",
+            params=params,
+        )
+        data = response.get("data") or response.get("Data") or {}
+        agent_id = data.get("customAgentId") or data.get("CustomAgentId")
+        if not agent_id:
+            raise ApiError(
+                f"CreateCustomAgent response missing CustomAgentId: {response}",
+                code="InvalidResponse",
+                request_id=response.get("requestId"),
+            )
+        return agent_id
+
+    @retry_on_error(max_retries=3)
+    def modify_custom_agent(
+        self,
+        workspace_id: str,
+        custom_agent_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        web_report_config: Optional[str] = None,
+        instruction: Optional[str] = None,
+        execution_config: Optional[dict] = None,
+        client_token: Optional[str] = None,
+    ) -> dict:
+        """Modify an existing custom agent.
+
+        Args:
+            workspace_id: Workspace ID the agent belongs to.
+            custom_agent_id: The custom agent ID to modify.
+            name: Optional new agent name.
+            description: Optional new description.
+            web_report_config: Optional WebReport DSL JSON string.
+            instruction: Optional new instruction text.
+            execution_config: Optional execution config dict; defaults to
+                skipping plan / SQL / report / human confirmations.
+            client_token: Optional idempotency token, auto-generated for retries.
+
+        Returns:
+            Raw API response confirming the modification.
+
+        Raises:
+            ApiError: If the API call fails.
+        """
+        if execution_config is None:
+            execution_config = {
+                "SkipPlan": True,
+                "SkipSqlConfirm": True,
+                "SkipWebReportConfirm": True,
+                "SkipAskHuman": True,
+            }
+
+        params: dict = {
+            "WorkspaceId": workspace_id,
+            "CustomAgentId": custom_agent_id,
+            "DMSUnit": self._resolve_dms_unit(),
+        }
+        if name:
+            params["Name"] = name
+        if description is not None:
+            params["Description"] = description
+        if web_report_config is not None:
+            params["WebReportConfig"] = web_report_config
+        if instruction is not None:
+            params["Instruction"] = instruction
+        if client_token:
+            params["ClientToken"] = client_token
+        if self._auth_type == "api_key":
+            params["ExecutionConfig"] = execution_config
+        else:
+            params["ExecutionConfig"] = json.dumps(execution_config)
+
+        return self._call_api(
+            action="ModifyCustomAgent",
+            version="2025-04-14",
+            params=params,
+        )
+
+    @retry_on_error(max_retries=3)
+    def operate_custom_agent(
+        self,
+        workspace_id: str,
+        custom_agent_id: str,
+        operate_type: str = "RELEASE",
+        client_token: Optional[str] = None,
+    ) -> dict:
+        """Operate on a custom agent.
+
+        Args:
+            workspace_id: Workspace ID the agent belongs to.
+            custom_agent_id: The custom agent ID.
+            operate_type: Operation type: RELEASE (publish) / OFFLINE /
+                SET_DEFAULT / CANCEL_DEFAULT.
+            client_token: Optional idempotency token, auto-generated for retries.
+
+        Returns:
+            Raw API response confirming the operation.
+
+        Raises:
+            ApiError: If the API call fails.
+        """
+        params: dict = {
+            "WorkspaceId": workspace_id,
+            "CustomAgentId": custom_agent_id,
+            "OperateType": operate_type,
+            "DMSUnit": self._resolve_dms_unit(),
+        }
+        if client_token:
+            params["ClientToken"] = client_token
+
+        return self._call_api(
+            action="OperateCustomAgent",
+            version="2025-04-14",
+            params=params,
+        )
+
     @property
     def config(self) -> DataAgentConfig:
         """Get the client configuration."""
@@ -1455,7 +1711,9 @@ class AsyncDataAgentClient:
         file_id: Optional[str] = None,  # 添加文件ID参数
         workspace_id: Optional[str] = None,
         custom_agent_id: Optional[str] = None,
+        custom_agent_stage: str = "prod",
         client_token: Optional[str] = None,
+        plan_mode: Optional[str] = "force",
     ) -> SessionInfo:
         """Create a new Data Agent session asynchronously.
 
@@ -1467,7 +1725,9 @@ class AsyncDataAgentClient:
             file_id: Optional file ID for file-based analysis session.
             workspace_id: Optional workspace ID to bind to the session.
             custom_agent_id: Optional custom agent ID to use for the session.
+            custom_agent_stage: Stage of the custom agent, "prod" (default) or "debug".
             client_token: Optional idempotency token.
+            plan_mode: Plan mode: "force" (default, always plan) or "disable" (skip planning).
 
         Returns:
             SessionInfo with agent_id and session_id.
@@ -1481,7 +1741,9 @@ class AsyncDataAgentClient:
             file_id=file_id,
             workspace_id=workspace_id,
             custom_agent_id=custom_agent_id,
+            custom_agent_stage=custom_agent_stage,
             client_token=client_token,
+            plan_mode=plan_mode,
         )
 
     async def describe_session(self, session_id: str, agent_id: str = "", workspace_id: str = "") -> SessionInfo:
@@ -1504,26 +1766,40 @@ class AsyncDataAgentClient:
 
     async def send_message(
         self,
-        agent_id: str,
-        session_id: str,
         message: str,
+        session_id: str = "",
+        agent_id: str = "",
         message_type: str = "primary",
         data_source: Optional[DataSource] = None,
         language: str = "CHINESE",
         workspace_id: str = "",
         mode: Optional[str] = None,
+        data_sources: Optional[list] = None,
+        report_config: Optional[dict] = None,
+        permission_config: Optional[dict] = None,
+        plan_mode: Optional[str] = None,
     ) -> dict:
         """Send a message to the Data Agent asynchronously.
 
         Args:
-            agent_id: The agent ID.
-            session_id: The session ID.
             message: The user's natural language query.
-            message_type: Message type (default: "primary").
+            session_id: The session ID. May be omitted for the first message
+                of a session — the backend then creates the session and the
+                response data carries the new AgentId / SessionId.
+            agent_id: Deprecated — no longer needed. The backend resolves the
+                agent automatically; kept only for backward compatibility and
+                omitted from the wire when empty.
+            message_type: Message type (default: "primary"; "report" / "cancel").
             data_source: Optional DataSource with database metadata.
             language: Response language (default: "CHINESE").
             workspace_id: The workspace ID (required for workspace-bound sessions).
             mode: Optional per-message mode (auto / lite / pro / ultra).
+            data_sources: Optional message-level data sources (remote_data_center).
+            report_config: Optional report configuration for message_type="report".
+            permission_config: Optional session-level permission dict
+                ({"DefaultAction": "allow" | "deny"}).
+            plan_mode: Optional per-message plan mode (force / disable);
+                omitted by default so the session-level setting applies.
 
         Returns:
             Response from the API.
@@ -1538,19 +1814,24 @@ class AsyncDataAgentClient:
             language=language,
             workspace_id=workspace_id,
             mode=mode,
+            data_sources=data_sources,
+            report_config=report_config,
+            permission_config=permission_config,
+            plan_mode=plan_mode,
         )
 
     async def get_chat_content(
         self,
-        agent_id: str,
         session_id: str,
+        agent_id: str = "",
         checkpoint: Optional[str] = None,
     ) -> dict:
         """Get chat content from the Data Agent asynchronously.
 
         Args:
-            agent_id: The agent ID.
             session_id: The session ID.
+            agent_id: Deprecated — no longer needed. Omitted from the wire
+                when empty; kept only for backward compatibility.
             checkpoint: Optional checkpoint for incremental fetching.
 
         Returns:
@@ -1567,12 +1848,16 @@ class AsyncDataAgentClient:
         self,
         filename: str,
         file_size: int,
+        workspace_id: Optional[str] = None,
+        dms_unit: Optional[str] = None,
     ) -> dict:
         """Get OSS upload signature asynchronously.
 
         Args:
             filename: Name of the file to upload.
             file_size: Size of the file in bytes.
+            workspace_id: Optional workspace ID to upload into.
+            dms_unit: Optional DMSUnit override (defaults to auto resolution).
 
         Returns:
             Response containing upload URL and credentials.
@@ -1581,6 +1866,8 @@ class AsyncDataAgentClient:
             self._sync_client.get_file_upload_signature,
             filename=filename,
             file_size=file_size,
+            workspace_id=workspace_id,
+            dms_unit=dms_unit,
         )
 
     async def file_upload_callback(
@@ -1589,6 +1876,8 @@ class AsyncDataAgentClient:
         filename: str,
         upload_location: str,
         file_size: int = None,
+        workspace_id: Optional[str] = None,
+        dms_unit: Optional[str] = None,
         client_token: Optional[str] = None,
     ) -> dict:
         """Notify file upload completion asynchronously.
@@ -1598,6 +1887,8 @@ class AsyncDataAgentClient:
             filename: The original filename.
             upload_location: The full OSS path.
             file_size: The file size in bytes (required for API_KEY auth).
+            workspace_id: Optional workspace ID the file was uploaded into.
+            dms_unit: Optional DMSUnit override (defaults to auto resolution).
             client_token: Optional idempotency token.
 
         Returns:
@@ -1609,6 +1900,8 @@ class AsyncDataAgentClient:
             filename=filename,
             upload_location=upload_location,
             file_size=file_size,
+            workspace_id=workspace_id,
+            dms_unit=dms_unit,
             client_token=client_token,
         )
 
@@ -1723,6 +2016,105 @@ class AsyncDataAgentClient:
             self._sync_client.describe_custom_agent,
             custom_agent_id=custom_agent_id,
             workspace_id=workspace_id,
+        )
+
+    async def create_custom_agent(
+        self,
+        workspace_id: str,
+        name: str,
+        description: str = "",
+        web_report_config: Optional[str] = None,
+        instruction: Optional[str] = None,
+        execution_config: Optional[dict] = None,
+        client_token: Optional[str] = None,
+    ) -> str:
+        """Create a custom agent asynchronously.
+
+        Args:
+            workspace_id: Workspace ID to create the agent in.
+            name: Agent name (unique within the workspace).
+            description: Optional agent description.
+            web_report_config: Optional WebReport DSL JSON string.
+            instruction: Optional agent instruction text.
+            execution_config: Optional execution config dict (defaults to skip-all).
+            client_token: Optional idempotency token.
+
+        Returns:
+            The new CustomAgentId.
+        """
+        return await self._run_in_executor(
+            self._sync_client.create_custom_agent,
+            workspace_id=workspace_id,
+            name=name,
+            description=description,
+            web_report_config=web_report_config,
+            instruction=instruction,
+            execution_config=execution_config,
+            client_token=client_token,
+        )
+
+    async def modify_custom_agent(
+        self,
+        workspace_id: str,
+        custom_agent_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        web_report_config: Optional[str] = None,
+        instruction: Optional[str] = None,
+        execution_config: Optional[dict] = None,
+        client_token: Optional[str] = None,
+    ) -> dict:
+        """Modify an existing custom agent asynchronously.
+
+        Args:
+            workspace_id: Workspace ID the agent belongs to.
+            custom_agent_id: The custom agent ID to modify.
+            name: Optional new agent name.
+            description: Optional new description.
+            web_report_config: Optional WebReport DSL JSON string.
+            instruction: Optional new instruction text.
+            execution_config: Optional execution config dict (defaults to skip-all).
+            client_token: Optional idempotency token.
+
+        Returns:
+            Raw API response confirming the modification.
+        """
+        return await self._run_in_executor(
+            self._sync_client.modify_custom_agent,
+            workspace_id=workspace_id,
+            custom_agent_id=custom_agent_id,
+            name=name,
+            description=description,
+            web_report_config=web_report_config,
+            instruction=instruction,
+            execution_config=execution_config,
+            client_token=client_token,
+        )
+
+    async def operate_custom_agent(
+        self,
+        workspace_id: str,
+        custom_agent_id: str,
+        operate_type: str = "RELEASE",
+        client_token: Optional[str] = None,
+    ) -> dict:
+        """Operate on a custom agent asynchronously.
+
+        Args:
+            workspace_id: Workspace ID the agent belongs to.
+            custom_agent_id: The custom agent ID.
+            operate_type: Operation type: RELEASE / OFFLINE / SET_DEFAULT / CANCEL_DEFAULT.
+            client_token: Optional idempotency token.
+
+        Returns:
+            Raw API response confirming the operation.
+        """
+        return await self._run_in_executor(
+            self._sync_client.operate_custom_agent,
+            workspace_id=workspace_id,
+            custom_agent_id=custom_agent_id,
+            operate_type=operate_type,
+            client_token=client_token,
         )
 
     @property

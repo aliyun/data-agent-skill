@@ -5,7 +5,9 @@ Created: 2026-04-16
 """
 
 import argparse
+import json
 import sys
+from pathlib import Path
 
 from data_agent import DataAgentConfig, DataAgentClient
 
@@ -16,6 +18,46 @@ def _get_field(obj: dict, *names: str, default=""):
         if name in obj:
             return obj[name]
     return default
+
+
+def _require_workspace_id(args: argparse.Namespace) -> str:
+    workspace_id = getattr(args, "workspace_id", None)
+    if not workspace_id:
+        print("Error: --workspace-id is required for create/update/publish", file=sys.stderr)
+        sys.exit(1)
+    return workspace_id
+
+
+def _read_instruction(value: str) -> str:
+    """Resolve --instruction: inline text, or @path to read the whole file."""
+    if not value.startswith("@"):
+        return value
+    path = Path(value[1:])
+    if not path.is_file():
+        print(f"Error: --instruction file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        print(f"Error: --instruction file is empty: {path}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  Instruction loaded: {len(text)} chars")
+    return text
+
+
+def _load_dsl(path_str: str) -> str:
+    """Read --dsl-file and validate it is well-formed JSON."""
+    path = Path(path_str)
+    if not path.is_file():
+        print(f"Error: --dsl-file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    content = path.read_text(encoding="utf-8")
+    try:
+        json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"Error: --dsl-file is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  DSL loaded: {len(content)} chars")
+    return content
 
 
 def _cmd_list(client: DataAgentClient, args: argparse.Namespace) -> None:
@@ -167,6 +209,122 @@ def _cmd_describe(client: DataAgentClient, args: argparse.Namespace) -> None:
     print()
 
 
+def _cmd_create(client: DataAgentClient, args: argparse.Namespace) -> None:
+    """Create a custom agent and release it."""
+    name = getattr(args, "agent_name", None)
+    if not name:
+        print("Error: --agent-name is required for create", file=sys.stderr)
+        sys.exit(1)
+    workspace_id = _require_workspace_id(args)
+
+    web_report_config = _load_dsl(args.dsl_file) if getattr(args, "dsl_file", None) else None
+    instruction = _read_instruction(args.instruction) if getattr(args, "instruction", None) else None
+    description = getattr(args, "description", "") or ""
+
+    print(f"Region: {client.config.region}")
+    print(f"Creating custom agent: {name}")
+    try:
+        agent_id = client.create_custom_agent(
+            workspace_id=workspace_id,
+            name=name,
+            description=description,
+            web_report_config=web_report_config,
+            instruction=instruction,
+        )
+    except Exception as e:
+        print(f"Error: create failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  Created CustomAgentId: {agent_id}")
+
+    print("Releasing (operate_type=RELEASE)...")
+    try:
+        client.operate_custom_agent(
+            workspace_id=workspace_id,
+            custom_agent_id=agent_id,
+            operate_type="RELEASE",
+        )
+    except Exception as e:
+        print(f"Error: release failed: {e}", file=sys.stderr)
+        print(
+            "  The agent was created but not released; retry with:\n"
+            f"  agent --action publish --custom-agent-id {agent_id} --workspace-id {workspace_id}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"  Released CustomAgentId: {agent_id}")
+    print(
+        f"\nNext: use it in a session with\n"
+        f"  send --workspace-id {workspace_id} --custom-agent-id {agent_id} ..."
+    )
+
+
+def _cmd_update(client: DataAgentClient, args: argparse.Namespace) -> None:
+    """Modify an existing custom agent and re-release it."""
+    custom_agent_id = getattr(args, "custom_agent_id", None)
+    if not custom_agent_id:
+        print("Error: --custom-agent-id is required for update action", file=sys.stderr)
+        sys.exit(1)
+    workspace_id = _require_workspace_id(args)
+
+    web_report_config = _load_dsl(args.dsl_file) if getattr(args, "dsl_file", None) else None
+    instruction = _read_instruction(args.instruction) if getattr(args, "instruction", None) else None
+
+    print(f"Region: {client.config.region}")
+    print(f"Updating custom agent: {custom_agent_id}")
+    try:
+        client.modify_custom_agent(
+            workspace_id=workspace_id,
+            custom_agent_id=custom_agent_id,
+            name=getattr(args, "agent_name", None),
+            description=getattr(args, "description", None),
+            web_report_config=web_report_config,
+            instruction=instruction,
+        )
+    except Exception as e:
+        print(f"Error: update failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  Updated CustomAgentId: {custom_agent_id}")
+
+    print("Releasing (operate_type=RELEASE)...")
+    try:
+        client.operate_custom_agent(
+            workspace_id=workspace_id,
+            custom_agent_id=custom_agent_id,
+            operate_type="RELEASE",
+        )
+    except Exception as e:
+        print(f"Error: release failed: {e}", file=sys.stderr)
+        print(
+            "  The agent was updated but not released; retry with:\n"
+            f"  agent --action publish --custom-agent-id {custom_agent_id} --workspace-id {workspace_id}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"  Released CustomAgentId: {custom_agent_id}")
+
+
+def _cmd_publish(client: DataAgentClient, args: argparse.Namespace) -> None:
+    """Release an existing custom agent."""
+    custom_agent_id = getattr(args, "custom_agent_id", None)
+    if not custom_agent_id:
+        print("Error: --custom-agent-id is required for publish action", file=sys.stderr)
+        sys.exit(1)
+    workspace_id = _require_workspace_id(args)
+
+    print(f"Region: {client.config.region}")
+    print(f"Releasing custom agent: {custom_agent_id} (operate_type=RELEASE)")
+    try:
+        client.operate_custom_agent(
+            workspace_id=workspace_id,
+            custom_agent_id=custom_agent_id,
+            operate_type="RELEASE",
+        )
+    except Exception as e:
+        print(f"Error: publish failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  Released CustomAgentId: {custom_agent_id}")
+
+
 def cmd_agent(args: argparse.Namespace) -> None:
     """Handle agent subcommand."""
     config = DataAgentConfig.from_env()
@@ -176,5 +334,11 @@ def cmd_agent(args: argparse.Namespace) -> None:
 
     if action == "describe":
         _cmd_describe(client, args)
+    elif action == "create":
+        _cmd_create(client, args)
+    elif action == "update":
+        _cmd_update(client, args)
+    elif action == "publish":
+        _cmd_publish(client, args)
     else:
         _cmd_list(client, args)

@@ -14,22 +14,12 @@ domain: AIOps
 ---
 metadata:
   author: DataAgent Team
-  version: "1.8.6"
+  version: "2.5.0"
 ---
 
 # Changelog
-- **v1.8.6**: Fix SSE parsing when server omits `event:` prefix line (extract event_type from JSON payload as fallback); add DMSUnit to all SSE streaming methods (GetChatContent); add `--dms-unit` CLI flag to `db`, `file`, `attach` subcommands; add `--workspace-id` CLI flag to `attach` subcommand; DMSUnit resolution uses env/config/CLI override before `GetActiveRouteUnit` and region fallback.
-- **v1.8.5** — Database listing migrated to `ListTagMetaAsset` (dms-enterprise 2018-11-01); workspace auto-resolution (CLI `--workspace-id` > env `DATA_AGENT_WORKSPACE_ID` > `InitDataAgentPersonalWorkspace`); `db` subcommand relaxed `--instance-name` to optional.
-- **v1.8.4**: Document project Python virtualenv (`venv/`) setup and activation; add end-to-end regression notes for ASK_DATA / ANALYSIS (async + attach)
-- **v1.8.3**: `db` and `file` subcommands now accept `--session-mode` with simplified mode tiers
-- **v1.8.2**: `SendChatMessage` now supports per-message mode override (injected via `SessionConfig.Mode`); dynamic DMSUnit resolution via `GetActiveRouteUnit`
-- **v1.8.1**: Emphasize `attach`-based session reuse as the core interaction mechanism; add golden workflow, capability matrix, and usage rules
-- **v1.8.0**: Add workspace (collaborative space) support, add custom agent support
-- **v1.7.2**: Use Alibaba Cloud default credential chain instead of explicit AK/SK, add User-Agent header, fix RAM policy wildcard issues
-- **v1.7.1**: Fix CLI `ls` command API response parsing (support case-insensitive field names), optimize SKILL documentation structure, separate pro mode specification document
-- **v1.7.0**: API_KEY authentication support, native async execution mode, session isolation, enhanced attach mode, optimized log output
 
----
+- **v2.5.0**: Sync with the maintained master. Added new capabilities including data permissions, plain credentials-file authentication, enhanced `send` subcommand, `cancel` and `upload` subcommands, report generation options, custom agent lifecycle management, workspace-scoped file uploads, and endpoint overrides. Updated SDK contract and fixed bugs related to credential value redaction and response handling. Enhanced dependency on `alibabacloud-dms20250414>=2.0.0`. Removed deprecated `--dms-unit` CLI flag. For detailed changes and earlier versions, see [CHANGELOG.md](references/CHANGELOG.md).
 
 ---
 
@@ -80,13 +70,16 @@ pip install -r scripts/requirements.txt
 
 ## Configure Credentials
 
-This Skill uses Alibaba Cloud default credential chain (recommended) or API_KEY authentication.
+This Skill supports three authentication modes: Alibaba Cloud default credential chain (recommended), API_KEY, or a plain credentials file.
 
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DATA_AGENT_API_KEY` | API Key authentication (file analysis scenarios) | — |
+| `DATA_AGENT_CREDENTIALS_FILE` | Plain credentials file path (multi-account) | `~/.data-agent-credentials.json` |
+| `DATA_AGENT_CREDENTIALS_ENV` | Credentials-file environment selector | `default` |
+| `DATA_AGENT_CREDENTIALS_PROFILE` | Credentials-file profile selector | `default` |
 | `DATA_AGENT_REGION` | Region ID | `cn-hangzhou` |
 | `DATA_AGENT_DMS_UNIT` | DMSUnit override (alias `DATA_AGENT_DMSUNIT`) | auto-resolved |
 | `DATA_AGENT_WORKSPACE_ID` | Default workspace ID | auto personal workspace |
@@ -99,7 +92,7 @@ This Skill uses Alibaba Cloud default credential chain (recommended) or API_KEY 
 | `DATA_AGENT_MAX_POLL_COUNT` | Max poll attempts | `60` |
 | `DATA_AGENT_DEBUG_API` | Print API request details | `false` |
 
-All variables can be set in a `.env` file or exported as environment variables. CLI flags (`--dms-unit`, `--workspace-id`, `--custom-agent-id`) override the corresponding environment variable.
+All variables can be set in a `.env` file or exported as environment variables. CLI flags (`--workspace-id`, `--custom-agent-id`) override the corresponding environment variable.
 
 ### Option 1: Default Credential Chain (Recommended)
 
@@ -115,6 +108,16 @@ export DATA_AGENT_REGION=cn-hangzhou
 ```
 
 Get API_KEY: [Data Agent Console](https://agent.dms.aliyun.com/cn-hangzhou/api-key)
+
+### Option 3: Credentials File (Multiple Accounts / Environments)
+
+```bash
+export DATA_AGENT_CREDENTIALS_FILE=/path/to/creds.json
+export DATA_AGENT_CREDENTIALS_ENV=pre          # optional environment selector
+export DATA_AGENT_CREDENTIALS_PROFILE=main     # optional profile selector
+```
+
+The file groups AK/SK pairs by environment and nickname; when both selectors are left unset and the file is unambiguous, the single candidate is auto-selected. Entries may also carry an `api_key` field, which takes precedence for that profile. See [CREDENTIALS.md](references/CREDENTIALS.md) for the full format and resolution rules.
 
 ### Permission Requirements
 
@@ -138,6 +141,29 @@ DATA_AGENT_DEBUG_API=1 python3 scripts/data_agent_cli.py file example.csv -q "an
 ## Overview
 
 `scripts/data_agent_cli.py` helps users complete the full workflow from **discover data → initiate analysis → track progress → get results**.
+
+### Command Overview
+
+```bash
+python3 scripts/data_agent_cli.py <command> [options]
+```
+
+| Command | Purpose |
+|---------|---------|
+| `ls` | List Data Center databases / tables with the IDs the `db` command needs |
+| `dms` | DMS instance / database / table lookup (`list-instances`, `search-database`, `list-tables`) |
+| `import` | Import DMS database tables into Data Agent Data Center |
+| `db` | Start a database analysis session (auto / lite / pro / ultra) |
+| `file` | Upload a local file (or use `--file-id`) and analyze it |
+| `upload` | Upload a local file and print its file ID (no session created) |
+| `send` | Send a single message — direct session-less send (backend creates the session, response carries the new SessionId) or reuse an existing one; connectivity checks, report requests and permission-controlled requests |
+| `attach` | Re-enter an existing session: follow-ups, plan confirmation, live progress, checkpoint resume |
+| `reports` | List and download session-generated reports / charts |
+| `cancel` | Cancel a running session |
+| `workspace` | List available workspaces |
+| `agent` | List / describe / create / update / publish custom agents |
+
+Common options: `--region` (default `DATA_AGENT_REGION` or `cn-hangzhou`), `--endpoint` (explicit gateway override, defaults derived from region), `--workspace-id`, `--custom-agent-id`, `--session-mode`, `--plan-mode`, `--output summary|detail|raw`, `--async-run`.
 
 ### Core Concepts
 
@@ -220,11 +246,60 @@ Custom Agents are user-defined AI agents with specialized instructions, knowledg
 
 - **List custom agents**: Use `agent` subcommand to discover available custom agents (RELEASED status by default)
 - **View agent details**: Use `agent describe --custom-agent-id <ID>` to see full agent configuration
-- **Bind session to custom agent**: Pass `--custom-agent-id <ID>` when using `db` or `file` to create a session powered by a specific custom agent
+- **Create an agent**: Use `agent create --workspace-id <WS> --agent-name <NAME> [--description ...] [--instruction text|@path] [--dsl-file report_dsl.json]` — created agents are auto-released for immediate use
+- **Update an agent**: Use `agent update --custom-agent-id <ID> [--agent-name ...] [--instruction ...]`
+- **Publish an agent**: Use `agent publish --custom-agent-id <ID> --workspace-id <WS>` to promote a draft to RELEASED
+- **Bind session to custom agent**: Pass `--custom-agent-id <ID>` when using `db` or `file` to create a session powered by a specific custom agent (or set `DATA_AGENT_CUSTOM_AGENT_ID` as the default)
 
 > **Note**: When `--custom-agent-id` is specified, data source parameters (`--dms-instance-id`, `--dms-db-id`, `--db-name`, `--tables`) are **not required** and should **not** be passed. The custom agent already has its own data scope configuration. Only `--workspace-id` and session options (e.g. `--session-mode`, `--plan-mode`) are needed.
 
 > **Note**: Custom Agent sessions automatically use the `prod` stage. The custom agent's instructions, knowledge, and data scope will be applied to the analysis session.
+
+---
+
+## Report Generation Messages
+
+Report controls are accepted by `send`, `db`, `file` and `attach`:
+
+```bash
+python3 scripts/data_agent_cli.py send --data-source <FILE_ID> -m "Analyze store sales"
+python3 scripts/data_agent_cli.py send -s <SESSION_ID> \
+    --message-type report --report-theme default \
+    --report-prompt @report_instructions.txt \
+    -m "Generate a web report on sales trends"
+```
+
+- `--message-type primary|report|diag` — `report` attaches a `TaskConfig.ReportConfig` (WebReport) to the message; `diag` sends a report-diagnosis request where the message text is the complaint about the session's report (backend diagnosis support required).
+- `--report-theme <name>` — report visual theme (default `default`).
+- `--report-prompt <text|@path>` — extra prompt injected into the report guide; `@path` reads the whole file.
+
+---
+
+## Data Permissions (SQL Access Control)
+
+`send` can restrict the agent's SQL access on a database data source:
+
+```bash
+python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> \
+    --db-name <DB> --tables "orders,customers" \
+    --permission-file permission.json --permission-default-action deny \
+    -m "Analyze last month's orders" --poll
+```
+
+- `--permission-file <PATH>` — JSON with per-table column whitelists/blacklists and required row filters, attached to the database data source.
+- `--permission-default-action allow|deny` — session-level default for tables not declared in the permission file.
+
+Full schema, field semantics (empty whitelist = deny-all, whitelist−blacklist, last-wins, OR row-filter lists) and SDK examples: [PERMISSIONS.md](references/PERMISSIONS.md).
+
+---
+
+## Cancel a Running Session
+
+```bash
+python3 scripts/data_agent_cli.py cancel --session-id <SESSION_ID>
+```
+
+Cancels a running analysis session (agent ID is resolved automatically). Use it to clean up test sessions or stop long-running tasks that are no longer needed.
 
 ---
 
@@ -244,7 +319,7 @@ After you call `db` / `file` to start a session, **all subsequent interactions o
 | **Progress monitoring** | `attach --session-id <ID>` (no `-q`) | Tail live SSE progress of a long-running session |
 | **Resume after network drop** | `attach --session-id <ID> --checkpoint <N>` | Precise recovery from the Nth event after interruption |
 | **Replay full history** | `attach --session-id <ID> --from-start` | Re-stream the entire session from event 0 |
-| **Cross-region attach** | `attach --session-id <ID> --dms-unit cn-hangzhou --workspace-id <WS>` | Override DMSUnit and workspace for the session |
+| **Workspace-scoped resume** | `attach --session-id <ID> --workspace-id <WS>` | Re-enter a session bound to a specific workspace |
 
 ### Golden Workflow (Async + attach)
 
@@ -333,20 +408,21 @@ python3 scripts/data_agent_cli.py db \
     --db-name <schemaName> \
     --tables <table1,table2> -q "Which department has the highest average salary"
 
-# 5b. Query with explicit DMSUnit (e.g. cn-shenzhen region, cn-hangzhou DMSUnit)
-DATA_AGENT_REGION=cn-shenzhen python3 scripts/data_agent_cli.py db \
-    --dms-instance-id <DMS_INSTANCE_ID> \
-    --workspace-id <WORKSPACE_ID> \
-    --dms-unit cn-hangzhou \
-    --dms-db-id <dbId> \
-    --db-name <schemaName> \
-    --tables <table1,table2> -q "your question"
+# 5b. Quick connectivity check / session-less send (backend creates the session)
+python3 scripts/data_agent_cli.py send -m "ping" --no-async-run
+# -> response carries the new Session ID for follow-up attach
 
-# 6. List available custom agents
+# 6. Upload a file without starting a session (prints the file ID)
+python3 scripts/data_agent_cli.py upload assets/example_game_data.csv
+
+# 7. List available custom agents
 python3 scripts/data_agent_cli.py agent
 
-# 7. Use a custom agent for analysis (no DB params needed)
+# 8. Use a custom agent for analysis (no DB params needed)
 python3 scripts/data_agent_cli.py db --custom-agent-id <AGENT_ID> --workspace-id <WS_ID> -q "your question"
+
+# 9. Cancel a running session when it is no longer needed
+python3 scripts/data_agent_cli.py cancel --session-id <SESSION_ID>
 ```
 
 > **Remember**: `db` / `file` create the session **once**; all follow-ups go through `attach --session-id <ID>`.
@@ -361,10 +437,12 @@ python3 scripts/data_agent_cli.py db --custom-agent-id <AGENT_ID> --workspace-id
                           # Skill root directory
 ├── SKILL.md              # This document
 ├── scripts/              # Source code
-│   ├── data_agent/       # SDK module
-│   ├── cli/              # CLI module
+│   ├── data_agent/       # SDK module (config / client / session / file_manager / sse_client)
+│   ├── cli/              # CLI module (parser / cmd_* / streaming / worker_*)
 │   ├── data_agent_cli.py # CLI entry point
 │   └── requirements.txt  # Dependencies
+├── assets/               # Demo / sample files (example_game_data.csv, LICENSE, HEARTBEAT.md)
 ├── sessions/             # Session data
-└── references/           # Reference documents
+├── references/           # Reference documents
+└── .env.example          # Environment variable template
 ```

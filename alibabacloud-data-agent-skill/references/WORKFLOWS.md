@@ -31,11 +31,19 @@ python3 scripts/data_agent_cli.py db \
     --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> \
     --instance-name <INSTANCE_NAME> --db-name internal_data_employees \
     --tables "employees,departments,salaries" \
-    --session-mode auto \
+    --session-mode lite \
     -q "Which position has the highest salary"
 
 # Step 4: Connect to existing session for follow-up questions
 python3 scripts/data_agent_cli.py attach --session-id <SESSION_ID> -q "Calculate average salary by department"
+```
+
+## File Analysis Quick Start
+
+> **Sample file**: `assets/example_game_data.csv` ships with this skill for a first-time file-analysis experience.
+
+```bash
+python3 scripts/data_agent_cli.py file assets/example_game_data.csv -q "Analyze player retention"
 ```
 
 ---
@@ -93,7 +101,7 @@ python3 scripts/data_agent_cli.py db \
 For long-running `ls` and `db` commands, running in background is recommended:
 
 ```bash
-# Start pro mode task in background
+# Start pro analysis task in background
 nohup python3 scripts/data_agent_cli.py db \
     --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> \
     --instance-name <INSTANCE_NAME> --db-name internal_data_employees \
