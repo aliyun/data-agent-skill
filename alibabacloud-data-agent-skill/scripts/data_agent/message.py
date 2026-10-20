@@ -21,14 +21,22 @@ class MessageHandler:
     Uses SSE streaming to receive responses from Data Agent.
     """
 
-    def __init__(self, client: DataAgentClient):
+    def __init__(self, client: DataAgentClient, send_options: Optional[dict] = None):
         """Initialize message handler.
 
         Args:
             client: DataAgentClient instance for API calls.
+            send_options: Optional default options applied to every outgoing
+                message, passed through to ``client.send_message``. Recognized
+                keys: ``message_type``, ``data_sources``, ``report_config``.
         """
         self._client = client
         self._sse_client = SSEClient(client.config)
+        self._send_options = send_options or {}
+
+    def set_send_options(self, send_options: Optional[dict]) -> None:
+        """Replace the default send options applied to every outgoing message."""
+        self._send_options = send_options or {}
 
     def send_query(
         self,
@@ -62,6 +70,7 @@ class MessageHandler:
                 message=query,
                 data_source=data_source,
                 workspace_id=session.workspace_id or "",
+                **self._send_options,
             )
         except Exception as e:
             raise MessageSendError(f"Failed to send message: {e}")
@@ -109,6 +118,7 @@ class MessageHandler:
                 message=query,
                 data_source=data_source,
                 workspace_id=session.workspace_id or "",
+                **self._send_options,
             )
         except Exception as e:
             raise MessageSendError(f"Failed to send message: {e}")
@@ -176,6 +186,7 @@ class MessageHandler:
                 message=query,
                 data_source=data_source,
                 workspace_id=session.workspace_id or "",
+                **self._send_options,
             )
         except Exception as e:
             raise MessageSendError(f"Failed to send message: {e}")
@@ -223,6 +234,7 @@ class MessageHandler:
                 message=query,
                 data_source=data_source,
                 workspace_id=session.workspace_id or "",
+                **self._send_options,
             )
         except Exception as e:
             raise MessageSendError(f"Failed to send message: {e}")
@@ -274,14 +286,22 @@ class AsyncMessageHandler:
     Uses async SSE streaming for responses.
     """
 
-    def __init__(self, client: AsyncDataAgentClient):
+    def __init__(self, client: AsyncDataAgentClient, send_options: Optional[dict] = None):
         """Initialize async message handler.
 
         Args:
             client: AsyncDataAgentClient instance for API calls.
+            send_options: Optional default options applied to every outgoing
+                message, passed through to ``client.send_message``. Recognized
+                keys: ``message_type``, ``data_sources``, ``report_config``.
         """
         self._client = client
         self._sse_client = AsyncSSEClient(client.config)
+        self._send_options = send_options or {}
+
+    def set_send_options(self, send_options: Optional[dict]) -> None:
+        """Replace the default send options applied to every outgoing message."""
+        self._send_options = send_options or {}
 
     async def send_query(
         self,
@@ -311,6 +331,7 @@ class AsyncMessageHandler:
                 message=query,
                 data_source=data_source,
                 workspace_id=session.workspace_id or "",
+                **self._send_options,
             )
         except Exception as e:
             raise MessageSendError(f"Failed to send message: {e}")
@@ -356,6 +377,7 @@ class AsyncMessageHandler:
                 message=query,
                 data_source=data_source,
                 workspace_id=session.workspace_id or "",
+                **self._send_options,
             )
         except Exception as e:
             raise MessageSendError(f"Failed to send message: {e}")
@@ -421,6 +443,7 @@ class AsyncMessageHandler:
                 message=query,
                 data_source=data_source,
                 workspace_id=session.workspace_id or "",
+                **self._send_options,
             )
         except Exception as e:
             raise MessageSendError(f"Failed to send message: {e}")

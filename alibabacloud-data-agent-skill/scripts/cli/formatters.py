@@ -88,7 +88,7 @@ def _fmt_jupyter_cell(outer: dict) -> Optional[str]:
 
 
 def _fmt_task_finish(payload: dict) -> Optional[str]:
-    """Format a task_finish data event for structured CLI display (ASK_DATA mode).
+    """Format a task_finish data event for structured CLI display (lite mode).
 
     Handles common field layouts returned by the Data Agent:
       - status / taskStatus / state

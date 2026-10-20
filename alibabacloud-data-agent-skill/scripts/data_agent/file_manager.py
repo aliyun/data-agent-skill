@@ -59,12 +59,15 @@ class FileManager:
     def upload_file(
         self,
         file_path: str,
+        workspace_id: Optional[str] = None,
         timeout: int = 60,
     ) -> FileInfo:
         """Upload a file for analysis.
 
         Args:
             file_path: Path to the local file.
+            workspace_id: Optional workspace ID to upload into (defaults to
+                the caller's personal workspace).
             timeout: Upload timeout in seconds.
 
         Returns:
@@ -95,6 +98,7 @@ class FileManager:
             signature_response = self._client.get_file_upload_signature(
                 filename=filename,
                 file_size=file_size,
+                workspace_id=workspace_id,
             )
         except Exception as e:
             raise FileUploadError(f"Failed to get upload signature: {e}", file_path=file_path)
@@ -154,7 +158,9 @@ class FileManager:
         # Note: For API_KEY auth, FileUploadCallback may fail, so we use upload_dir as file_id
         final_file_id = file_id
         try:
-            callback_resp = self._client.file_upload_callback(file_id, filename, upload_location, file_size)
+            callback_resp = self._client.file_upload_callback(
+                file_id, filename, upload_location, file_size, workspace_id=workspace_id
+            )
             # Extract FileId from callback response - after API adapter transformation,
             # response fields become camelCase
             data_field = callback_resp.get("data", callback_resp.get("Data", {}))
@@ -359,12 +365,15 @@ class AsyncFileManager:
     async def upload_file(
         self,
         file_path: str,
+        workspace_id: Optional[str] = None,
         timeout: int = 60,
     ) -> FileInfo:
         """Upload a file for analysis asynchronously.
 
         Args:
             file_path: Path to the local file.
+            workspace_id: Optional workspace ID to upload into (defaults to
+                the caller's personal workspace).
             timeout: Upload timeout in seconds.
 
         Returns:
@@ -393,6 +402,7 @@ class AsyncFileManager:
             signature_response = await self._client.get_file_upload_signature(
                 filename=filename,
                 file_size=file_size,
+                workspace_id=workspace_id,
             )
         except Exception as e:
             raise FileUploadError(f"Failed to get upload signature: {e}", file_path=file_path)
@@ -454,7 +464,9 @@ class AsyncFileManager:
         # Note: For API_KEY auth, FileUploadCallback may fail, so we use upload_dir as file_id
         final_file_id = file_id
         try:
-            callback_resp = await self._client.file_upload_callback(file_id, filename, upload_location, file_size)
+            callback_resp = await self._client.file_upload_callback(
+                file_id, filename, upload_location, file_size, workspace_id=workspace_id
+            )
             # Extract FileId from callback response - after API adapter transformation,
             # response fields become camelCase
             data_field = callback_resp.get("data", callback_resp.get("Data", {}))
@@ -484,15 +496,17 @@ class AsyncFileManager:
             List of FileInfo objects.
         """
         response = await self._client.list_files(session_id)
-        files = response.get("Files", [])
+        files = response.get("data", response.get("Data", response.get("Files", [])))
+        if not isinstance(files, list):
+            files = []
 
         return [
             FileInfo(
-                file_id=f.get("FileId", ""),
-                filename=f.get("FileName", ""),
-                file_type=f.get("FileType", ""),
-                size=f.get("FileSize", 0),
-                download_url=f.get("DownloadUrl"),
+                file_id=f.get("fileId") or f.get("FileId", ""),
+                filename=f.get("fileName") or f.get("FileName", ""),
+                file_type=f.get("fileType") or f.get("FileType", ""),
+                size=f.get("fileSize") or f.get("FileSize", 0),
+                download_url=f.get("downloadLink") or f.get("DownloadLink") or f.get("downloadUrl") or f.get("DownloadUrl"),
             )
             for f in files
         ]

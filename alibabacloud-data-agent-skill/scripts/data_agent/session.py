@@ -59,6 +59,8 @@ class SessionManager:
             file_id: Optional file ID for file-based analysis session.
             workspace_id: Optional workspace ID to bind the session to a workspace.
             custom_agent_id: Optional custom agent ID to use for the session.
+            plan_mode: Plan mode for new sessions: "force" (default, always
+                       generate execution plan) or "disable" (skip planning).
 
         Returns:
             SessionInfo for the active session.

@@ -3,9 +3,9 @@
 # python3 -m venv venv && source venv/bin/activate
 # pip install -r requirements.txt
 
-# 阿里云 SDK
-alibabacloud-tea-openapi==0.4.3
-alibabacloud-dms20250414==1.10.0
+# 阿里云 SDK（dms SDK >= 2.0.0：SendChatMessage 的 session 级 PermissionConfig 模型自 2.0.0 起提供）
+alibabacloud-tea-openapi>=0.4.6
+alibabacloud-dms20250414>=2.0.0
 alibabacloud-dms-enterprise20181101==2.1.6
 alibabacloud-openapi-util==0.2.4
 
