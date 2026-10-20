@@ -14,11 +14,12 @@ domain: AIOps
 ---
 metadata:
   author: DataAgent Team
-  version: "2.5.0"
+  version: "2.6.0"
 ---
 
 # Changelog
 
+- **v2.6.0**: `send` binds custom agents directly via the SendChatMessage `SessionConfig` under AK/SK auth (no CreateDataAgentSession round-trip); `--title` moved to the new `legacy-send` subcommand — avoid unless a session title is really needed. Fixed an invalid `--no-async-run` flag in the `send` quick-start example. For detailed changes and earlier versions, see [CHANGELOG.md](references/CHANGELOG.md).
 - **v2.5.0**: Sync with the maintained master. Added new capabilities including data permissions, plain credentials-file authentication, enhanced `send` subcommand, `cancel` and `upload` subcommands, report generation options, custom agent lifecycle management, workspace-scoped file uploads, and endpoint overrides. Updated SDK contract and fixed bugs related to credential value redaction and response handling. Enhanced dependency on `alibabacloud-dms20250414>=2.0.0`. Removed deprecated `--dms-unit` CLI flag. For detailed changes and earlier versions, see [CHANGELOG.md](references/CHANGELOG.md).
 
 ---
@@ -156,7 +157,8 @@ python3 scripts/data_agent_cli.py <command> [options]
 | `db` | Start a database analysis session (auto / lite / pro / ultra) |
 | `file` | Upload a local file (or use `--file-id`) and analyze it |
 | `upload` | Upload a local file and print its file ID (no session created) |
-| `send` | Send a single message — direct session-less send (backend creates the session, response carries the new SessionId) or reuse an existing one; connectivity checks, report requests and permission-controlled requests |
+| `send` | Send a single message — direct send (backend creates the session, response carries the new SessionId; custom agent binding carried in `SessionConfig` under AK/SK auth) or reuse an existing one; connectivity checks, report requests and permission-controlled requests |
+| `legacy-send` | Legacy `send` that pre-creates the session via CreateDataAgentSession — only for `--title` or custom-agent binding under API_KEY auth; avoid unless a title is really needed |
 | `attach` | Re-enter an existing session: follow-ups, plan confirmation, live progress, checkpoint resume |
 | `reports` | List and download session-generated reports / charts |
 | `cancel` | Cancel a running session |
@@ -249,11 +251,13 @@ Custom Agents are user-defined AI agents with specialized instructions, knowledg
 - **Create an agent**: Use `agent create --workspace-id <WS> --agent-name <NAME> [--description ...] [--instruction text|@path] [--dsl-file report_dsl.json]` — created agents are auto-released for immediate use
 - **Update an agent**: Use `agent update --custom-agent-id <ID> [--agent-name ...] [--instruction ...]`
 - **Publish an agent**: Use `agent publish --custom-agent-id <ID> --workspace-id <WS>` to promote a draft to RELEASED
-- **Bind session to custom agent**: Pass `--custom-agent-id <ID>` when using `db` or `file` to create a session powered by a specific custom agent (or set `DATA_AGENT_CUSTOM_AGENT_ID` as the default)
+- **Bind session to custom agent**: Pass `--custom-agent-id <ID>` when using `db`, `file` or `send` to create a session powered by a specific custom agent (or set `DATA_AGENT_CUSTOM_AGENT_ID` as the default)
 
 > **Note**: When `--custom-agent-id` is specified, data source parameters (`--dms-instance-id`, `--dms-db-id`, `--db-name`, `--tables`) are **not required** and should **not** be passed. The custom agent already has its own data scope configuration. Only `--workspace-id` and session options (e.g. `--session-mode`, `--plan-mode`) are needed.
 
 > **Note**: Custom Agent sessions automatically use the `prod` stage. The custom agent's instructions, knowledge, and data scope will be applied to the analysis session.
+
+> **Note**: With `send`, the binding rides the SendChatMessage `SessionConfig` directly under AK/SK auth — no separate CreateDataAgentSession call. Under API_KEY auth the backend does not fully support implicit creation with a custom agent yet, so `send` still pre-creates there. `legacy-send` (which always pre-creates) exists only for `--title` and the API_KEY custom-agent path; prefer leaving the title at its server-side default.
 
 ---
 
@@ -409,7 +413,7 @@ python3 scripts/data_agent_cli.py db \
     --tables <table1,table2> -q "Which department has the highest average salary"
 
 # 5b. Quick connectivity check / session-less send (backend creates the session)
-python3 scripts/data_agent_cli.py send -m "ping" --no-async-run
+python3 scripts/data_agent_cli.py send -m "ping"
 # -> response carries the new Session ID for follow-up attach
 
 # 6. Upload a file without starting a session (prints the file ID)

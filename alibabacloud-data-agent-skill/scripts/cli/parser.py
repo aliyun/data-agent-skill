@@ -14,7 +14,7 @@ from cli.cmd_file import cmd_file
 from cli.cmd_attach import cmd_attach
 from cli.cmd_cancel import cmd_cancel
 from cli.cmd_upload import cmd_upload
-from cli.cmd_send import cmd_send
+from cli.cmd_send import cmd_send, cmd_send_legacy
 from cli.cmd_dms import cmd_dms
 from cli.cmd_import import cmd_import
 from cli.cmd_reports import cmd_reports
@@ -75,6 +75,88 @@ def _add_report_options(parser: argparse.ArgumentParser, repeatable_data_source:
             metavar="FILE_ID",
             help="Data Center file ID attached to the message as a remote_data_center data source",
         )
+
+
+def _add_send_message_params(parser: argparse.ArgumentParser) -> None:
+    """Add the message parameters shared by the send / legacy-send subcommands."""
+    _add_common_endpoint(parser)
+    _add_report_options(parser, repeatable_data_source=True)
+    parser.add_argument(
+        "--message", "-m",
+        required=True,
+        metavar="TEXT",
+        help="Message content to send",
+    )
+    parser.add_argument(
+        "--session-id", "-s",
+        metavar="SESSION_ID",
+        help="Reuse an existing session instead of creating one",
+    )
+    parser.add_argument(
+        "--agent-id", "-a",
+        metavar="AGENT_ID",
+        help="Agent ID (with --session-id; auto-resolved via DescribeDataAgentSession when omitted)",
+    )
+    parser.add_argument(
+        "--workspace-id",
+        metavar="WORKSPACE_ID",
+        help="Workspace ID for newly created sessions (or workspace-bound reuse)",
+    )
+    parser.add_argument(
+        "--custom-agent-id",
+        metavar="AGENT_ID",
+        help="Custom Agent ID bound to the session created by this message",
+    )
+    parser.add_argument(
+        "--custom-agent-stage",
+        choices=["debug", "prod"],
+        default="prod",
+        metavar="STAGE",
+        help="Custom agent stage (default: prod)",
+    )
+    db_source_group = parser.add_argument_group("Database Data Source Parameters")
+    db_source_group.add_argument(
+        "--dms-instance-id",
+        type=int,
+        metavar="INT",
+        help="DMS Instance ID for a database data source attached to the message",
+    )
+    db_source_group.add_argument(
+        "--db-name",
+        metavar="STR",
+        help="Database name for the database data source",
+    )
+    db_source_group.add_argument(
+        "--tables",
+        metavar="T1,T2,...",
+        help="Table names for the database data source (comma-separated)",
+    )
+    perm_group = parser.add_argument_group("Permission Parameters")
+    perm_group.add_argument(
+        "--permission-file",
+        default=None,
+        metavar="PATH",
+        help="Permission JSON file (table-level column/row restrictions) attached to the database data source; its top-level default_action promotes to the session-level permission config",
+    )
+    perm_group.add_argument(
+        "--permission-default-action",
+        choices=["allow", "deny"],
+        default=None,
+        metavar="ACTION",
+        help="Session-level default action for tables not declared in the permission config (allow | deny)",
+    )
+    parser.add_argument(
+        "--poll",
+        action="store_true",
+        help="After sending, poll DescribeDataAgentSession until the session completes (2 consecutive IDLE) or reaches a terminal status",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        metavar="SECONDS",
+        help="Poll timeout in seconds (with --poll; default: 300)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -347,21 +429,20 @@ Mode Description:
     # -- send subcommand --
     send_parser = subparsers.add_parser(
         "send",
-        help="Send a single message (direct session-less send, or reuse one)",
+        help="Send a single message (direct send, or reuse one)",
         description=(
             "Lightweight message trigger: send a single message, printing the response.\n"
             "Without --session-id the message is sent directly and the backend\n"
-            "creates the session (the new SessionId is parsed from the response);\n"
-            "--custom-agent-id / --title still pre-create via CreateDataAgentSession.\n"
+            "creates the session (the new SessionId is parsed from the response).\n"
+            "With AK/SK auth, --custom-agent-id is carried in the SendChatMessage\n"
+            "SessionConfig directly — no CreateDataAgentSession round-trip.\n"
             "Use this for connectivity checks and report-generation requests\n"
             "without the full streaming workflow of db / file / attach.\n\n"
             "Examples:\n"
             "  python3 scripts/data_agent_cli.py send -m \"Analyze sales trends\"\n"
             "  python3 scripts/data_agent_cli.py send --data-source <FILE_ID> -m \"Analyze store sales\"\n"
-            "  python3 scripts/data_agent_cli.py send --data-source <FILE_ID_1> --data-source <FILE_ID_2> -m \"Analyze both files\"\n"
             "  python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --db-name <DB> --tables \"t1,t2\" -m \"Analyze the database\"\n"
-            "  python3 scripts/data_agent_cli.py send --workspace-id <WORKSPACE_ID> --custom-agent-id <AGENT_ID> \\\n"
-            "      --title \"poc session\" --data-source <FILE_ID> -m \"Generate a report\" --poll --timeout 600\n"
+            "  python3 scripts/data_agent_cli.py send --workspace-id <WORKSPACE_ID> --custom-agent-id <AGENT_ID> -m \"Generate a report\" --poll --timeout 600\n"
             "  python3 scripts/data_agent_cli.py send -s <SID> --message-type report --report-theme default -m \"Generate a web report\"\n"
             "  python3 scripts/data_agent_cli.py send -s <SID> --message-type report --report-prompt @report_prompt.md -m \"Generate report\"\n"
             "  python3 scripts/data_agent_cli.py send -s <SID> --message-type diag -m \"Why does the web report show no data for metric X\"\n"
@@ -370,90 +451,33 @@ Mode Description:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    _add_common_endpoint(send_parser)
-    _add_report_options(send_parser, repeatable_data_source=True)
-    send_parser.add_argument(
-        "--message", "-m",
-        required=True,
-        metavar="TEXT",
-        help="Message content to send",
+    _add_send_message_params(send_parser)
+    send_parser.set_defaults(func=cmd_send)
+
+    # -- legacy-send subcommand --
+    legacy_send_parser = subparsers.add_parser(
+        "legacy-send",
+        help="Legacy send: pre-creates the session via CreateDataAgentSession (supports --title)",
+        description=(
+            "Legacy variant of send that pre-creates the session via\n"
+            "CreateDataAgentSession. Kept only for what SendChatMessage cannot\n"
+            "express today: session titles (--title) and custom-agent binding\n"
+            "under API_KEY auth. Prefer plain `send` unless a title is really\n"
+            "required; sessions created without a title get a server-side\n"
+            "default title.\n\n"
+            "Examples:\n"
+            "  python3 scripts/data_agent_cli.py legacy-send --title \"poc session\" --data-source <FILE_ID> -m \"Generate a report\"\n"
+            "  python3 scripts/data_agent_cli.py legacy-send --custom-agent-id <AGENT_ID> -m \"Analyze\"   # API_KEY auth path"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    send_parser.add_argument(
-        "--session-id", "-s",
-        metavar="SESSION_ID",
-        help="Reuse an existing session instead of creating one",
-    )
-    send_parser.add_argument(
-        "--agent-id", "-a",
-        metavar="AGENT_ID",
-        help="Agent ID (with --session-id; auto-resolved via DescribeDataAgentSession when omitted)",
-    )
-    send_parser.add_argument(
-        "--workspace-id",
-        metavar="WORKSPACE_ID",
-        help="Workspace ID for newly created sessions (or workspace-bound reuse)",
-    )
-    send_parser.add_argument(
-        "--custom-agent-id",
-        metavar="AGENT_ID",
-        help="Custom Agent ID bound to a newly created session",
-    )
-    send_parser.add_argument(
-        "--custom-agent-stage",
-        choices=["debug", "prod"],
-        default="prod",
-        metavar="STAGE",
-        help="Custom agent stage for a newly created session (default: prod)",
-    )
-    send_parser.add_argument(
+    _add_send_message_params(legacy_send_parser)
+    legacy_send_parser.add_argument(
         "--title",
         metavar="TEXT",
         help="Title for a newly created session (default: data-agent-session)",
     )
-    db_source_group = send_parser.add_argument_group("Database Data Source Parameters")
-    db_source_group.add_argument(
-        "--dms-instance-id",
-        type=int,
-        metavar="INT",
-        help="DMS Instance ID for a database data source attached to the message",
-    )
-    db_source_group.add_argument(
-        "--db-name",
-        metavar="STR",
-        help="Database name for the database data source",
-    )
-    db_source_group.add_argument(
-        "--tables",
-        metavar="T1,T2,...",
-        help="Table names for the database data source (comma-separated)",
-    )
-    perm_group = send_parser.add_argument_group("Permission Parameters")
-    perm_group.add_argument(
-        "--permission-file",
-        default=None,
-        metavar="PATH",
-        help="Permission JSON file (table-level column/row restrictions) attached to the database data source; its top-level default_action promotes to the session-level permission config",
-    )
-    perm_group.add_argument(
-        "--permission-default-action",
-        choices=["allow", "deny"],
-        default=None,
-        metavar="ACTION",
-        help="Session-level default action for tables not declared in the permission config (allow | deny)",
-    )
-    send_parser.add_argument(
-        "--poll",
-        action="store_true",
-        help="After sending, poll DescribeDataAgentSession until the session completes (2 consecutive IDLE) or reaches a terminal status",
-    )
-    send_parser.add_argument(
-        "--timeout",
-        type=int,
-        default=300,
-        metavar="SECONDS",
-        help="Poll timeout in seconds (with --poll; default: 300)",
-    )
-    send_parser.set_defaults(func=cmd_send)
+    legacy_send_parser.set_defaults(func=cmd_send_legacy)
 
     # -- attach subcommand --
     attach_parser = subparsers.add_parser(

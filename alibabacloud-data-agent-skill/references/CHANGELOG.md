@@ -2,6 +2,27 @@
 
 Full version history of the Data Agent CLI skill. The latest entry is mirrored in short form in [SKILL.md](../SKILL.md).
 
+## v2.6.0 (2026-10-20)
+
+`send` drops the CreateDataAgentSession round-trip under AK/SK auth; `legacy-send` keeps it for `--title`.
+
+### Breaking changes
+
+- `send` no longer accepts `--title`: session titles are only expressible through CreateDataAgentSession, which `send` no longer calls under AK/SK auth. Use the new `legacy-send` subcommand when a title is genuinely required; otherwise the session gets a server-side default title.
+
+### New capabilities
+
+- **Custom-agent direct send (AK/SK)**: `send --custom-agent-id <ID>` binds the custom agent via the SendChatMessage `SessionConfig` (`CustomAgentId` / `CustomAgentStage`); the backend creates the session implicitly and the response carries the new `AgentId` / `SessionId` — one API call instead of two. Under API_KEY auth `send` still pre-creates the session (backend limitation).
+- **`legacy-send` subcommand**: the pre-CreateDataAgentSession send path, kept for `--title` and the API_KEY custom-agent path.
+
+### SDK contract
+
+- `send_message` (sync and async) accepts `custom_agent_id` / `custom_agent_stage`, injected into `SessionConfig.CustomAgentId` / `CustomAgentStage`.
+
+### Fixes
+
+- SKILL.md quick-start connectivity check: removed the invalid `--no-async-run` flag from the `send` example (`send` is synchronous by design; the flag exists only on `db` / `file` / `attach`).
+
 ## v2.5.0 (2026-10-20)
 
 Sync with the maintained master: the CLI skill absorbs the internal master's v1.9.0–v2.5.0 feature set in one pass.
