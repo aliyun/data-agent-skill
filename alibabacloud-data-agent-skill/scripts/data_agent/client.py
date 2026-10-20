@@ -850,6 +850,8 @@ class DataAgentClient:
         report_config: Optional[dict] = None,
         permission_config: Optional[dict] = None,
         plan_mode: Optional[str] = None,
+        custom_agent_id: Optional[str] = None,
+        custom_agent_stage: str = "prod",
     ) -> dict:
         """Send a message to the Data Agent.
 
@@ -887,6 +889,13 @@ class DataAgentClient:
                 ``{"DefaultAction": "deny"}`` — the default action for tables
                 not declared in any data-source permission. Injected into
                 ``SessionConfig.PermissionConfig``.
+            custom_agent_id: Optional custom agent ID. When the message
+                implicitly creates the session, the binding is expressed via
+                ``SessionConfig.CustomAgentId`` / ``CustomAgentStage`` without
+                a prior CreateDataAgentSession call (AK/SK auth; the API_KEY
+                path still requires explicit pre-creation).
+            custom_agent_stage: Stage of the custom agent, ``prod`` (default)
+                or ``debug``.
 
         Returns:
             Response from the API.
@@ -920,6 +929,9 @@ class DataAgentClient:
             session_config["PlanMode"] = plan_mode
         if permission_config:
             session_config["PermissionConfig"] = permission_config
+        if custom_agent_id:
+            session_config["CustomAgentId"] = custom_agent_id
+            session_config["CustomAgentStage"] = custom_agent_stage or "prod"
         if self._auth_type == "api_key":
             params["SessionConfig"] = session_config
         else:
@@ -1778,6 +1790,8 @@ class AsyncDataAgentClient:
         report_config: Optional[dict] = None,
         permission_config: Optional[dict] = None,
         plan_mode: Optional[str] = None,
+        custom_agent_id: Optional[str] = None,
+        custom_agent_stage: str = "prod",
     ) -> dict:
         """Send a message to the Data Agent asynchronously.
 
@@ -1818,6 +1832,8 @@ class AsyncDataAgentClient:
             report_config=report_config,
             permission_config=permission_config,
             plan_mode=plan_mode,
+            custom_agent_id=custom_agent_id,
+            custom_agent_stage=custom_agent_stage,
         )
 
     async def get_chat_content(

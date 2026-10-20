@@ -218,6 +218,62 @@ Import DMS database tables into Data Agent Data Center.
 
 ---
 
+## send Subcommand — Single Message
+
+Send a single message, printing the response. Without `--session-id` the message is sent directly and the backend creates the session; the response carries the new `SessionId` for follow-up `attach`.
+
+Under AK/SK auth, `--custom-agent-id` is carried in the SendChatMessage `SessionConfig` directly (`CustomAgentId` / `CustomAgentStage`) — no CreateDataAgentSession round-trip. Under API_KEY auth the backend does not fully support implicit creation with a custom agent yet, so `send` still pre-creates the session in that case.
+
+### Parameters
+
+| Parameter | Description |
+|------|------|
+| `-m` / `--message` | **Required**, message content |
+| `-s` / `--session-id` | Reuse an existing session instead of creating one |
+| `-a` / `--agent-id` | Agent ID (with `--session-id`; auto-resolved when omitted) |
+| `--workspace-id` | Workspace ID for newly created sessions (or workspace-bound reuse) |
+| `--custom-agent-id` | Custom Agent ID bound to the session created by this message |
+| `--custom-agent-stage` | `prod` (default) / `debug` |
+| `--message-type` | `primary` (default) / `report` / `diag` |
+| `--report-theme` / `--report-prompt` | Report options (with `--message-type report`) |
+| `--data-source` | Data Center file ID as a remote_data_center data source (repeatable) |
+| `--dms-instance-id` / `--db-name` / `--tables` | Database data source attached to the message |
+| `--permission-file` / `--permission-default-action` | SQL permission control (see [PERMISSIONS.md](PERMISSIONS.md)) |
+| `--poll` / `--timeout` | Poll `DescribeDataAgentSession` until completion (timeout in seconds, default 300) |
+| `--endpoint` | Explicit gateway endpoint override |
+
+### Examples
+
+```bash
+# Connectivity check (backend creates the session)
+python3 scripts/data_agent_cli.py send -m "ping"
+
+# Custom agent direct send (AK/SK): binding rides SessionConfig, one API call
+python3 scripts/data_agent_cli.py send --workspace-id <WS_ID> --custom-agent-id <AGENT_ID> -m "Generate a report" --poll
+
+# Database data source with permissions
+python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --db-name <DB> --tables "t1,t2" \
+    --permission-file permission.json --permission-default-action deny -m "Analyze orders"
+```
+
+> **Note**: `send` does not support session titles. If a title is genuinely required, use `legacy-send`; otherwise the session gets a server-side default title.
+
+---
+
+## legacy-send Subcommand — Pre-created Send (title)
+
+Legacy variant of `send` that pre-creates the session via `CreateDataAgentSession`. Kept only for what SendChatMessage cannot express today: `--title` and custom-agent binding under API_KEY auth. Prefer plain `send` unless a title is really required.
+
+### Parameters
+
+Identical to `send` (see above), plus:
+
+| Parameter | Description |
+|------|------|
+| `--title` | Title for a newly created session (default: data-agent-session) |
+
+---
+
 ## attach Subcommand — Session Reuse
 
 Connect to an existing session to continue conversation, confirm plans, or check progress.

@@ -7,6 +7,7 @@ Created: 2026-10-13
 import argparse
 import sys
 import time
+from typing import Optional
 
 from cli.worker_utils import build_send_options
 from data_agent import (
@@ -79,12 +80,72 @@ def _poll_session_completion(
     return f"TIMEOUT:{last_status}"
 
 
-def cmd_send(args: argparse.Namespace) -> None:
-    """Send a single message: direct session-less send, explicit creation, or reuse.
+def _resolve_reuse_agent(
+    client: DataAgentClient,
+    config: DataAgentConfig,
+    session_id: str,
+    agent_id: str,
+) -> str:
+    """Resolve the agent ID for a reused session, exiting on failure."""
+    if agent_id:
+        return agent_id
+    try:
+        session = client.describe_session(agent_id="", session_id=session_id)
+    except Exception as e:
+        print(f"Error: Failed to describe session: {e}", file=sys.stderr)
+        sys.exit(1)
+    agent_id = session.agent_id
+    if not agent_id:
+        print(
+            f"Error: No agent ID for session {session_id}; "
+            "it may not exist or not belong to the current account.",
+            file=sys.stderr,
+        )
+        if config.using_credentials_file:
+            print(
+                f"Current credentials: {config.credentials_env}/{config.credentials_profile}. "
+                "If the session belongs to another account, switch via "
+                "DATA_AGENT_CREDENTIALS_ENV / DATA_AGENT_CREDENTIALS_PROFILE.",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+    return agent_id
 
-    Without --session-id (and without --custom-agent-id / --title) the message
-    is sent directly and the backend creates the session; the new SessionId is
-    parsed from the SendChatMessage response.
+
+def _precreate_session(
+    client: DataAgentClient,
+    workspace_id: str,
+    custom_agent_id: Optional[str] = None,
+    custom_agent_stage: Optional[str] = None,
+    title: Optional[str] = None,
+):
+    """Pre-create the session via CreateDataAgentSession; returns (session_id, agent_id)."""
+    print("Creating session...")
+    try:
+        session = client.create_session(
+            workspace_id=workspace_id or None,
+            title=title or "data-agent-session",
+            custom_agent_id=custom_agent_id,
+            custom_agent_stage=custom_agent_stage or "prod",
+        )
+    except Exception as e:
+        print(f"Error: Failed to create session: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  Session ID: {session.session_id}")
+    print(f"  Agent ID:   {session.agent_id}")
+    return session.session_id, session.agent_id
+
+
+def cmd_send(args: argparse.Namespace) -> None:
+    """Send a single message: direct send, custom-agent direct send, or session reuse.
+
+    Without --session-id the message is sent directly and the backend creates
+    the session; the new SessionId is parsed from the SendChatMessage response.
+    With AK/SK auth a --custom-agent-id is carried in SessionConfig directly —
+    no CreateDataAgentSession round-trip. The API_KEY path still pre-creates
+    the session because the backend does not fully support implicit creation
+    with a custom agent binding there yet. Session titles are not supported;
+    use legacy-send when a title is genuinely required.
     """
     if not args.message:
         print("Error: --message/-m is required", file=sys.stderr)
@@ -96,55 +157,74 @@ def cmd_send(args: argparse.Namespace) -> None:
     session_id = args.session_id
     agent_id = args.agent_id
     workspace_id = getattr(args, "workspace_id", None) or ""
+    custom_agent_id = getattr(args, "custom_agent_id", None)
 
+    custom_agent = None
+    if session_id:
+        agent_id = _resolve_reuse_agent(client, config, session_id, agent_id)
+        print(f"Reusing session: {session_id} (agent: {agent_id})")
+    elif custom_agent_id and config.api_key:
+        session_id, agent_id = _precreate_session(
+            client, workspace_id, custom_agent_id,
+            getattr(args, "custom_agent_stage", None),
+        )
+    else:
+        print("Direct send (backend will create the session)...")
+        if custom_agent_id:
+            custom_agent = {
+                "custom_agent_id": custom_agent_id,
+                "custom_agent_stage": getattr(args, "custom_agent_stage", None) or "prod",
+            }
+            print(f"  custom agent: {custom_agent_id} (stage={custom_agent['custom_agent_stage']})")
+
+    _dispatch_message(client, args, agent_id, session_id, workspace_id, custom_agent)
+
+
+def cmd_send_legacy(args: argparse.Namespace) -> None:
+    """Legacy send: pre-creates the session via CreateDataAgentSession.
+
+    Kept only for capabilities that SendChatMessage cannot express today —
+    chiefly --title (and custom-agent binding under API_KEY auth). Prefer
+    plain `send` without a title; sessions get a default server-side title.
+    """
+    if not args.message:
+        print("Error: --message/-m is required", file=sys.stderr)
+        sys.exit(1)
+
+    config = DataAgentConfig.from_env()
+    client = DataAgentClient(config)
+
+    session_id = args.session_id
+    agent_id = args.agent_id
+    workspace_id = getattr(args, "workspace_id", None) or ""
     custom_agent_id = getattr(args, "custom_agent_id", None)
     title = getattr(args, "title", None)
+
     if session_id:
-        if not agent_id:
-            try:
-                session = client.describe_session(agent_id="", session_id=session_id)
-            except Exception as e:
-                print(f"Error: Failed to describe session: {e}", file=sys.stderr)
-                sys.exit(1)
-            agent_id = session.agent_id
-            if not agent_id:
-                print(
-                    f"Error: No agent ID for session {session_id}; "
-                    "it may not exist or not belong to the current account.",
-                    file=sys.stderr,
-                )
-                if config.using_credentials_file:
-                    print(
-                        f"Current credentials: {config.credentials_env}/{config.credentials_profile}. "
-                        "If the session belongs to another account, switch via "
-                        "DATA_AGENT_CREDENTIALS_ENV / DATA_AGENT_CREDENTIALS_PROFILE.",
-                        file=sys.stderr,
-                    )
-                sys.exit(1)
+        agent_id = _resolve_reuse_agent(client, config, session_id, agent_id)
         print(f"Reusing session: {session_id} (agent: {agent_id})")
     elif custom_agent_id or title:
-        # Custom agents and titles are only expressible through
-        # CreateDataAgentSession, so pre-create the session explicitly.
-        print("Creating session...")
-        try:
-            session = client.create_session(
-                workspace_id=workspace_id or None,
-                title=title or "data-agent-session",
-                custom_agent_id=custom_agent_id,
-                custom_agent_stage=getattr(args, "custom_agent_stage", None) or "prod",
-            )
-        except Exception as e:
-            print(f"Error: Failed to create session: {e}", file=sys.stderr)
-            sys.exit(1)
-        session_id = session.session_id
-        agent_id = session.agent_id
-        print(f"  Session ID: {session_id}")
-        print(f"  Agent ID:   {agent_id}")
+        # Custom-agent binding under API_KEY auth and session titles are only
+        # expressible through CreateDataAgentSession, so pre-create explicitly.
+        session_id, agent_id = _precreate_session(
+            client, workspace_id, custom_agent_id,
+            getattr(args, "custom_agent_stage", None), title,
+        )
     else:
-        # Session-less direct send: the backend creates the session and the
-        # response carries the new SessionId / AgentId.
         print("Direct send (backend will create the session)...")
 
+    _dispatch_message(client, args, agent_id, session_id, workspace_id)
+
+
+def _dispatch_message(
+    client: DataAgentClient,
+    args: argparse.Namespace,
+    agent_id: str,
+    session_id: str,
+    workspace_id: str,
+    custom_agent: Optional[dict] = None,
+) -> None:
+    """Send the message, print the result, optionally poll; exits the process."""
     send_options = build_send_options(args)
     if send_options.get("message_type") == "report":
         report_config = send_options.get("report_config", {})
@@ -168,6 +248,7 @@ def cmd_send(args: argparse.Namespace) -> None:
             session_id=session_id,
             message=args.message,
             workspace_id=workspace_id,
+            **(custom_agent or {}),
             **send_options,
         )
     except Exception as e:
