@@ -122,7 +122,7 @@ def _extract_unit(body: dict[str, Any]) -> Optional[tuple[str, str]]:
 
 def _print_request(region: str, params: dict[str, Any]) -> None:
     print("=" * 70)
-    print(f"Endpoint : {_dms_enterprise_endpoint(region)}")
+    print(f"Endpoint : dms-enterprise.{region}.aliyuncs.com")
     print(f"Action   : {API_ACTION}")
     print(f"Version  : {API_VERSION}")
     print(f"Region   : {region}")

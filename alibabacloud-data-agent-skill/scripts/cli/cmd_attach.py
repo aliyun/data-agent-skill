@@ -15,7 +15,7 @@ from cli.streaming import _stream_response, StreamState, _print_event
 from cli.cmd_db import _db_attach
 from cli.log_handler import StructuredLogHandler
 # from cli.notify import push_notification
-from cli.worker_utils import is_worker_process, setup_async_worker, handle_worker_completion
+from cli.worker_utils import is_worker_process, setup_async_worker, handle_worker_completion, build_send_options
 from cli.streaming_utils import run_worker_with_handler, execute_single_query
 from cli.worker_lock import check_worker_lock, write_worker_pid, acquire_worker_lock, release_worker_lock
 from data_agent import (
@@ -36,13 +36,11 @@ def cmd_attach(args: argparse.Namespace) -> None:
 
     # Initialize components
     config = DataAgentConfig.from_env()
-    if getattr(args, 'dms_unit', None):
-        config.dms_unit = args.dms_unit
     if getattr(args, 'workspace_id', None):
         config.workspace_id = args.workspace_id
     client = DataAgentClient(config)
     session_manager = SessionManager(client)
-    message_handler = MessageHandler(client)
+    message_handler = MessageHandler(client, build_send_options(args))
     sse_client = SSEClient(config)
     file_manager = FileManager(client)
 
@@ -70,6 +68,7 @@ def cmd_attach(args: argparse.Namespace) -> None:
     elif is_worker:
         # WORKER PROCESS: run the attach operation in background - using common utility
         def attach_query_executor(message_handler, session, args):
+            message_handler.set_send_options(build_send_options(args))
             output_mode = getattr(args, "output", "summary")
             session_dir = Path(f"sessions/{session.session_id}")
 

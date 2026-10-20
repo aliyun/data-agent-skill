@@ -12,11 +12,69 @@ from cli.cmd_db import cmd_db
 from cli.cmd_ls import cmd_ls
 from cli.cmd_file import cmd_file
 from cli.cmd_attach import cmd_attach
+from cli.cmd_cancel import cmd_cancel
+from cli.cmd_upload import cmd_upload
+from cli.cmd_send import cmd_send
 from cli.cmd_dms import cmd_dms
 from cli.cmd_import import cmd_import
 from cli.cmd_reports import cmd_reports
 from cli.cmd_workspace import cmd_workspace
 from cli.cmd_agent import cmd_agent
+
+
+def _add_common_endpoint(parent: argparse.ArgumentParser) -> None:
+    """Register the shared --endpoint override on a subparser parent."""
+    parent.add_argument(
+        "--endpoint",
+        default=None,
+        metavar="HOST",
+        help="Explicit API gateway endpoint override (defaults derived from region; also settable via DATA_AGENT_ENDPOINT)",
+    )
+
+
+def _add_report_options(parser: argparse.ArgumentParser, repeatable_data_source: bool = False) -> None:
+    """Add report-message options shared by db / file / attach / send subcommands.
+
+    ``repeatable_data_source`` makes ``--data-source`` appendable so a single
+    message can carry multiple Data Center file data sources (send).
+    """
+    group = parser.add_argument_group("Message Parameters")
+    group.add_argument(
+        "--message-type",
+        choices=["primary", "report", "diag"],
+        default="primary",
+        metavar="TYPE",
+        help="Message type: primary (default, plain chat) | report (web report generation request) | diag (report diagnosis request, message text is the complaint)",
+    )
+    group.add_argument(
+        "--report-theme",
+        default=None,
+        metavar="THEME",
+        help="Report visual theme (with --message-type report; default 'default')",
+    )
+    group.add_argument(
+        "--report-prompt",
+        default=None,
+        metavar="TEXT|@PATH",
+        help="Extra prompt injected into the report guide (with --message-type report); @path reads the whole file",
+    )
+    if repeatable_data_source:
+        group.add_argument(
+            "--data-source",
+            dest="data_source",
+            action="append",
+            default=None,
+            metavar="FILE_ID",
+            help="Data Center file ID attached to the message as a remote_data_center data source (repeatable for multiple files)",
+        )
+    else:
+        group.add_argument(
+            "--data-source",
+            dest="data_source",
+            default=None,
+            metavar="FILE_ID",
+            help="Data Center file ID attached to the message as a remote_data_center data source",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,16 +117,18 @@ Examples:
     # -- db subcommand --
     db_parser = subparsers.add_parser(
         "db",
-        help="Database query/analysis (supports auto/lite/pro/ultra modes)",
+        help="Database query/analysis (supports auto / lite / pro / ultra modes)",
         description="""Connect to DMS database for natural language queries or data analysis.
 
 Mode Description:
-  auto (default): Backend intelligent decision
-  lite          : Quick SQL query + natural language response
-  pro           : Deep analysis, multi-step reasoning, report generation
-  ultra         : Most thorough analysis with multi-dimensional insights""",
+  auto  (default): Backend intelligent decision, selects the best mode per query
+  lite            : Quick SQL query + natural language response
+  pro             : Deep analysis, multi-step reasoning, report generation
+  ultra           : Most thorough analysis with multi-dimensional insights""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    _add_common_endpoint(db_parser)
+    _add_report_options(db_parser)
 
     # Data source parameters
     ds_group = db_parser.add_argument_group("Data Source Parameters (required unless --custom-agent-id is set)")
@@ -142,6 +202,13 @@ Mode Description:
         help="Session mode: auto (default) | lite | pro | ultra",
     )
     db_parser.add_argument(
+        "--plan-mode",
+        default="force",
+        choices=["force", "disable"],
+        metavar="PLAN",
+        help="Plan mode: force (default, always generate execution plan) | disable (skip planning)",
+    )
+    db_parser.add_argument(
         "--output",
         choices=["summary", "detail", "raw"],
         default="summary",
@@ -154,13 +221,6 @@ Mode Description:
         help="Enable search capability in the session (default: False)",
     )
     db_parser.add_argument(
-        "--plan-mode",
-        default="force",
-        choices=["force", "disable"],
-        metavar="PLAN",
-        help="Plan mode: force (default, always generate execution plan) | disable (skip planning)",
-    )
-    db_parser.add_argument(
         "--workspace-id",
         metavar="WORKSPACE_ID",
         help="Workspace ID to bind the session to a specific workspace",
@@ -171,11 +231,6 @@ Mode Description:
         default=None,
         help="Custom Agent ID to use for the analysis session. When specified, data source parameters (--dms-instance-id, --dms-db-id, --db-name, --tables) are not required.",
     )
-    db_parser.add_argument(
-        "--dms-unit",
-        metavar="DMS_UNIT",
-        help="DMSUnit override for Data Agent APIs",
-    )
 
     db_parser.set_defaults(func=cmd_db)
 
@@ -185,6 +240,8 @@ Mode Description:
         help="File upload and analysis (CSV / Excel / JSON)",
         description="Upload local data files for intelligent analysis via Data Agent.",
     )
+    _add_common_endpoint(file_parser)
+    _add_report_options(file_parser)
 
     # Create a mutually exclusive group for file source
     file_source_group = file_parser.add_mutually_exclusive_group(required=True)
@@ -229,6 +286,13 @@ Mode Description:
         help="Session mode: auto (default) | lite | pro | ultra",
     )
     file_parser.add_argument(
+        "--plan-mode",
+        default="force",
+        choices=["force", "disable"],
+        metavar="PLAN",
+        help="Plan mode: force (default, always generate execution plan) | disable (skip planning)",
+    )
+    file_parser.add_argument(
         "--output",
         default="summary",
         choices=["summary", "detail", "raw"],
@@ -241,13 +305,6 @@ Mode Description:
         help="Enable search capability in the session (default: False)",
     )
     file_parser.add_argument(
-        "--plan-mode",
-        default="force",
-        choices=["force", "disable"],
-        metavar="PLAN",
-        help="Plan mode: force (default, always generate execution plan) | disable (skip planning)",
-    )
-    file_parser.add_argument(
         "--workspace-id",
         metavar="WORKSPACE_ID",
         help="Workspace ID to bind the session to a specific workspace",
@@ -258,13 +315,145 @@ Mode Description:
         default=None,
         help="Custom Agent ID to use for the analysis session",
     )
-    file_parser.add_argument(
-        "--dms-unit",
-        metavar="DMS_UNIT",
-        help="DMSUnit override for Data Agent APIs",
-    )
 
     file_parser.set_defaults(func=cmd_file)
+
+    # -- upload subcommand --
+    upload_parser = subparsers.add_parser(
+        "upload",
+        help="Upload a local file and print its file ID (no session created)",
+        description=(
+            "Upload a local data file (CSV / Excel) to Data Agent and print\n"
+            "the resulting file ID, without starting an analysis session.\n\n"
+            "Examples:\n"
+            "  python3 scripts/data_agent_cli.py upload data.csv\n"
+            "  python3 scripts/data_agent_cli.py upload data.csv --endpoint custom-gw.example.com"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_common_endpoint(upload_parser)
+    upload_parser.add_argument(
+        "file_path",
+        metavar="FILE",
+        help="Local file path to upload (supports: .csv / .xlsx / .xls)",
+    )
+    upload_parser.add_argument(
+        "--workspace-id",
+        metavar="WORKSPACE_ID",
+        help="Workspace ID to upload into (defaults to the caller's personal workspace)",
+    )
+    upload_parser.set_defaults(func=cmd_upload)
+
+    # -- send subcommand --
+    send_parser = subparsers.add_parser(
+        "send",
+        help="Send a single message (direct session-less send, or reuse one)",
+        description=(
+            "Lightweight message trigger: send a single message, printing the response.\n"
+            "Without --session-id the message is sent directly and the backend\n"
+            "creates the session (the new SessionId is parsed from the response);\n"
+            "--custom-agent-id / --title still pre-create via CreateDataAgentSession.\n"
+            "Use this for connectivity checks and report-generation requests\n"
+            "without the full streaming workflow of db / file / attach.\n\n"
+            "Examples:\n"
+            "  python3 scripts/data_agent_cli.py send -m \"Analyze sales trends\"\n"
+            "  python3 scripts/data_agent_cli.py send --data-source <FILE_ID> -m \"Analyze store sales\"\n"
+            "  python3 scripts/data_agent_cli.py send --data-source <FILE_ID_1> --data-source <FILE_ID_2> -m \"Analyze both files\"\n"
+            "  python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --db-name <DB> --tables \"t1,t2\" -m \"Analyze the database\"\n"
+            "  python3 scripts/data_agent_cli.py send --workspace-id <WORKSPACE_ID> --custom-agent-id <AGENT_ID> \\\n"
+            "      --title \"poc session\" --data-source <FILE_ID> -m \"Generate a report\" --poll --timeout 600\n"
+            "  python3 scripts/data_agent_cli.py send -s <SID> --message-type report --report-theme default -m \"Generate a web report\"\n"
+            "  python3 scripts/data_agent_cli.py send -s <SID> --message-type report --report-prompt @report_prompt.md -m \"Generate report\"\n"
+            "  python3 scripts/data_agent_cli.py send -s <SID> --message-type diag -m \"Why does the web report show no data for metric X\"\n"
+            "  python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --db-name <DB> --tables \"t1,t2\" \\\n"
+            "      --permission-file permission.json --permission-default-action deny -m \"Analyze orders\" --poll"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_common_endpoint(send_parser)
+    _add_report_options(send_parser, repeatable_data_source=True)
+    send_parser.add_argument(
+        "--message", "-m",
+        required=True,
+        metavar="TEXT",
+        help="Message content to send",
+    )
+    send_parser.add_argument(
+        "--session-id", "-s",
+        metavar="SESSION_ID",
+        help="Reuse an existing session instead of creating one",
+    )
+    send_parser.add_argument(
+        "--agent-id", "-a",
+        metavar="AGENT_ID",
+        help="Agent ID (with --session-id; auto-resolved via DescribeDataAgentSession when omitted)",
+    )
+    send_parser.add_argument(
+        "--workspace-id",
+        metavar="WORKSPACE_ID",
+        help="Workspace ID for newly created sessions (or workspace-bound reuse)",
+    )
+    send_parser.add_argument(
+        "--custom-agent-id",
+        metavar="AGENT_ID",
+        help="Custom Agent ID bound to a newly created session",
+    )
+    send_parser.add_argument(
+        "--custom-agent-stage",
+        choices=["debug", "prod"],
+        default="prod",
+        metavar="STAGE",
+        help="Custom agent stage for a newly created session (default: prod)",
+    )
+    send_parser.add_argument(
+        "--title",
+        metavar="TEXT",
+        help="Title for a newly created session (default: data-agent-session)",
+    )
+    db_source_group = send_parser.add_argument_group("Database Data Source Parameters")
+    db_source_group.add_argument(
+        "--dms-instance-id",
+        type=int,
+        metavar="INT",
+        help="DMS Instance ID for a database data source attached to the message",
+    )
+    db_source_group.add_argument(
+        "--db-name",
+        metavar="STR",
+        help="Database name for the database data source",
+    )
+    db_source_group.add_argument(
+        "--tables",
+        metavar="T1,T2,...",
+        help="Table names for the database data source (comma-separated)",
+    )
+    perm_group = send_parser.add_argument_group("Permission Parameters")
+    perm_group.add_argument(
+        "--permission-file",
+        default=None,
+        metavar="PATH",
+        help="Permission JSON file (table-level column/row restrictions) attached to the database data source; its top-level default_action promotes to the session-level permission config",
+    )
+    perm_group.add_argument(
+        "--permission-default-action",
+        choices=["allow", "deny"],
+        default=None,
+        metavar="ACTION",
+        help="Session-level default action for tables not declared in the permission config (allow | deny)",
+    )
+    send_parser.add_argument(
+        "--poll",
+        action="store_true",
+        help="After sending, poll DescribeDataAgentSession until the session completes (2 consecutive IDLE) or reaches a terminal status",
+    )
+    send_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        metavar="SECONDS",
+        help="Poll timeout in seconds (with --poll; default: 300)",
+    )
+    send_parser.set_defaults(func=cmd_send)
 
     # -- attach subcommand --
     attach_parser = subparsers.add_parser(
@@ -272,7 +461,7 @@ Mode Description:
         help="Connect to an existing session to continue analysis or confirm plan",
         description=(
             "Attach to an existing Data Agent session. Use this to:\n"
-            "  - Continue an interrupted analysis session\n"
+            "  - Continue an interrupted pro/ultra session\n"
             "  - Confirm an execution plan after WAIT_INPUT\n"
             "  - Ask follow-up questions in an existing session\n\n"
             "Examples:\n"
@@ -281,6 +470,8 @@ Mode Description:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    _add_common_endpoint(attach_parser)
+    _add_report_options(attach_parser)
     attach_parser.add_argument(
         "--session-id",
         required=True,
@@ -317,16 +508,36 @@ Mode Description:
         help="Run asynchronously in background (default: True). Use --no-async-run for synchronous mode.",
     )
     attach_parser.add_argument(
-        "--dms-unit",
-        metavar="DMS_UNIT",
-        help="DMSUnit override for Data Agent APIs",
-    )
-    attach_parser.add_argument(
         "--workspace-id",
         metavar="WORKSPACE_ID",
         help="Workspace ID override",
     )
     attach_parser.set_defaults(func=cmd_attach)
+
+    # -- cancel subcommand --
+    cancel_parser = subparsers.add_parser(
+        "cancel",
+        help="Cancel a running session",
+        description=(
+            "Cancel a running Data Agent session by sending a cancel message.\n\n"
+            "Examples:\n"
+            "  python3 scripts/data_agent_cli.py cancel --session-id <ID>"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_common_endpoint(cancel_parser)
+    cancel_parser.add_argument(
+        "--session-id",
+        required=True,
+        metavar="SESSION_ID",
+        help="Session ID to cancel",
+    )
+    cancel_parser.add_argument(
+        "--workspace-id",
+        metavar="WORKSPACE_ID",
+        help="Workspace ID if the session is workspace-bound",
+    )
+    cancel_parser.set_defaults(func=cmd_cancel)
 
     # -- ls subcommand --
     ls_parser = subparsers.add_parser(
@@ -342,6 +553,7 @@ Mode Description:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    _add_common_endpoint(ls_parser)
     ls_parser.add_argument(
         "--workspace-id",
         type=str,
@@ -379,6 +591,7 @@ Examples:
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    _add_common_endpoint(dms_parser)
     dms_parser.add_argument(
         "tool",
         choices=["list-instances", "search-database", "list-tables"],
@@ -453,6 +666,7 @@ Examples:
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    _add_common_endpoint(import_parser)
 
     # Data source parameters (required)
     import_group = import_parser.add_argument_group("Data Source Parameters (required)")
@@ -515,6 +729,7 @@ Examples:
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    _add_common_endpoint(reports_parser)
     reports_parser.add_argument(
         "--session-id",
         required=True,
@@ -539,6 +754,7 @@ Examples:
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    _add_common_endpoint(workspace_parser)
     workspace_parser.add_argument(
         "--workspace-type",
         default="MY",
@@ -570,40 +786,83 @@ Examples:
     # -- agent subcommand --
     agent_parser = subparsers.add_parser(
         "agent",
-        help="List and describe custom agents",
-        description="""List and describe custom agents.
+        help="List, describe, create, update and publish custom agents",
+        description="""Manage custom agents.
+
+Actions:
+  list     List custom agents (default)
+  describe Show one agent's details
+  create   Create an agent, then release it automatically
+  update   Modify an existing agent, then release it automatically
+  publish  Release an existing agent (operate_type=RELEASE)
 
 Examples:
   python3 scripts/data_agent_cli.py agent
   python3 scripts/data_agent_cli.py agent list --search myagent
   python3 scripts/data_agent_cli.py agent describe --custom-agent-id <ID>
+  python3 scripts/data_agent_cli.py agent create --workspace-id <WORKSPACE_ID> \\
+      --agent-name "report-agent" --dsl-file report_dsl.json \\
+      --instruction @instruction.md
+  python3 scripts/data_agent_cli.py agent update --custom-agent-id <ID> \\
+      --workspace-id <WORKSPACE_ID> --dsl-file report_dsl_v2.json
+  python3 scripts/data_agent_cli.py agent publish --custom-agent-id <ID> \\
+      --workspace-id <WORKSPACE_ID>
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    _add_common_endpoint(agent_parser)
     agent_parser.add_argument(
         "action",
         nargs="?",
         default="list",
-        choices=["list", "describe"],
+        choices=["list", "describe", "create", "update", "publish"],
         help="Action to perform (default: list)",
     )
     agent_parser.add_argument(
         "--workspace-id",
         type=str,
         default=None,
-        help="Filter agents by workspace ID",
+        help="Workspace ID (filter for list/describe; target for create/update/publish)",
     )
     agent_parser.add_argument(
         "--custom-agent-id",
         type=str,
         default=None,
-        help="Custom Agent ID (required for describe)",
+        help="Custom Agent ID (required for describe/update/publish)",
     )
     agent_parser.add_argument(
         "--search",
         type=str,
         default=None,
         help="Search keyword to filter agents",
+    )
+    agent_parser.add_argument(
+        "--agent-name",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="Custom agent name (required for create; optional for update)",
+    )
+    agent_parser.add_argument(
+        "--description",
+        type=str,
+        default=None,
+        metavar="TEXT",
+        help="Custom agent description (create/update)",
+    )
+    agent_parser.add_argument(
+        "--dsl-file",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="WebReport DSL JSON file (create/update; validated as JSON)",
+    )
+    agent_parser.add_argument(
+        "--instruction",
+        type=str,
+        default=None,
+        metavar="TEXT|@PATH",
+        help="Agent instruction text; @path reads the whole file (create/update)",
     )
     agent_parser.add_argument("--page-number", type=int, default=1)
     agent_parser.add_argument("--page-size", type=int, default=20)
@@ -615,6 +874,11 @@ Examples:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    # Propagate an explicit --endpoint before any component reads the
+    # environment; worker subprocesses inherit it automatically.
+    if getattr(args, "endpoint", None):
+        os.environ["DATA_AGENT_ENDPOINT"] = args.endpoint
 
     try:
         args.func(args)

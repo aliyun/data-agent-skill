@@ -1,6 +1,26 @@
-# Pro/Ultra Mode Sub-Agent Specification
+# Session Modes & Pro/Ultra Sub-Agent Specification
 
-Pro and ultra mode tasks are long-running (5-40 minutes), **you must spawn a sub-agent to execute in background** to avoid blocking the main conversation flow.
+## Session Modes
+
+| Mode | Features | Duration | Report |
+|------|----------|----------|--------|
+| `auto` (default) | Backend intelligent decision — automatically selects the best mode based on query complexity | varies | auto |
+| `lite` | Quick query mode, sub-second response, suitable for quick Q&A and simple SQL queries | 30 sec - 2 min | ❌ |
+| `pro` | Deep analysis with planning, multi-step reasoning, and report generation | 5-15 min | ✅ |
+| `ultra` | Most thorough analysis with multi-dimensional insights; follows the same plan-confirmation flow as pro | 20-40 min | ✅ |
+
+## Plan Mode
+
+`--plan-mode` controls `SessionConfig.PlanMode`:
+
+- `force` (default): always generate an execution plan — pro/ultra sessions enter `waiting_input` until the plan is confirmed via `attach -q "confirm"`.
+- `disable`: skip planning and go straight to execution.
+
+Set at session creation (`db` / `file` / `send`) or per message (`send -s <SESSION_ID>`); when omitted on a message, the session-level setting applies.
+
+## Pro/Ultra Sub-Agent Behavior
+
+pro and ultra mode tasks are long-running (5-40 minutes), **you must spawn a sub-agent to execute in background** to avoid blocking the main conversation flow.
 
 ---
 
@@ -24,7 +44,7 @@ Pro and ultra mode tasks are long-running (5-40 minutes), **you must spawn a sub
 | Checkpoint | Trigger Condition | Report Content | Required Action |
 |------|----------|----------|----------|
 | 🚀 Task Started | After command execution | Session ID, estimated duration | No action needed |
-| 📋 Execution Plan Ready | `status.txt` = `waiting_input` | Show analysis plan/SQL | **Must wait for user confirmation, then `attach -q 'confirm execution'`** |
+| 📋 Execution Plan Ready | `status.txt` = `waiting_input` | Show analysis plan/SQL | **Must wait for user confirmation, then `attach -q 'confirm execution'`** (only with `--plan-mode force`) |
 | 📊 Phase Conclusion | New content in `progress.log` | Phase analysis summary | No action needed |
 | ✅ Task Completed | `status.txt` = `completed` | Report link or file path | Guide user to view report |
 | ❌ Task Failed | `status.txt` = `failed` | Error message | Prompt user to retry |
