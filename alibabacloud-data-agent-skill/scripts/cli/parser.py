@@ -13,6 +13,7 @@ from cli.cmd_ls import cmd_ls
 from cli.cmd_file import cmd_file
 from cli.cmd_attach import cmd_attach
 from cli.cmd_cancel import cmd_cancel
+from cli.cmd_status import cmd_status
 from cli.cmd_upload import cmd_upload
 from cli.cmd_send import cmd_send, cmd_send_legacy
 from cli.cmd_dms import cmd_dms
@@ -103,6 +104,13 @@ def _add_send_message_params(parser: argparse.ArgumentParser) -> None:
         help="Workspace ID for newly created sessions (or workspace-bound reuse)",
     )
     parser.add_argument(
+        "--session-mode",
+        default=None,
+        choices=["auto", "lite", "pro", "ultra"],
+        metavar="MODE",
+        help="Session mode for the created session: auto | lite | pro | ultra (default: backend intelligent decision)",
+    )
+    parser.add_argument(
         "--custom-agent-id",
         metavar="AGENT_ID",
         help="Custom Agent ID bound to the session created by this message",
@@ -120,6 +128,12 @@ def _add_send_message_params(parser: argparse.ArgumentParser) -> None:
         type=int,
         metavar="INT",
         help="DMS Instance ID for a database data source attached to the message",
+    )
+    db_source_group.add_argument(
+        "--dms-db-id",
+        type=int,
+        metavar="INT",
+        help="DMS Database ID (required when any database data source parameter is passed; the backend resolves table schemas and executes SQL by database ID)",
     )
     db_source_group.add_argument(
         "--db-name",
@@ -441,12 +455,12 @@ Mode Description:
             "Examples:\n"
             "  python3 scripts/data_agent_cli.py send -m \"Analyze sales trends\"\n"
             "  python3 scripts/data_agent_cli.py send --data-source <FILE_ID> -m \"Analyze store sales\"\n"
-            "  python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --db-name <DB> --tables \"t1,t2\" -m \"Analyze the database\"\n"
+            "  python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> --db-name <DB> --tables \"t1,t2\" -m \"Analyze the database\"\n"
             "  python3 scripts/data_agent_cli.py send --workspace-id <WORKSPACE_ID> --custom-agent-id <AGENT_ID> -m \"Generate a report\" --poll --timeout 600\n"
             "  python3 scripts/data_agent_cli.py send -s <SID> --message-type report --report-theme default -m \"Generate a web report\"\n"
             "  python3 scripts/data_agent_cli.py send -s <SID> --message-type report --report-prompt @report_prompt.md -m \"Generate report\"\n"
             "  python3 scripts/data_agent_cli.py send -s <SID> --message-type diag -m \"Why does the web report show no data for metric X\"\n"
-            "  python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --db-name <DB> --tables \"t1,t2\" \\\n"
+            "  python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> --db-name <DB> --tables \"t1,t2\" \\\n"
             "      --permission-file permission.json --permission-default-action deny -m \"Analyze orders\" --poll"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -562,6 +576,38 @@ Mode Description:
         help="Workspace ID if the session is workspace-bound",
     )
     cancel_parser.set_defaults(func=cmd_cancel)
+
+    # -- status subcommand --
+    status_parser = subparsers.add_parser(
+        "status",
+        help="Show the current status of a session",
+        description=(
+            "Show the current status of a Data Agent session via a single\n"
+            "DescribeDataAgentSession call. Read-only: no streaming, no worker.\n"
+            "For WAIT_INPUT sessions, prints how to confirm via attach.\n\n"
+            "Examples:\n"
+            "  python3 scripts/data_agent_cli.py status --session-id <ID>"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_common_endpoint(status_parser)
+    status_parser.add_argument(
+        "--session-id",
+        required=True,
+        metavar="SESSION_ID",
+        help="Session ID to query",
+    )
+    status_parser.add_argument(
+        "--agent-id", "-a",
+        metavar="AGENT_ID",
+        help="Agent ID (optional; the backend resolves it from the session)",
+    )
+    status_parser.add_argument(
+        "--workspace-id",
+        metavar="WORKSPACE_ID",
+        help="Workspace ID if the session is workspace-bound",
+    )
+    status_parser.set_defaults(func=cmd_status)
 
     # -- ls subcommand --
     ls_parser = subparsers.add_parser(

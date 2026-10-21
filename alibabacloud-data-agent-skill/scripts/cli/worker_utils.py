@@ -72,8 +72,8 @@ def build_send_options(args: object) -> dict:
     """Build message send options from report-related CLI arguments.
 
     Reads ``message_type``, ``report_theme``, ``report_prompt``, ``data_source``
-    and the database data-source parameters (``dms_instance_id`` / ``db_name`` /
-    ``tables``) from ``args`` (all optional) and returns a dict of keyword
+    and the database data-source parameters (``dms_db_id`` — required when any
+    of them is set — ``dms_instance_id`` / ``db_name`` / ``tables``) from ``args`` (all optional) and returns a dict of keyword
     arguments for ``client.send_message`` / ``MessageHandler`` send options:
     ``message_type``, ``report_config``, ``data_sources``,
     ``permission_config``.
@@ -142,13 +142,18 @@ def build_send_options(args: object) -> dict:
 
 
 def _build_data_sources(args: object, permission: Optional[dict] = None) -> list:
-    """Build the message-level data_sources list.
+    """Build the session-level data_sources list.
 
     File IDs come from ``--data-source`` (single or repeatable); the database
-    data source comes from ``--dms-instance-id`` / ``--db-name`` / ``--tables``
-    (comma-separated table names), matching the POP DataSources structure.
-    ``permission`` (from ``--permission-file``) is attached to the database
-    data source as ``Permission``.
+    data source comes from ``--dms-db-id`` (required when any database data
+    source parameter is passed) plus ``--dms-instance-id`` / ``--db-name`` /
+    ``--tables`` (comma-separated table names), matching the POP DataSources
+    structure. ``permission`` (from ``--permission-file``) is attached to the
+    database data source as ``Permission``.
+
+    Both POP forms (``DataSource`` / ``DataSources``) are session-level and
+    merge server-side with equal priority; the backend recommends
+    ``DataSources`` uniformly, which is why every CLI path builds this list.
     """
     data_sources: list = []
 
@@ -161,16 +166,35 @@ def _build_data_sources(args: object, permission: Optional[dict] = None) -> list
         )
 
     dms_instance_id = getattr(args, "dms_instance_id", None)
+    dms_db_id = getattr(args, "dms_db_id", None)
     db_name = getattr(args, "db_name", None)
     tables_str = getattr(args, "tables", None)
-    if dms_instance_id or db_name or tables_str:
-        db_source: Dict[str, Any] = {"DataSourceType": "database"}
+    if dms_instance_id or dms_db_id or db_name or tables_str:
+        # The backend resolves table schemas (GetTableKnowledgeInfo) and executes
+        # SQL (SubmitAsyncSQLExecuteTask) by database ID; a database data source
+        # without DmsDatabaseId fails server-side, so fail fast here instead.
+        if not dms_db_id:
+            print(
+                "Error: --dms-db-id is required for the database data source "
+                "(the backend resolves table schemas and executes SQL by database ID). "
+                "Add --dms-db-id, or drop --dms-instance-id / --db-name / --tables "
+                "to send without a database data source.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        db_source: Dict[str, Any] = {
+            "DataSourceType": "database",
+            "DmsDatabaseId": str(dms_db_id),
+        }
         if dms_instance_id:
             db_source["DmsInstanceId"] = str(dms_instance_id)
         if db_name:
             db_source["DbName"] = db_name
         if tables_str:
             db_source["Tables"] = [t.strip() for t in tables_str.split(",") if t.strip()]
+        engine = getattr(args, "engine", None)
+        if engine:
+            db_source["Engine"] = engine
         if permission:
             db_source["Permission"] = permission
         data_sources.append(db_source)
