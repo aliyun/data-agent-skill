@@ -141,6 +141,7 @@ def run_worker_with_handler(
     # Redirect stdout to progress.log for worker process
     log_file_path = session_dir / "progress.log"
     log_file = open(log_file_path, "a", encoding="utf-8")  # Changed from "w" to "a" to append instead of overwrite
+    _orig_stdout, _orig_stderr = sys.stdout, sys.stderr
     sys.stdout = log_file
     sys.stderr = log_file
 
@@ -200,7 +201,12 @@ def run_worker_with_handler(
         # Close structured logging files
         from cli.streaming import close_structured_logging
         close_structured_logging()
-        # Close the redirected file
+        # Restore the original streams BEFORE closing the file: leaving
+        # sys.stdout/stderr on a closed file makes any later write (including
+        # the interpreter's shutdown flush) raise
+        # "ValueError: I/O operation on closed file".
+        sys.stdout = _orig_stdout
+        sys.stderr = _orig_stderr
         log_file.close()
 
     sys.exit(0)

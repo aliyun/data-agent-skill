@@ -410,6 +410,64 @@ def _stream_response(
     return state.got_content, state.need_user_confirm, full_text
 
 
+def _stream_existing_response(
+    sse_client,
+    session,
+    output_mode: str = "summary",
+    output_dir: Optional[Path] = None,
+    checkpoint: Optional[int] = None,
+    timeout: Optional[int] = None,
+) -> tuple[bool, bool, str]:
+    """Stream the pending response of an already-sent message.
+
+    Mirrors _stream_response but never sends a message: it iterates the SSE
+    stream directly (the same wire path MessageHandler.stream_events uses
+    after its send). This lets a separate process consume a message that was
+    sent elsewhere — e.g. the async worker consuming the first message its
+    parent sent to implicitly create the session.
+
+    Pass ``checkpoint=0`` to replay the response from its beginning, so no
+    early events are missed between the send and this stream connecting.
+
+    Returns (got_content: bool, need_user_confirm: bool, output_text: str).
+    """
+    state = StreamState(output_mode=output_mode)
+    state.output_dir = output_dir
+    state.session_id = getattr(session, 'session_id', None)
+    state.session_status = getattr(session, 'status', None)
+    if hasattr(state.session_status, 'value'):
+        state.session_status = state.session_status.value
+
+    init_structured_logging(output_dir)
+
+    # Match MessageHandler.stream_events timeout semantics (config.timeout)
+    if timeout is None:
+        sse_config = getattr(sse_client, "_config", None)
+        timeout = getattr(sse_config, "timeout", None) or 300
+
+    try:
+        for event in sse_client.stream_chat_content(
+            agent_id=getattr(session, 'agent_id', '') or "",
+            session_id=session.session_id,
+            timeout=timeout,
+            checkpoint=checkpoint,
+        ):
+            if event.event_type == "SSE_FINISH":
+                break
+            _print_event(event, output_mode, state=state)
+    finally:
+        # Close structured logging
+        close_structured_logging()
+
+    _finalize_stream(state)
+
+    if state.got_content and not state.need_user_confirm:
+        _out(state, "")  # final newline after streaming
+
+    full_text = "\n".join(state.full_output)
+    return state.got_content, state.need_user_confirm, full_text
+
+
 def _finalize_stream(state: StreamState) -> None:
     """Flush any pending accumulators when the stream ends."""
     # Flush accumulated output_conclusion that never got a content_finish

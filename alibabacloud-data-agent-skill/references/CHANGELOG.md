@@ -2,6 +2,51 @@
 
 Full version history of the Data Agent CLI skill. The latest entry is mirrored in short form in [SKILL.md](../SKILL.md).
 
+## v2.7.0 (2026-10-20)
+
+`db` / `file` eliminate the CreateDataAgentSession round-trip and converge on the send message path; data sources unify on the session-level `DataSources` list.
+
+### Breaking changes
+
+- `db` no longer pre-creates the session before executing queries (sync and async). The first SendChatMessage creates it implicitly; everything the old CreateDataAgentSession call carried now rides that first message: mode / plan mode / enable search / custom-agent binding via `SessionConfig`. The response's `SessionId` / `AgentId` are parsed the same way `send` does. A rejected first message (business failure) now aborts before any session directory or worker is created, instead of leaving a half-registered async task.
+- `file` no longer pre-creates the session either: the local file is uploaded (or `--file-id` taken) and the first message — carrying the file as a `remote_data_center` DataSources entry — creates the session implicitly. The old `file_data_source` pass-through (session-level `DataSource` object reconstructed in the worker from input.json) is gone.
+- `db` / `file` no longer send the session-level `DataSource` object at all. **Both `DataSource` and `DataSources` are session-level** (confirmed backend semantics): repeated passes auto-merge server-side with equal priority, and the backend recommends `DataSources` uniformly — the CLI now uses `DataSources` everywhere, carried on the first message of the session; follow-up messages (remaining preset queries) go bare, exactly like `attach` follow-ups. The wire change: one `DataSources` list entry instead of a `DataSource` object plus a duplicate `DataSources` entry on the same message.
+- The async worker no longer re-sends the first query: the parent's direct send is already in flight, and the worker consumes its pending response from checkpoint 0 (new `_stream_existing_response` stream-only helper), then sends only the remaining preset queries. A first response that requires plan confirmation stops the batch exactly as before (`status.txt` → `waiting_input`).
+
+### New capabilities
+
+- `send` / `legacy-send` gain `--session-mode` (`auto` / `lite` / `pro` / `ultra`), injected into `SessionConfig.Mode` of the created session — `send` can now express everything `db` / `file` could.
+- `db`, `file` and `send` share one message path (`start_session_with_message` in `cmd_send`): direct send with implicit session creation, the API_KEY + custom-agent pre-create fallback, response parsing and result printing all live in one place. `db` / `file` are workflow layers (async worker, presets, streaming consumption) on top of it.
+- New `status` subcommand: a read-only session status query (one DescribeDataAgentSession call — no streaming, no worker) that prints status / title / mode / agent, shows the local async worker's `status.txt` when present, and prints the attach confirmation guidance for WAIT_INPUT sessions. Complements `send --poll` (which waits for the message it just sent) instead of replacing it.
+- `DescribeDataAgentSession` status parsing is now robust to wire variants: `SessionStatus` matching is case-insensitive and gateway/backend values (`init`, `INITIALIZING`, `RECOVERABLE`, `UNAVAILABLE`, `FINISHED`, `CANCELED`/`CANCELLED`, `ERROR`) are normalized to the CLI enum (`init`/`RECOVERABLE` → `IDLE` — a cold session accepts a new message; `INITIALIZING` → `CREATING`; `UNAVAILABLE`/`FINISHED`/`CANCELED` → `STOPPED`; `ERROR` → `FAILED`). `SessionInfo` gains `title` / `mode` / `raw_status`; `status` shows the server's own value alongside the normalized one, e.g. `IDLE (server: RECOVERABLE)`. Previously these variants all fell through to `CREATING`, which made completed sessions look like they were still starting (and left the `--poll` terminal-state branch dead).
+
+### Compatibility notes
+
+- API_KEY auth + `--custom-agent-id` still pre-creates via CreateDataAgentSession — the backend does not support implicit creation with a custom-agent binding under API_KEY auth yet (same fallback for `send` / `db` / `file`, now handled by the shared path).
+- Follow-up interactions remain `attach --session-id <ID>`; `--poll` / status checks remain DescribeDataAgentSession-based. No observable CLI surface changed: flags, outputs and the async kickoff contract (session ID printed immediately) are unchanged.
+
+### SDK contract
+
+- `send_message` (sync and async) accepts `enable_search`, injected into `SessionConfig.EnableSearch` — carried on the first message of an implicitly created session where the CreateDataAgentSession path previously set it at session level.
+- `send_message` docstrings corrected: `data_sources` is session-level (merged across messages), not message-level; `DataSources` is the backend-recommended form over the `DataSource` object.
+
+## v2.6.1 (2026-10-20)
+
+Message-level database data sources always carry `DmsDatabaseId`, enforced as a required CLI parameter.
+
+### Breaking changes
+
+- `--dms-db-id` (`DataSources[].DmsDatabaseId`) is now **required whenever any database data source parameter is passed** on `send` / `legacy-send` / `db` message sends (`--dms-instance-id`, `--dms-db-id`, `--db-name`, `--tables`). Previously a database data source without a database ID was sent as-is; the backend resolves table schemas (`GetTableKnowledgeInfo`) and executes SQL (`SubmitAsyncSQLExecuteTask`) by database ID, so such a source always failed server-side (typically as a table permission error). The CLI now fails fast before any API call, with the fix spelled out in the error message. Sessions driven purely by a custom agent or a `--data-source` file are unaffected.
+
+### New capabilities
+
+- `send` / `legacy-send` gain the `--dms-db-id` flag (the `DataSources` database entry previously had no way to express the database ID).
+
+### Fixes
+
+- `_build_data_sources` now fills `DmsDatabaseId` (and `Engine` when available on the subcommand), closing the gap with the session-level `DataSource` path which already carried it.
+- SKILL.md / COMMANDS.md custom-agent note corrected: data source parameters alongside `--custom-agent-id` **are technically accepted** (the backend merges them into the analysis scope and rejects out-of-scope sources when the agent forbids appending) — they are still best left unset so the agent's own data scope drives the session; the old wording ("should not be passed") is now explicit about this.
+
 ## v2.6.0 (2026-10-20)
 
 `send` drops the CreateDataAgentSession round-trip under AK/SK auth; `legacy-send` keeps it for `--title`.

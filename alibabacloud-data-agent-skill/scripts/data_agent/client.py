@@ -24,7 +24,7 @@ from alibabacloud_openapi_util.client import Client as OpenApiUtilClient
 from Tea.exceptions import TeaException
 
 from data_agent.config import DataAgentConfig
-from data_agent.models import SessionInfo, SessionStatus, DataSource
+from data_agent.models import SessionInfo, SessionStatus, DataSource, normalize_session_status
 from data_agent.api_adapter import APIAdapter
 from data_agent.exceptions import (
     ApiError,
@@ -817,15 +817,15 @@ class DataAgentClient:
         request_id = response.get("requestId", "")  # Changed from "RequestId" to "requestId"
         data = response.get("data", response)  # Changed from "Data" to "data"
         status_str = data.get("sessionStatus", data.get("status", "CREATING"))  # Changed from "SessionStatus"/"Status" to "sessionStatus"/"status"
-        try:
-            status = SessionStatus(status_str)
-        except ValueError:
-            status = SessionStatus.CREATING
+        # Case-insensitive match + alias map for gateway/backend variants
+        # ("init", "INITIALIZING", "RECOVERABLE", ...); unknown → CREATING.
+        status = normalize_session_status(status_str)
 
         # Capture the real AgentId from response if available
         # The agent_id in the response should take precedence over the one passed in
         real_agent_id = data.get("agentId") or data.get("AgentId") or agent_id  # Try both transformed and original
 
+        session_config = data.get("sessionConfig") or {}
         return SessionInfo(
             agent_id=real_agent_id,
             session_id=session_id,
@@ -833,6 +833,9 @@ class DataAgentClient:
             database_id=data.get("databaseId"),  # Changed from "DatabaseId" to "databaseId"
             workspace_id=workspace_id,
             request_id=request_id,
+            title=data.get("title"),
+            mode=session_config.get("mode"),
+            raw_status=status_str,
         )
 
     @retry_on_error(max_retries=3)
@@ -850,6 +853,7 @@ class DataAgentClient:
         report_config: Optional[dict] = None,
         permission_config: Optional[dict] = None,
         plan_mode: Optional[str] = None,
+        enable_search: Optional[bool] = None,
         custom_agent_id: Optional[str] = None,
         custom_agent_stage: str = "prod",
     ) -> dict:
@@ -867,7 +871,9 @@ class DataAgentClient:
                 report generation requests, "cancel" to cancel the session,
                 "diag" for report-diagnosis requests where the message text
                 is the complaint about the session's report).
-            data_source: Optional DataSource with database metadata.
+            data_source: Optional DataSource with database metadata. Both
+                this and ``data_sources`` are session-level (merged
+                server-side); the backend recommends ``data_sources``.
             language: Response language (default: "CHINESE").
             workspace_id: The workspace ID (required for workspace-bound sessions).
             mode: Optional per-message analysis mode. Supported values:
@@ -878,9 +884,17 @@ class DataAgentClient:
                 generate an execution plan) or ``disable`` (skip planning).
                 When provided it is injected into ``SessionConfig.PlanMode``;
                 omitted by default so the session-level setting applies.
-            data_sources: Optional list of message-level data sources, each a
+            enable_search: Whether to enable search capability in the session,
+                injected into ``SessionConfig.EnableSearch``. Carry it on the
+                first message of an implicitly created session (the
+                CreateDataAgentSession path set it at session level).
+            data_sources: Optional list of session-level data sources, each a
                 dict like ``{"DataSourceType": "remote_data_center", "FileId":
-                "..."}``. Distinct from ``data_source`` (session-level).
+                "..."}``. Both ``DataSource`` and ``DataSources`` are
+                session-level (repeated passes are merged server-side with
+                equal priority); the backend recommends ``DataSources``, so
+                carrying them on the first message of a session is enough —
+                follow-ups inherit the session scope.
             report_config: Optional report configuration dict for
                 ``message_type="report"``, e.g. ``{"ReportType": "WebReport",
                 "ReportTheme": "default", "ReportPrompt": "..."}``. Injected
@@ -927,6 +941,8 @@ class DataAgentClient:
             session_config["Mode"] = mode
         if plan_mode:
             session_config["PlanMode"] = plan_mode
+        if enable_search is not None:
+            session_config["EnableSearch"] = enable_search
         if permission_config:
             session_config["PermissionConfig"] = permission_config
         if custom_agent_id:
@@ -1790,6 +1806,7 @@ class AsyncDataAgentClient:
         report_config: Optional[dict] = None,
         permission_config: Optional[dict] = None,
         plan_mode: Optional[str] = None,
+        enable_search: Optional[bool] = None,
         custom_agent_id: Optional[str] = None,
         custom_agent_stage: str = "prod",
     ) -> dict:
@@ -1804,11 +1821,14 @@ class AsyncDataAgentClient:
                 agent automatically; kept only for backward compatibility and
                 omitted from the wire when empty.
             message_type: Message type (default: "primary"; "report" / "cancel").
-            data_source: Optional DataSource with database metadata.
+            data_source: Optional DataSource with database metadata. Both
+                this and ``data_sources`` are session-level (merged
+                server-side); the backend recommends ``data_sources``.
             language: Response language (default: "CHINESE").
             workspace_id: The workspace ID (required for workspace-bound sessions).
             mode: Optional per-message mode (auto / lite / pro / ultra).
-            data_sources: Optional message-level data sources (remote_data_center).
+            data_sources: Optional session-level data sources
+                (remote_data_center); merged server-side on repeated passes.
             report_config: Optional report configuration for message_type="report".
             permission_config: Optional session-level permission dict
                 ({"DefaultAction": "allow" | "deny"}).
@@ -1832,6 +1852,7 @@ class AsyncDataAgentClient:
             report_config=report_config,
             permission_config=permission_config,
             plan_mode=plan_mode,
+            enable_search=enable_search,
             custom_agent_id=custom_agent_id,
             custom_agent_stage=custom_agent_stage,
         )

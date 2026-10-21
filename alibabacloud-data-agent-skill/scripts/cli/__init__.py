@@ -25,10 +25,11 @@ from cli.streaming import (
     _finalize_stream,
     _is_user_confirmation_event,
 )
-from cli.cmd_db import cmd_db, _build_data_source, _db_attach, _db_batch, _db_single
+from cli.cmd_db import cmd_db, _db_attach, _db_batch
 from cli.cmd_ls import cmd_ls, _extract_list
 from cli.cmd_file import cmd_file, _print_generated_files
 from cli.cmd_attach import cmd_attach
+from cli.cmd_status import cmd_status
 from cli.parser import build_parser, main
 
 __all__ = [
@@ -53,15 +54,14 @@ __all__ = [
     "_is_user_confirmation_event",
     # Commands
     "cmd_db",
-    "_build_data_source",
     "_db_attach",
     "_db_batch",
-    "_db_single",
     "cmd_ls",
     "_extract_list",
     "cmd_file",
     "_print_generated_files",
     "cmd_attach",
+    "cmd_status",
     # Parser / entry
     "build_parser",
     "main",

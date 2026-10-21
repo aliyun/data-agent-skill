@@ -1,5 +1,10 @@
 """Database analysis subcommand (db).
 
+A workflow layer on top of the shared send message path: the first message of
+the session is sent by ``cli.cmd_send.start_session_with_message`` (the backend
+creates the session implicitly), this module owns the async worker contract,
+preset queries and streaming consumption.
+
 Author: Tinker
 Created: 2026-03-04
 """
@@ -8,44 +13,21 @@ import argparse
 import sys
 import os
 import json
-import subprocess
 from pathlib import Path
 from typing import Optional
 
 # from cli.notify import push_notification
-from cli.worker_lock import check_worker_lock, write_worker_pid, acquire_worker_lock, release_worker_lock
-from cli.worker_utils import is_worker_process, setup_async_worker, handle_worker_completion, build_send_options
-from cli.streaming_utils import run_worker_with_handler, execute_single_query, execute_query_batch
-from cli.streaming import _stream_response, _finalize_stream, StreamState, _print_event
+from cli.worker_utils import is_worker_process, setup_async_worker, build_send_options
+from cli.streaming_utils import run_worker_with_handler
+from cli.streaming import _stream_response, _finalize_stream, StreamState, _print_event, _stream_existing_response
+from cli.cmd_send import start_session_with_message
 from data_agent import (
     DataAgentConfig,
     DataAgentClient,
-    SessionManager,
     MessageHandler,
     FileManager,
-    DataSource,
     SSEClient,
 )
-
-
-def _build_data_source(args: argparse.Namespace) -> Optional[DataSource]:
-    """Build DataSource from command-line arguments. Returns None if essential DB params are missing (custom agent mode)."""
-    if not getattr(args, 'dms_instance_id', None):
-        return None
-
-    tables = [t.strip() for t in args.tables.split(",")] if getattr(args, 'tables', None) else []
-    table_ids = [t.strip() for t in args.table_ids.split(",")] if getattr(args, 'table_ids', None) else []
-
-    return DataSource(
-        dms_instance_id=args.dms_instance_id,
-        dms_database_id=getattr(args, 'dms_db_id', None),
-        instance_name=getattr(args, 'instance_name', None) or "",
-        db_name=getattr(args, 'db_name', None) or "",
-        tables=tables,
-        table_ids=table_ids,
-        engine=getattr(args, 'engine', 'mysql'),
-        region_id=getattr(args, 'region', 'cn-hangzhou'),
-    )
 
 
 def _db_attach(
@@ -204,19 +186,22 @@ def _db_attach(
 def _db_batch(
     message_handler: MessageHandler,
     session,
-    data_source: Optional[DataSource],
     queries: list,
     output_mode: str = "summary",
     output_dir: Optional[Path] = None,
 ) -> tuple[bool, bool, str]:
-    """Execute batch preset queries."""
+    """Execute follow-up queries with streaming output.
+
+    Data sources are session-level (merged server-side, carried by the first
+    message), so follow-ups are sent bare.
+    """
     got_content, need_confirm = False, False
     full_text = ""
     for query in queries:
         print(f"\n{'=' * 60}")
         print(f"Query: {query}")
         print("=" * 60)
-        c, nc, t = _stream_response(message_handler, session, query, data_source=data_source, output_mode=output_mode, output_dir=output_dir)
+        c, nc, t = _stream_response(message_handler, session, query, output_mode=output_mode, output_dir=output_dir)
         if c: got_content = True
         if t: full_text += f"\n### Query: {query}\n" + t + "\n"
         if nc:
@@ -225,24 +210,48 @@ def _db_batch(
     return got_content, need_confirm, full_text
 
 
-def _db_single(
-    message_handler: MessageHandler,
+def _preset_queries(session_mode: str, db_name: str) -> list:
+    """Preset queries run when -q is omitted (shared by sync and async paths)."""
+    if session_mode in ("pro", "ultra"):
+        return [
+            f"Analyze the overall data structure and table relationships of {db_name} database",
+            "Identify key metrics and distribution characteristics in the data",
+        ]
+    return [
+        f"What tables exist in {db_name} database?",
+        "Who has the highest sales?",
+    ]
+
+
+def _resolve_queries(args: argparse.Namespace, session_mode: str) -> list:
+    """Return the queries to run: the user query, or the presets when omitted."""
+    if args.query:
+        return [args.query]
+    return _preset_queries(session_mode, getattr(args, "db_name", None) or "the")
+
+
+def _consume_first_response(
+    client: DataAgentClient,
     session,
-    data_source: Optional[DataSource],
-    query: str,
-    output_mode: str = "summary",
-    output_dir: Optional[Path] = None,
-) -> tuple[bool, bool, str]:
-    """Execute a single query with streaming output."""
-    print(f"\nAnalyzing...\n")
-    got_content, need_confirm, full_text = _stream_response(
-        message_handler, session, query, data_source=data_source, output_mode=output_mode, output_dir=output_dir
+    output_mode: str,
+    session_dir: Path,
+) -> tuple[bool, bool]:
+    """Consume the in-flight response of the parent/first direct-sent message.
+
+    Prints the same no-content / need-confirmation notices as the rest of the
+    db flow. Returns (got_content, need_confirm).
+    """
+    print("\nAnalyzing...\n")
+    got_content, need_confirm, _ = _stream_existing_response(
+        # SSEClient takes the DataAgentConfig, not the client
+        SSEClient(client._config), session,
+        output_mode=output_mode, output_dir=session_dir, checkpoint=0,
     )
     if not got_content:
         print("(No response received, please retry)")
     elif need_confirm:
-        print("\n\u26a0\ufe0f  \u9700\u8981\u7528\u6237\u786e\u8ba4\uff0c\u7a0b\u5e8f\u5c06\u9000\u51fa\u3002\u8bf7\u5b8c\u6210\u786e\u8ba4\u540e\u4f7f\u7528\u4f1a\u8bddID\u7ee7\u7eed\u5bf9\u8bdd\u3002")
-    return got_content, need_confirm, full_text
+        print("\n⚠️  需要用户确认，程序将退出。请完成确认后使用会话ID继续对话。")
+    return got_content, need_confirm
 
 
 def cmd_db(args: argparse.Namespace) -> None:
@@ -269,51 +278,51 @@ def cmd_db(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     client = DataAgentClient(config)
-    session_manager = SessionManager(client)
-    message_handler = MessageHandler(client, build_send_options(args))
+    send_options = build_send_options(args)
+    # Data sources are session-level and merge server-side, so only the first
+    # message of the session carries them; follow-ups go bare.
+    followup_options = {k: v for k, v in send_options.items() if k != "data_sources"}
+    message_handler = MessageHandler(client, followup_options)
 
-    # Create new session
     session_mode = args.session_mode
-    data_source = _build_data_source(args)
+    queries = _resolve_queries(args, session_mode)
     is_worker = is_worker_process()
 
     if getattr(args, "async_run", False) and not is_worker:
-        # PARENT PROCESS LOGIC
-        enable_search = getattr(args, 'enable_search', False)
-        print(f"Creating session for async execution...")
-        workspace_id = getattr(args, 'workspace_id', None)
-        custom_agent_id = config.custom_agent_id
-        plan_mode = getattr(args, 'plan_mode', 'force')
-        session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id) if getattr(args, 'dms_db_id', None) else None, enable_search=enable_search, workspace_id=workspace_id, custom_agent_id=custom_agent_id, plan_mode=plan_mode)
-
-        # Use common async worker setup
+        # PARENT PROCESS LOGIC — the shared send path delivers the first
+        # message (creating the session implicitly, data sources attached);
+        # the worker consumes its response instead of re-sending.
+        print(f"Region: {config.region}")
+        session = start_session_with_message(
+            client, config, args, queries[0],
+            mode=session_mode,
+            plan_mode=getattr(args, 'plan_mode', 'force'),
+            enable_search=getattr(args, 'enable_search', False),
+        )
         setup_async_worker(args, session)
 
     elif is_worker:
-        # WORKER PROCESS LOGIC - using common utility
+        # WORKER PROCESS LOGIC — consume the parent-sent first response, then
+        # stream the remaining queries.
         def db_query_executor(message_handler, session, args):
-            message_handler.set_send_options(build_send_options(args))
+            message_handler.set_send_options(followup_options)
             output_mode = getattr(args, "output", "summary")
-            data_source = _build_data_source(args)
+            session_dir = Path(f"sessions/{session.session_id}")
 
-            if args.query:
-                _, need_confirm, _ = _db_single(message_handler, session, data_source, args.query, output_mode=output_mode, output_dir=Path(f"sessions/{session.session_id}"))
-            else:
-                db_name = data_source.db_name if data_source else "the"
-                if session_mode in ("pro", "ultra"):
-                    default_queries = [
-                        f"Analyze the overall data structure and table relationships of {db_name} database",
-                        "Identify key metrics and distribution characteristics in the data",
-                    ]
-                else:
-                    default_queries = [
-                        f"What tables exist in {db_name} database?",
-                        "Who has the highest sales?",
-                    ]
-                _, need_confirm, _ = _db_batch(message_handler, session, data_source, default_queries, output_mode=output_mode, output_dir=Path(f"sessions/{session.session_id}"))
-            return True, need_confirm  # got_content=True, need_confirm
+            got_content, need_confirm = _consume_first_response(
+                client, session, output_mode, session_dir
+            )
+            if need_confirm:
+                return got_content, need_confirm
 
-        run_worker_with_handler(args, data_source=_build_data_source(args), query_execution_func=db_query_executor)
+            remaining = queries[1:]
+            if remaining:
+                c, nc, _ = _db_batch(message_handler, session, remaining, output_mode=output_mode, output_dir=session_dir)
+                got_content = got_content or c
+                need_confirm = need_confirm or nc
+            return got_content, need_confirm
+
+        run_worker_with_handler(args, data_source=None, query_execution_func=db_query_executor)
 
     # NORMAL SYNCHRONOUS LOGIC
     mode_desc = {
@@ -323,13 +332,14 @@ def cmd_db(args: argparse.Namespace) -> None:
         "ultra": "ultra mode (most thorough analysis)",
     }.get(session_mode, session_mode)
 
-    print(f"Creating session: {mode_desc}...")
+    print(f"Starting database analysis ({mode_desc})...")
     print(f"  Region: {config.region}")
-    enable_search = getattr(args, 'enable_search', False)
-    workspace_id = getattr(args, 'workspace_id', None)
-    custom_agent_id = config.custom_agent_id
-    plan_mode = getattr(args, 'plan_mode', 'force')
-    session = session_manager.create_or_reuse(mode=session_mode, database_id=str(args.dms_db_id) if getattr(args, 'dms_db_id', None) else None, enable_search=enable_search, workspace_id=workspace_id, custom_agent_id=custom_agent_id, plan_mode=plan_mode)
+    session = start_session_with_message(
+        client, config, args, queries[0],
+        mode=session_mode,
+        plan_mode=getattr(args, 'plan_mode', 'force'),
+        enable_search=getattr(args, 'enable_search', False),
+    )
     print(f"Session ready: {session.session_id}")
     print(f"\n💡 Tip: To continue this session later, use: python3 scripts/data_agent_cli.py attach --session-id {session.session_id}")
 
@@ -343,31 +353,16 @@ def cmd_db(args: argparse.Namespace) -> None:
     init_structured_logging(session_dir)
 
     try:
-        if args.query:
-            _, _, output_text = _db_single(message_handler, session, data_source, args.query, output_mode=output_mode, output_dir=session_dir)
-        else:
-            # Default batch preset queries
-            db_name = data_source.db_name if data_source else "the"
-            if session_mode in ("pro", "ultra"):
-                default_queries = [
-                    f"Analyze the overall data structure and table relationships of {db_name} database",
-                    "Identify key metrics and distribution characteristics in the data",
-                ]
-            else:
-                default_queries = [
-                    f"What tables exist in {db_name} database?",
-                    "Who has the highest sales?",
-                ]
-            print(f"\nNo query specified, running preset queries ({len(default_queries)} total)...")
-            _, _, output_text = _db_batch(message_handler, session, data_source, default_queries, output_mode=output_mode, output_dir=session_dir)
+        # Consume the response of the direct-sent first message, then run any
+        # remaining preset queries.
+        got_content, need_confirm = _consume_first_response(
+            client, session, output_mode, session_dir
+        )
+        if not need_confirm and queries[1:]:
+            _db_batch(message_handler, session, queries[1:], output_mode=output_mode, output_dir=session_dir)
     finally:
         close_structured_logging()
 
     # Write result status
-    # if output_text:
-    #     with open(session_dir / "output.md", "w", encoding="utf-8") as f:
-    #         f.write(output_text)
-    #     with open(session_dir / "result.json", "w", encoding="utf-8") as f:
-    #         json.dump({"status": "completed", "output_file": "output.md"}, f)
     with open(session_dir / "result.json", "w", encoding="utf-8") as f:
         json.dump({"status": "completed"}, f)
