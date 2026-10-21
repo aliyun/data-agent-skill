@@ -156,13 +156,13 @@ python3 scripts/data_agent_cli.py <command> [options]
 | `ls` | List Data Center databases / tables with the IDs the `db` command needs |
 | `dms` | DMS instance / database / table lookup (`list-instances`, `search-database`, `list-tables`) |
 | `import` | Import DMS database tables into Data Agent Data Center |
-| `db` | Start a database analysis session (auto / lite / pro / ultra) — a workflow layer on the shared send path: the first message creates the session implicitly (no CreateDataAgentSession; response carries the new SessionId; API_KEY + custom agent still pre-creates) |
-| `file` | Upload a local file (or use `--file-id`) and analyze it — same shared send path: the file rides the first message's `DataSources` and the session is created implicitly |
+| `db` | Start a database analysis session (auto / lite / pro / ultra); prints the session ID for `status` / `attach` follow-ups |
+| `file` | Upload a local file (or use `--file-id`) and analyze it; prints the session ID for `status` / `attach` follow-ups |
 | `upload` | Upload a local file and print its file ID (no session created) |
-| `send` | Send a single message — direct send (backend creates the session, response carries the new SessionId; custom agent binding carried in `SessionConfig` under AK/SK auth; `--session-mode` supported) or reuse an existing one; connectivity checks, report requests and permission-controlled requests; the shared message path underneath `db` / `file` |
-| `legacy-send` | Legacy `send` that pre-creates the session via CreateDataAgentSession — only for `--title` or custom-agent binding under API_KEY auth; avoid unless a title is really needed |
+| `send` | Send a single message — create a session (ID printed for follow-ups) or reuse one with `--session-id`; supports `--session-mode`, report requests and permission-controlled queries |
+| `legacy-send` | Variant of `send` that can set `--title`; avoid unless a session title is really needed |
 | `attach` | Re-enter an existing session: follow-ups, plan confirmation, live progress, checkpoint resume |
-| `status` | Read-only session status query — one `DescribeDataAgentSession` call, prints status / title / mode / agent; WAIT_INPUT sessions get the attach confirmation guidance |
+| `status` | Read-only session status query — status / title / mode; WAIT_INPUT sessions get the attach confirmation guidance |
 | `reports` | List and download session-generated reports / charts |
 | `cancel` | Cancel a running session |
 | `workspace` | List available workspaces |
@@ -183,7 +183,7 @@ Common options: `--region` (default `DATA_AGENT_REGION` or `cn-hangzhou`), `--en
 > 2. If **not found**, use `dms` subcommand to search for database info, then use `import` subcommand to import it
 > 3. After successful import, you can use `db` subcommand for analysis
 
-> **Data source semantics**: the POP API accepts both a `DataSource` object and a `DataSources` list, and **both are session-level** — passing either on any message updates the session's data scope, repeated passes are **merged server-side with equal priority**, and the backend recommends `DataSources` uniformly. The CLI uses `DataSources` everywhere (database via `--dms-*`, Data Center files via `--data-source` / `file` uploads) and carries them on the **first message** of a session; follow-up messages inherit the session scope (this is also why `attach` follow-ups never re-send data sources).
+> **Data source semantics**: data sources are **session-level** — pass them once with the command that starts the session (database via `--dms-*`, Data Center files via `--data-source` or the `file` upload). Follow-up messages — including `attach` — inherit the session's data scope; passing them again is unnecessary (repeated passes are merged server-side).
 
 ---
 
@@ -262,7 +262,7 @@ Custom Agents are user-defined AI agents with specialized instructions, knowledg
 
 > **Note**: Custom Agent sessions automatically use the `prod` stage. The custom agent's instructions, knowledge, and data scope will be applied to the analysis session.
 
-> **Note**: With `send`, the binding rides the SendChatMessage `SessionConfig` directly under AK/SK auth — no separate CreateDataAgentSession call. Under API_KEY auth the backend does not fully support implicit creation with a custom agent yet, so `send` still pre-creates there. `legacy-send` (which always pre-creates) exists only for `--title` and the API_KEY custom-agent path; prefer leaving the title at its server-side default.
+> **Note**: Custom-agent binding works with plain `send` (`--custom-agent-id`). Use `legacy-send` only when a session `--title` is really required; prefer the server-side default title.
 
 ---
 
@@ -417,9 +417,8 @@ python3 scripts/data_agent_cli.py db \
     --db-name <schemaName> \
     --tables <table1,table2> -q "Which department has the highest average salary"
 
-# 5b. Quick connectivity check / session-less send (backend creates the session)
+# 5b. Quick connectivity check (creates a session; its ID is printed for follow-up attach)
 python3 scripts/data_agent_cli.py send -m "ping"
-# -> response carries the new Session ID for follow-up attach
 
 # 6. Upload a file without starting a session (prints the file ID)
 python3 scripts/data_agent_cli.py upload assets/example_game_data.csv

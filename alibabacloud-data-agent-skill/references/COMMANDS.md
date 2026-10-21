@@ -64,7 +64,7 @@ Output includes a `db` command template ready to copy and use.
 
 > **⚠️ Important**: The `db` subcommand requires the database to **already exist in Data Agent Data Center**.
 
-`db` does not pre-create the session: the first SendChatMessage — carrying the database as a session-level `DataSources` entry — creates it implicitly and the response carries the new `SessionId` (the shared send path underneath `send`). Mode / plan mode / enable search / custom-agent binding ride the `SessionConfig` of that first message. In async mode the first message is sent by the parent process and the background worker consumes its response. Under API_KEY auth with `--custom-agent-id`, the session is still pre-created via CreateDataAgentSession (backend limitation).
+Starts a database analysis session and streams the results. The session ID is printed immediately — use `status` to check progress and `attach` to continue the conversation. In async mode (default) the analysis runs in a background worker; progress is written to `sessions/<session_id>/progress.log` and `status.txt`.
 
 ### Data Source Parameters
 
@@ -100,9 +100,7 @@ Required unless `--custom-agent-id` (or `DATA_AGENT_CUSTOM_AGENT_ID`) is set.
 
 ## file Subcommand — File Analysis
 
-File analysis uses `auto` mode by default.
-
-`file` does not pre-create the session: the local file is uploaded (or `--file-id` taken) and the first SendChatMessage — carrying the file as a session-level `remote_data_center` DataSources entry — creates the session implicitly (same shared send path as `db` / `send`). In async mode the first message is sent by the parent process and the background worker consumes its response.
+Uploads a local file (or takes an existing Data Center file via `--file-id`) and analyzes it in `auto` mode. The session ID is printed immediately — use `status` to check progress and `attach` to continue. In async mode (default) the analysis runs in a background worker; progress is written to `sessions/<session_id>/progress.log`.
 
 ### Parameters
 
@@ -226,11 +224,9 @@ Import DMS database tables into Data Agent Data Center.
 
 ## send Subcommand — Single Message
 
-Send a single message, printing the response. Without `--session-id` the message is sent directly and the backend creates the session; the response carries the new `SessionId` for follow-up `attach`. This is also the shared message path underneath `db` / `file`.
+Send a single message, printing the response. Without `--session-id` a new session is created and its ID printed for follow-up `attach`; with `--session-id` the message reuses that session.
 
-Under AK/SK auth, `--custom-agent-id` is carried in the SendChatMessage `SessionConfig` directly (`CustomAgentId` / `CustomAgentStage`) — no CreateDataAgentSession round-trip. Under API_KEY auth the backend does not fully support implicit creation with a custom agent yet, so `send` still pre-creates the session in that case.
-
-> **Data source semantics**: both the `DataSource` object and the `DataSources` list are **session-level** — passing them on any message of a session updates the session's data scope, repeated passes are merged server-side with equal priority, and the backend recommends `DataSources` uniformly. The CLI uses `DataSources` everywhere (`--data-source` files, `--dms-*` database, `file` uploads); it is enough to carry them on the first message, follow-ups inherit the session scope.
+> **Data sources are session-level**: pass them once with the message that starts the session (`--data-source` for Data Center files, `--dms-*` for a database, or the `file` upload). Follow-up messages — including `attach` — inherit the session's data scope; there is no need to pass them again.
 
 ### Parameters
 
@@ -245,20 +241,20 @@ Under AK/SK auth, `--custom-agent-id` is carried in the SendChatMessage `Session
 | `--custom-agent-stage` | `prod` (default) / `debug` |
 | `--message-type` | `primary` (default) / `report` / `diag` |
 | `--report-theme` / `--report-prompt` | Report options (with `--message-type report`) |
-| `--data-source` | Data Center file ID as a remote_data_center DataSources entry (repeatable) |
+| `--data-source` | Data Center file ID to attach to the session (repeatable) |
 | `--dms-db-id` | **Required** when any database data source parameter is passed; the backend resolves table schemas and executes SQL by database ID |
 | `--dms-instance-id` / `--db-name` / `--tables` | Database data source attached to the session |
 | `--permission-file` / `--permission-default-action` | SQL permission control (see [PERMISSIONS.md](PERMISSIONS.md)) |
-| `--poll` / `--timeout` | Poll `DescribeDataAgentSession` until completion (timeout in seconds, default 300) |
+| `--poll` / `--timeout` | Wait after sending until the analysis completes (timeout in seconds, default 300) |
 | `--endpoint` | Explicit gateway endpoint override |
 
 ### Examples
 
 ```bash
-# Connectivity check (backend creates the session)
+# Connectivity check (creates a session; its ID is printed)
 python3 scripts/data_agent_cli.py send -m "ping"
 
-# Custom agent direct send (AK/SK): binding rides SessionConfig, one API call
+# Custom agent session, waiting until the analysis completes
 python3 scripts/data_agent_cli.py send --workspace-id <WS_ID> --custom-agent-id <AGENT_ID> --session-mode pro -m "Generate a report" --poll
 
 # Database data source with permissions
@@ -272,7 +268,7 @@ python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --dms
 
 ## legacy-send Subcommand — Pre-created Send (title)
 
-Legacy variant of `send` that pre-creates the session via `CreateDataAgentSession`. Kept only for what SendChatMessage cannot express today: `--title` and custom-agent binding under API_KEY auth. Prefer plain `send` unless a title is really required.
+Variant of `send` that can set a session `--title`. Prefer plain `send` unless a title is really required — the server generates a usable default title.
 
 ### Parameters
 
@@ -303,7 +299,7 @@ Connect to an existing session to continue conversation, confirm plans, or check
 
 ## status Subcommand — Session Status Query
 
-Read-only query of a session's current state: a single `DescribeDataAgentSession` call, no streaming and no worker. Use it to check an async `db` / `file` / `send` run from anywhere (the server status is authoritative; the local `sessions/<id>/status.txt` of an async worker is shown as a hint when present). For WAIT_INPUT sessions it prints the `attach` commands to confirm the pending plan / SQL. This complements `send --poll`, which waits for the message it just sent.
+Read-only query of a session's current state — cheap to run anytime, no streaming involved. The server status is authoritative; if the session ran as a local async task, its `sessions/<id>/status.txt` is also shown. For WAIT_INPUT sessions it prints the `attach` commands to confirm the pending plan / SQL. Use it to check any session from anywhere; `send --poll` is the flag for waiting on a message just sent.
 
 ### Parameters
 
@@ -313,9 +309,9 @@ Read-only query of a session's current state: a single `DescribeDataAgentSession
 | `--agent-id` / `-a` | Agent ID (optional; the backend resolves it from the session) |
 | `--workspace-id` | Workspace ID if the session is workspace-bound |
 
-### Status Normalization
+### Status Values
 
-The wire carries more status values than the CLI enum. Observed and backend-defined variants are normalized: `init` / `RECOVERABLE` → `IDLE` (a cold session accepts a new message), `INITIALIZING` → `CREATING`, `UNAVAILABLE` / `FINISHED` / `CANCELED` / `CANCELLED` → `STOPPED`, `ERROR` → `FAILED`. When a mapping applies, the server's own value is printed alongside, e.g. `Status: IDLE (server: RECOVERABLE)`.
+`CREATING` preparing · `RUNNING` executing · `IDLE` ready for a new message (also shown for reclaimed sessions, e.g. `IDLE (server: RECOVERABLE)`) · `WAIT_INPUT` waiting for plan/SQL confirmation · `STOPPED` / `FAILED` session has ended.
 
 ### Example
 
