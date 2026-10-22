@@ -399,27 +399,13 @@ class DataAgentClient:
             # credentials file when configured, otherwise the Alibaba Cloud
             # default credential chain (env vars, ~/.aliyun/config.json,
             # ECS role, OIDC role, etc.)
-            from alibabacloud_credentials.client import Client as CredentialClient
-
             try:
-                entry = getattr(self._config, "_credentials_entry", None)
-                if (
-                    isinstance(entry, dict)
-                    and entry.get("access_key_id")
-                    and entry.get("access_key_secret")
-                ):
-                    from alibabacloud_credentials import models as cred_models
-
-                    cred_config = cred_models.Config(
-                        type="access_key",
-                        access_key_id=entry["access_key_id"],
-                        access_key_secret=entry["access_key_secret"],
-                    )
-                    self._credential_client = CredentialClient(cred_config)
-                    self._auth_type = "credential_file"
-                else:
-                    self._credential_client = CredentialClient()
-                    self._auth_type = "default_credential_chain"
+                self._credential_client = self._config.build_credential_client()
+                self._auth_type = (
+                    "credential_file"
+                    if self._config.using_credentials_file
+                    else "default_credential_chain"
+                )
                 # Force credential resolution early so misconfiguration
                 # fails here rather than at the first API call.
                 self._credential_client.get_credential()
@@ -481,30 +467,22 @@ class DataAgentClient:
         body: dict = None,
     ) -> dict:
         """Make an API call using API_KEY authentication."""
-        # Determine if this is a control plane or data plane API based on action
-        control_plane_actions = [
-            'ListDataAgentSession', 'CreateDataAgentSession', 'DescribeDataAgentSession',
-            'DescribeFileUploadSignature', 'FileUploadCallback',
-            'ListDataAgentWorkspace', 'InitDataAgentPersonalWorkspace',
-            'ListCustomAgent', 'DescribeCustomAgent',
-            'CreateCustomAgent', 'ModifyCustomAgent', 'OperateCustomAgent',
-        ]
+        # Only the chat/stream APIs are served by the stream gateway — every
+        # other action (session/workspace/custom-agent/file/usage/feedback
+        # APIs) lives on the control-plane gateway. Verified against the pre
+        # gateways: ListFileUpload / DescribeDataAgentUsage /
+        # UpdateDataAgentSession / CreateDataAgentFeedback all answer
+        # "Invalid Action" on the stream gateway.
+        data_plane_actions = ['SendChatMessage', 'GetChatContent']
 
-        data_plane_actions = [
-            'SendChatMessage', 'GetChatContent', 'DescribeDataAgentUsage',
-            'UpdateDataAgentSession', 'ListFileUpload', 'CreateDataAgentFeedback'
-        ]
-
-        # Choose the correct endpoint based on the action type
-        if action in control_plane_actions:
-            # Use control plane endpoint format - FIX: hyphen instead of dot
-            base_endpoint = f"dataagent-{self._config.region}.aliyuncs.com/apikey"
-        elif action in data_plane_actions:
-            # Use data plane endpoint format - FIX: hyphen instead of dot
+        # Choose the correct endpoint based on the action type. The control
+        # plane honors the configured ``endpoint`` override (non-public
+        # gateways such as the pre deployments); the data plane uses the
+        # region-derived public stream host.
+        if action in data_plane_actions:
             base_endpoint = f"dataagent-stream-{self._config.region}.aliyuncs.com/apikey"
         else:
-            # Default to control plane if action is not recognized - FIX: hyphen instead of dot
-            base_endpoint = f"dataagent-{self._config.region}.aliyuncs.com/apikey"
+            base_endpoint = self._config.endpoint
 
         # Add the required RegionId parameter to params
         params['RegionId'] = self._config.region

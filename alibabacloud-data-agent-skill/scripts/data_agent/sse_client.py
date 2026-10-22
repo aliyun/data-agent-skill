@@ -204,27 +204,33 @@ class SSEClient:
         checkpoint: Optional[int] = None,
     ) -> Iterator[SSEEvent]:
         """Stream with API_KEY authentication."""
-        # Determine endpoint based on action type (GetChatContent is a data plane API)
+        # GetChatContent is a data-plane API served by the stream gateway
+        # (region-derived public default).
         base_endpoint = f"dataagent-stream-{self._config.region}.aliyuncs.com/apikey"
         url = f"https://{base_endpoint}"
 
-        # Build request body
+        # Build request body. AgentId is deliberately omitted: on the API-key
+        # stream gateways a GetChatContent carrying AgentId switches to a
+        # non-terminating tail mode (replay without chat_finish/SSE_FINISH);
+        # without it the stream carries full turn semantics — it closes at
+        # SSE_FINISH just like the AK/SK gateway. The server resolves the
+        # agent from SessionId alone.
         body = {
             'Action': 'GetChatContent',
             'Version': '2025-04-14',
             'RegionId': self._config.region,
             'SessionId': session_id,
         }
-        if agent_id:
-            body['AgentId'] = agent_id
         if checkpoint is not None:
             body['Checkpoint'] = str(checkpoint)
 
-        # Set up headers with API_KEY
+        # Set up headers with API_KEY. Accept must be text/event-stream —
+        # with application/json the gateway answers a transport-200
+        # INTERNAL_DATA_AGENT_ERROR and no SSE events arrive at all.
         headers = {
             'x-api-key': self._config.api_key,
             'Content-Type': 'application/json',
-            'Accept': 'application/json',
+            'Accept': 'text/event-stream',
             'User-Agent': 'AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill',
         }
 
@@ -293,10 +299,8 @@ class SSEClient:
         timeout: int,
         checkpoint: Optional[int] = None,
     ) -> Iterator[SSEEvent]:
-        """Stream with AK/SK authentication via default credential chain."""
-        from alibabacloud_credentials.client import Client as CredentialClient
-        
-        credential_client = CredentialClient()
+        """Stream with AK/SK authentication (credentials file or default chain)."""
+        credential_client = self._config.build_credential_client()
         credential = credential_client.get_credential()
         access_key_id = credential.access_key_id
         access_key_secret = credential.access_key_secret
@@ -549,27 +553,33 @@ class AsyncSSEClient:
         checkpoint: Optional[int] = None,
     ) -> AsyncIterator[SSEEvent]:
         """Async stream with API_KEY authentication."""
-        # Determine endpoint based on action type (GetChatContent is a data plane API)
+        # GetChatContent is a data-plane API served by the stream gateway
+        # (region-derived public default).
         base_endpoint = f"dataagent-stream-{self._config.region}.aliyuncs.com/apikey"
         url = f"https://{base_endpoint}"
 
-        # Build request body
+        # Build request body. AgentId is deliberately omitted: on the API-key
+        # stream gateways a GetChatContent carrying AgentId switches to a
+        # non-terminating tail mode (replay without chat_finish/SSE_FINISH);
+        # without it the stream carries full turn semantics — it closes at
+        # SSE_FINISH just like the AK/SK gateway. The server resolves the
+        # agent from SessionId alone.
         body = {
             'Action': 'GetChatContent',
             'Version': '2025-04-14',
             'RegionId': self._config.region,
             'SessionId': session_id,
         }
-        if agent_id:
-            body['AgentId'] = agent_id
         if checkpoint is not None:
             body['Checkpoint'] = str(checkpoint)
 
-        # Set up headers with API_KEY
+        # Set up headers with API_KEY. Accept must be text/event-stream —
+        # with application/json the gateway answers a transport-200
+        # INTERNAL_DATA_AGENT_ERROR and no SSE events arrive at all.
         headers = {
             'x-api-key': self._config.api_key,
             'Content-Type': 'application/json',
-            'Accept': 'application/json',
+            'Accept': 'text/event-stream',
             'User-Agent': 'AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill',
         }
 
@@ -627,10 +637,8 @@ class AsyncSSEClient:
         timeout: int,
         checkpoint: Optional[int] = None,
     ) -> AsyncIterator[SSEEvent]:
-        """Async stream with AK/SK authentication via default credential chain."""
-        from alibabacloud_credentials.client import Client as CredentialClient
-        
-        credential_client = CredentialClient()
+        """Async stream with AK/SK authentication (credentials file or default chain)."""
+        credential_client = self._config.build_credential_client()
         credential = credential_client.get_credential()
         access_key_id = credential.access_key_id
         access_key_secret = credential.access_key_secret

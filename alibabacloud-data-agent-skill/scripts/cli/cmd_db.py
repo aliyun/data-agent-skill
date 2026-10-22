@@ -37,7 +37,7 @@ def _db_attach(
     from_start: bool = False,
     checkpoint: Optional[int] = None,
     output_mode: str = "summary",
-) -> None:
+) -> Optional[str]:
     """Attach to an existing session's SSE stream without sending a message.
 
     Streams all incoming events to stdout in real-time using the same
@@ -47,6 +47,9 @@ def _db_attach(
 
     After the stream ends, calls ListFileUpload to download any
     agent-generated report files to sessions/<session_id>/reports/.
+
+    Returns the task failure message observed in the stream (e.g. a
+    data-preparation failure notice), or None when no failure was seen.
     """
     session_id = session.session_id
     session_dir = Path(f"sessions/{session_id}")
@@ -182,6 +185,8 @@ def _db_attach(
     print(f'> \U0001f4a1 To continue conversation:')
     print(f'>    python3 skill/data_agent_cli.py attach --session-id {session_id} -q "your message"')
 
+    return state.task_failed_message
+
 
 def _db_batch(
     message_handler: MessageHandler,
@@ -189,25 +194,29 @@ def _db_batch(
     queries: list,
     output_mode: str = "summary",
     output_dir: Optional[Path] = None,
-) -> tuple[bool, bool, str]:
+) -> tuple[bool, bool, Optional[str], str]:
     """Execute follow-up queries with streaming output.
 
     Data sources are session-level (merged server-side, carried by the first
     message), so follow-ups are sent bare.
+
+    Returns (got_content, need_confirm, task_failed, full_text).
     """
     got_content, need_confirm = False, False
+    task_failed = None
     full_text = ""
     for query in queries:
         print(f"\n{'=' * 60}")
         print(f"Query: {query}")
         print("=" * 60)
-        c, nc, t = _stream_response(message_handler, session, query, output_mode=output_mode, output_dir=output_dir)
+        c, nc, tf, t = _stream_response(message_handler, session, query, output_mode=output_mode, output_dir=output_dir)
         if c: got_content = True
         if t: full_text += f"\n### Query: {query}\n" + t + "\n"
-        if nc:
-            need_confirm = True
+        if tf: task_failed = tf
+        if nc: need_confirm = True
+        if nc or tf:
             break
-    return got_content, need_confirm, full_text
+    return got_content, need_confirm, task_failed, full_text
 
 
 def _preset_queries(session_mode: str, db_name: str) -> list:
@@ -235,14 +244,14 @@ def _consume_first_response(
     session,
     output_mode: str,
     session_dir: Path,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, Optional[str]]:
     """Consume the in-flight response of the parent/first direct-sent message.
 
     Prints the same no-content / need-confirmation notices as the rest of the
-    db flow. Returns (got_content, need_confirm).
+    db flow. Returns (got_content, need_confirm, task_failed).
     """
     print("\nAnalyzing...\n")
-    got_content, need_confirm, _ = _stream_existing_response(
+    got_content, need_confirm, task_failed, _ = _stream_existing_response(
         # SSEClient takes the DataAgentConfig, not the client
         SSEClient(client._config), session,
         output_mode=output_mode, output_dir=session_dir, checkpoint=0,
@@ -251,7 +260,7 @@ def _consume_first_response(
         print("(No response received, please retry)")
     elif need_confirm:
         print("\n⚠️  需要用户确认，程序将退出。请完成确认后使用会话ID继续对话。")
-    return got_content, need_confirm
+    return got_content, need_confirm, task_failed
 
 
 def cmd_db(args: argparse.Namespace) -> None:
@@ -309,18 +318,19 @@ def cmd_db(args: argparse.Namespace) -> None:
             output_mode = getattr(args, "output", "summary")
             session_dir = Path(f"sessions/{session.session_id}")
 
-            got_content, need_confirm = _consume_first_response(
+            got_content, need_confirm, task_failed = _consume_first_response(
                 client, session, output_mode, session_dir
             )
-            if need_confirm:
-                return got_content, need_confirm
+            if need_confirm or task_failed:
+                return got_content, need_confirm, task_failed
 
             remaining = queries[1:]
             if remaining:
-                c, nc, _ = _db_batch(message_handler, session, remaining, output_mode=output_mode, output_dir=session_dir)
+                c, nc, tf, _ = _db_batch(message_handler, session, remaining, output_mode=output_mode, output_dir=session_dir)
                 got_content = got_content or c
                 need_confirm = need_confirm or nc
-            return got_content, need_confirm
+                task_failed = task_failed or tf
+            return got_content, need_confirm, task_failed
 
         run_worker_with_handler(args, data_source=None, query_execution_func=db_query_executor)
 
@@ -355,14 +365,23 @@ def cmd_db(args: argparse.Namespace) -> None:
     try:
         # Consume the response of the direct-sent first message, then run any
         # remaining preset queries.
-        got_content, need_confirm = _consume_first_response(
+        got_content, need_confirm, task_failed = _consume_first_response(
             client, session, output_mode, session_dir
         )
-        if not need_confirm and queries[1:]:
-            _db_batch(message_handler, session, queries[1:], output_mode=output_mode, output_dir=session_dir)
+        if not need_confirm and not task_failed and queries[1:]:
+            _, _, tf, _ = _db_batch(message_handler, session, queries[1:], output_mode=output_mode, output_dir=session_dir)
+            task_failed = task_failed or tf
     finally:
         close_structured_logging()
 
     # Write result status
+    if task_failed:
+        with open(session_dir / "result.json", "w", encoding="utf-8") as f:
+            json.dump({"status": "failed", "error": task_failed}, f, ensure_ascii=False)
+        sys.exit(1)
+    if need_confirm:
+        with open(session_dir / "result.json", "w", encoding="utf-8") as f:
+            json.dump({"status": "waiting_input"}, f)
+        return
     with open(session_dir / "result.json", "w", encoding="utf-8") as f:
         json.dump({"status": "completed"}, f)

@@ -212,6 +212,37 @@ class DataAgentConfig:
             return self.dms_enterprise_endpoint
         return f"dms-enterprise.{region_id or self.region}.aliyuncs.com"
 
+    def build_credential_client(self):
+        """Build a credentials SDK client honouring the credentials file.
+
+        Uses the static AK from the resolved credentials-file entry when
+        present, otherwise falls back to the Alibaba Cloud default credential
+        chain (env vars, ~/.aliyun/config.json, ECS role, OIDC role, ...).
+        Shared by every AK/SK consumer — the Data Agent API client, the SSE
+        streaming client and the DMS enterprise clients — so a credentials
+        file alone is enough for all of them.
+
+        Returns:
+            alibabacloud_credentials Client.
+        """
+        from alibabacloud_credentials.client import Client as CredentialClient
+
+        entry = getattr(self, "_credentials_entry", None)
+        if (
+            isinstance(entry, dict)
+            and entry.get("access_key_id")
+            and entry.get("access_key_secret")
+        ):
+            from alibabacloud_credentials import models as cred_models
+
+            cred_config = cred_models.Config(
+                type="access_key",
+                access_key_id=entry["access_key_id"],
+                access_key_secret=entry["access_key_secret"],
+            )
+            return CredentialClient(cred_config)
+        return CredentialClient()
+
     def validate(self) -> None:
         """Validate configuration values.
 

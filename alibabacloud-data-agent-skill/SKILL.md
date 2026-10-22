@@ -14,15 +14,18 @@ domain: AIOps
 ---
 metadata:
   author: DataAgent Team
-  version: "2.7.0"
+  version: "2.7.1"
 ---
 
 # Changelog
 
-- **v2.7.0**: `db` / `file` no longer pre-create the session — the first SendChatMessage creates it implicitly and the response carries the new SessionId; both are workflow layers on the shared send message path, and the async worker consumes the already-sent first response instead of re-sending it. `send` gains `--session-mode` (auto / lite / pro / ultra). Data sources unify on the session-level `DataSources` list: `DataSource` and `DataSources` are both session-level (repeated passes auto-merge with equal priority, backend recommends `DataSources`), so db / file / send all carry data sources via `DataSources` on the first message and follow-ups go bare. New read-only `status` subcommand (one DescribeDataAgentSession call, prints status / title / mode, WAIT_INPUT guidance); gateway status variants (`init` / `INITIALIZING` / `RECOVERABLE` / `UNAVAILABLE` / `FINISHED` / `CANCELED` / `ERROR`) are normalized to the CLI enum with the server value shown alongside. API_KEY auth + custom agent still pre-creates (backend limitation). For detailed changes and earlier versions, see [CHANGELOG.md](references/CHANGELOG.md).
-- **v2.6.1**: The `DataSources` database entry now always carries `DmsDatabaseId` — `--dms-db-id` is required whenever database data source parameters are passed (fail-fast in the CLI: the backend resolves table schemas and executes SQL by database ID, so a database data source without it cannot run). `send` / `legacy-send` gain the `--dms-db-id` flag. Custom-agent note clarified: extra data sources are merged server-side but best left unset. For detailed changes and earlier versions, see [CHANGELOG.md](references/CHANGELOG.md).
-- **v2.6.0**: `send` binds custom agents directly via the SendChatMessage `SessionConfig` under AK/SK auth (no CreateDataAgentSession round-trip); `--title` moved to the new `legacy-send` subcommand — avoid unless a session title is really needed. Fixed an invalid `--no-async-run` flag in the `send` quick-start example. For detailed changes and earlier versions, see [CHANGELOG.md](references/CHANGELOG.md).
-- **v2.5.0**: Sync with the maintained master. Added new capabilities including data permissions, plain credentials-file authentication, enhanced `send` subcommand, `cancel` and `upload` subcommands, report generation options, custom agent lifecycle management, workspace-scoped file uploads, and endpoint overrides. Updated SDK contract and fixed bugs related to credential value redaction and response handling. Enhanced dependency on `alibabacloud-dms20250414>=2.0.0`. Removed deprecated `--dms-unit` CLI flag. For detailed changes and earlier versions, see [CHANGELOG.md](references/CHANGELOG.md).
+One line per version — the detail lives in [CHANGELOG.md](references/CHANGELOG.md).
+
+- **v2.7.1**: Regression-matrix hardening: six fixes — analysis failures no longer fake success, `attach -q` keeps monitoring after a confirmation, API_KEY business failures render their real code/message, credentials-file AK works for every consumer, API_KEY endpoint routing fixed, API_KEY SSE wire repaired.
+- **v2.7.0**: `db` / `file` create the session implicitly via the first SendChatMessage on a shared send path; data sources unify on `DataSources`; `send --session-mode`; new read-only `status` subcommand; session-status normalization.
+- **v2.6.1**: `DataSources` database entries always carry `DmsDatabaseId` (`--dms-db-id` required, fail-fast); `--dms-db-id` flag on `send` / `legacy-send`.
+- **v2.6.0**: `send` binds custom agents directly via `SessionConfig` under AK/SK; `--title` moved to `legacy-send`.
+- **v2.5.0**: Sync with the maintained master — permissions, credentials-file auth, endpoint overrides, custom agents, `cancel` / `upload`, SDK contract update.
 
 ---
 

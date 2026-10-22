@@ -285,6 +285,10 @@ class StreamState:
     # Result flags
     got_content: bool = False
     need_user_confirm: bool = False
+    # Non-empty when data/task_finish delivered a task failure notice: the
+    # backend reports data-preparation failures as plain text (i18n template),
+    # not JSON, so the failure is detected by template prefix.
+    task_failed_message: Optional[str] = None
 
     # Turn counter for multi-turn display
     turn_count: int = 0
@@ -361,13 +365,13 @@ def _stream_response(
     output_dir: Optional[Path] = None,
     process_log_handler: Optional[StructuredLogHandler] = None,
     is_attach: bool = False,
-) -> tuple[bool, bool, str]:
+) -> tuple[bool, bool, Optional[str], str]:
     """Stream response tokens to stdout in real-time.
 
     Uses StreamState to track cross-event context (plan progress,
     output_conclusion accumulation, tool_call_response lifecycle).
 
-    Returns (got_content: bool, need_user_confirm: bool, output_text: str).
+    Returns (got_content, need_user_confirm, task_failed_message, output_text).
     """
     state = StreamState(output_mode=output_mode)
     state.output_dir = output_dir
@@ -407,7 +411,7 @@ def _stream_response(
         _out(state, "")  # final newline after streaming
 
     full_text = "\n".join(state.full_output)
-    return state.got_content, state.need_user_confirm, full_text
+    return state.got_content, state.need_user_confirm, state.task_failed_message, full_text
 
 
 def _stream_existing_response(
@@ -417,7 +421,7 @@ def _stream_existing_response(
     output_dir: Optional[Path] = None,
     checkpoint: Optional[int] = None,
     timeout: Optional[int] = None,
-) -> tuple[bool, bool, str]:
+) -> tuple[bool, bool, Optional[str], str]:
     """Stream the pending response of an already-sent message.
 
     Mirrors _stream_response but never sends a message: it iterates the SSE
@@ -429,7 +433,7 @@ def _stream_existing_response(
     Pass ``checkpoint=0`` to replay the response from its beginning, so no
     early events are missed between the send and this stream connecting.
 
-    Returns (got_content: bool, need_user_confirm: bool, output_text: str).
+    Returns (got_content, need_user_confirm, task_failed_message, output_text).
     """
     state = StreamState(output_mode=output_mode)
     state.output_dir = output_dir
@@ -465,7 +469,7 @@ def _stream_existing_response(
         _out(state, "")  # final newline after streaming
 
     full_text = "\n".join(state.full_output)
-    return state.got_content, state.need_user_confirm, full_text
+    return state.got_content, state.need_user_confirm, state.task_failed_message, full_text
 
 
 def _finalize_stream(state: StreamState) -> None:
@@ -704,8 +708,15 @@ def _handle_data_plan(state: StreamState, event: SSEEvent) -> None:
                 state.pending_step_label = progress
 
 
+# Backend (jarvis) delivers data-preparation failures through
+# data/task_finish as plain text (jarvis_io.notice → MessageCategory.TASK_
+# FINISH), while successful task_finish payloads may be plain text or JSON —
+# so failure is detected by the i18n template prefix, not by "not JSON".
+_TASK_FINISH_FAILURE_PREFIXES = ("数据准备失败：", "Data preparation failed:")
+
+
 def _handle_data_task_finish(state: StreamState, content: str) -> None:
-    """Handle data/task_finish — structured query result."""
+    """Handle data/task_finish — structured query result or failure notice."""
     json_parts = _extract_json_objects(content)
     for _, _, parsed in json_parts:
         if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) and "title" in parsed[0]:
@@ -720,6 +731,12 @@ def _handle_data_task_finish(state: StreamState, content: str) -> None:
                 _out(state, out)
                 state.got_content = True
                 return
+
+    text = content.strip()
+    if text.startswith(_TASK_FINISH_FAILURE_PREFIXES):
+        state.task_failed_message = text
+        _out(state, f"\n❌ {text}")
+        state.got_content = True
 
 
 def _handle_data_jsx_report(state: StreamState, content: str) -> None:
@@ -882,11 +899,13 @@ def _handle_chat_finish(state: StreamState, event: SSEEvent) -> None:
             if q_lower in exact_confirms:
                 is_confirmation = True
 
-        if q and not is_confirmation:
+        # A turn that ended in a task failure is not a completed analysis —
+        # the failure notice was already printed by _handle_data_task_finish.
+        if q and not is_confirmation and not state.task_failed_message:
             # Truncate long questions
             label = q if len(q) <= 40 else q[:37] + "..."
             _out(state, f"\n✅ 「{label}」已完成分析，正在获取生成的报告和中间文件...")
-        else:
+        elif not state.task_failed_message:
             _out(state, "\n✅ 分析已完成，正在获取生成的报告和中间文件...")
         state.got_content = True
         return

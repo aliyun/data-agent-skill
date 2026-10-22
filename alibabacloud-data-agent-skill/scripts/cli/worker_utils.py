@@ -289,20 +289,28 @@ def setup_async_worker(
     sys.exit(0)
 
 
-def handle_worker_completion(session_dir: Path, need_confirm: bool = False, error: Optional[Exception] = None) -> None:
+def handle_worker_completion(
+    session_dir: Path,
+    need_confirm: bool = False,
+    error: Optional[Exception] = None,
+    task_failed: Optional[str] = None,
+) -> None:
     """Handle worker process completion by updating status files.
 
     Args:
         session_dir: Session directory path
         need_confirm: Whether user confirmation is needed
         error: Exception object if there was an error, None otherwise
+        task_failed: data/task_finish failure message when the analysis
+            failed server-side (e.g. data preparation failure), None otherwise
     """
-    if error:
-        # Error occurred
+    if error or task_failed:
+        # Error or server-side task failure
+        detail = str(error) if error else task_failed
         with open(session_dir / "status.txt", "w", encoding="utf-8") as f:
             f.write("failed")
         with open(session_dir / "result.json", "w", encoding="utf-8") as f:
-            json.dump({"status": "failed", "error": str(error)}, f)
+            json.dump({"status": "failed", "error": detail}, f, ensure_ascii=False)
     elif need_confirm:
         # Need user confirmation
         with open(session_dir / "status.txt", "w", encoding="utf-8") as f:

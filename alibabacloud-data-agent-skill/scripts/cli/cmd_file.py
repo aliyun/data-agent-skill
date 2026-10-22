@@ -14,6 +14,7 @@ import argparse
 import sys
 import json
 from pathlib import Path
+from typing import Optional
 
 from cli.worker_utils import is_worker_process, setup_async_worker, build_send_options
 from cli.streaming_utils import run_worker_with_handler
@@ -47,13 +48,13 @@ def _consume_first_response(
     session,
     output_mode: str,
     session_dir: Path,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, Optional[str]]:
     """Consume the in-flight response of the first direct-sent message.
 
-    Returns (got_content, need_confirm); prints the standard notices.
+    Returns (got_content, need_confirm, task_failed); prints the standard notices.
     """
     print("\nAnalyzing...\n")
-    got_content, need_confirm, _ = _stream_existing_response(
+    got_content, need_confirm, task_failed, _ = _stream_existing_response(
         # SSEClient takes the DataAgentConfig, not the client
         SSEClient(client._config), session,
         output_mode=output_mode, output_dir=session_dir, checkpoint=0,
@@ -63,7 +64,7 @@ def _consume_first_response(
     elif need_confirm:
         print("\n⚠️  Agent has created an execution plan. User confirmation required.")
         print(f"   To continue: python3 scripts/data_agent_cli.py attach --session-id {session.session_id} -q 'User Input'")
-    return got_content, need_confirm
+    return got_content, need_confirm, task_failed
 
 
 def _resolve_file_id(args: argparse.Namespace, file_manager: FileManager) -> str:
@@ -155,27 +156,28 @@ def cmd_file(args: argparse.Namespace) -> None:
             print("File Analysis")
             print("=" * 60)
 
-            got_content, need_confirm = _consume_first_response(
+            got_content, need_confirm, task_failed = _consume_first_response(
                 client, session, output_mode, session_dir
             )
-            if need_confirm:
-                return got_content, need_confirm
+            if need_confirm or task_failed:
+                return got_content, need_confirm, task_failed
 
             for query in queries[1:]:
                 print(f"\nQuery: {query}")
                 print("-" * 50)
-                c, nc, _ = _stream_response(
+                c, nc, tf, _ = _stream_response(
                     message_handler, session, query,
                     output_mode=output_mode, output_dir=session_dir,
                 )
                 got_content = got_content or c
-                if nc:
-                    return got_content, True
+                task_failed = task_failed or tf
+                if nc or tf:
+                    return got_content, nc, task_failed
 
             if args.list_generated_files:
                 _print_generated_files(file_manager, session.session_id)
 
-            return got_content, False
+            return got_content, False, task_failed
 
         run_worker_with_handler(args, data_source=None, query_execution_func=file_query_executor)
 
@@ -211,26 +213,35 @@ def cmd_file(args: argparse.Namespace) -> None:
         print("File Analysis")
         print("=" * 60)
 
-        got_content, need_confirm = _consume_first_response(
+        got_content, need_confirm, task_failed = _consume_first_response(
             client, session, output_mode, session_dir
         )
         if need_confirm:
             with open(session_dir / "result.json", "w", encoding="utf-8") as f:
                 json.dump({"status": "waiting_input"}, f)
             return
+        if task_failed:
+            with open(session_dir / "result.json", "w", encoding="utf-8") as f:
+                json.dump({"status": "failed", "error": task_failed}, f, ensure_ascii=False)
+            sys.exit(1)
 
         for query in queries[1:]:
             print(f"\nQuery: {query}")
             print("-" * 50)
             try:
-                got_content, need_confirm, _ = _stream_response(
+                got_content, need_confirm, tf, _ = _stream_response(
                     message_handler, session, query,
                     output_mode=output_mode, output_dir=session_dir,
                 )
+                task_failed = task_failed or tf
                 if need_confirm:
                     with open(session_dir / "result.json", "w", encoding="utf-8") as f:
                         json.dump({"status": "waiting_input"}, f)
                     return
+                if task_failed:
+                    with open(session_dir / "result.json", "w", encoding="utf-8") as f:
+                        json.dump({"status": "failed", "error": task_failed}, f, ensure_ascii=False)
+                    sys.exit(1)
             except Exception as e:
                 print(f"Request failed: {e}")
 

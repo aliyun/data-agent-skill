@@ -31,8 +31,10 @@ def _print_send_result(resp: dict) -> bool:
     request_id = resp.get("requestId") or resp.get("RequestId")
     success = str(resp.get("success", resp.get("Success", ""))).lower()
     if success != "true":
-        error_code = resp.get("errorCode") or resp.get("ErrorCode")
-        error_message = resp.get("errorMessage") or resp.get("ErrorMessage")
+        # AK/SK RPC failures carry errorCode/errorMessage; the API_KEY gateway
+        # (HTTP 200 + error body) carries code/message instead.
+        error_code = resp.get("errorCode") or resp.get("ErrorCode") or resp.get("code")
+        error_message = resp.get("errorMessage") or resp.get("ErrorMessage") or resp.get("message")
         print(f"  Business failure: {error_code} {error_message}")
         if request_id:
             print(f"  RequestId: {request_id}")

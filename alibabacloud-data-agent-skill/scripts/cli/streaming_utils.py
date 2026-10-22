@@ -33,9 +33,10 @@ def execute_query_batch(
         process_log_handler: Optional process log handler
 
     Returns:
-        Tuple of (got_content, need_confirm, full_text)
+        Tuple of (got_content, need_confirm, task_failed, full_text)
     """
     got_content, need_confirm = False, False
+    task_failed = None
     full_text = ""
 
     for i, query in enumerate(queries):
@@ -46,7 +47,7 @@ def execute_query_batch(
         else:
             print(f"\nQuery: {query}")
 
-        c, nc, t = _stream_response_with_data_source(
+        c, nc, tf, t = _stream_response_with_data_source(
             message_handler, session, query,
             data_source=data_source,
             output_mode=output_mode,
@@ -58,11 +59,14 @@ def execute_query_batch(
             got_content = True
         if t:
             full_text += f"\n### Query: {query}\n" + t + "\n"
+        if tf:
+            task_failed = tf
         if nc:
             need_confirm = True
-            break  # Stop processing if confirmation is needed
+        if nc or tf:
+            break  # Stop processing if confirmation is needed or the task failed
 
-    return got_content, need_confirm, full_text
+    return got_content, need_confirm, task_failed, full_text
 
 
 def _stream_response_with_data_source(
@@ -73,7 +77,7 @@ def _stream_response_with_data_source(
     output_mode: str = "summary",
     output_dir: Optional[Path] = None,
     process_log_handler: Optional[StructuredLogHandler] = None
-) -> tuple[bool, bool, str]:
+) -> tuple[bool, bool, Optional[str], str]:
     """Wrapper for _stream_response that handles data_source parameter properly."""
     # Import the streaming function from the existing module
     from cli.streaming import _stream_response
@@ -92,7 +96,7 @@ def execute_single_query(
     output_dir: Optional[Path] = None,
     data_source: Optional[DataSource] = None,
     process_log_handler: Optional[StructuredLogHandler] = None
-) -> tuple[bool, bool, str]:
+) -> tuple[bool, bool, Optional[str], str]:
     """Execute a single query with streaming output.
 
     Args:
@@ -105,10 +109,10 @@ def execute_single_query(
         process_log_handler: Optional process log handler
 
     Returns:
-        Tuple of (got_content, need_confirm, full_text)
+        Tuple of (got_content, need_confirm, task_failed, full_text)
     """
     print(f"\nAnalyzing...\n")
-    got_content, need_confirm, full_text = _stream_response_with_data_source(
+    got_content, need_confirm, task_failed, full_text = _stream_response_with_data_source(
         message_handler, session, query,
         data_source=data_source, output_mode=output_mode, output_dir=output_dir,
         process_log_handler=process_log_handler
@@ -117,7 +121,7 @@ def execute_single_query(
         print("(No response received, please retry)")
     elif need_confirm:
         print("\n⚠️  需要用户确认，程序将退出。请完成确认后使用会话ID继续对话。")
-    return got_content, need_confirm, full_text
+    return got_content, need_confirm, task_failed, full_text
 
 
 def run_worker_with_handler(
@@ -131,6 +135,7 @@ def run_worker_with_handler(
         args: Command line arguments
         data_source: Optional data source for queries
         query_execution_func: Function to execute queries, receives (message_handler, session, args)
+            and returns (got_content, need_confirm, task_failed)
     """
     from cli.worker_lock import acquire_worker_lock, release_worker_lock
 
@@ -149,6 +154,7 @@ def run_worker_with_handler(
     print(f"[Worker] Agent ID: {agent_id}", flush=True)
     acquire_worker_lock(session_dir)
 
+    exit_code = 0
     try:
         # Initialize components
         _, _, session_manager, message_handler = initialize_components()
@@ -165,17 +171,18 @@ def run_worker_with_handler(
 
         output_mode = getattr(args, "output", "summary")
         output_text = ""
+        task_failed = None
 
         # Execute queries using provided function or default behavior
         if query_execution_func:
-            got_content, need_confirm = query_execution_func(
+            got_content, need_confirm, task_failed = query_execution_func(
                 message_handler, session, args
             )
         else:
             # Default behavior: handle query if provided, otherwise use presets
             # This is a simplified default - in practice, each command should provide its own execution function
             if hasattr(args, 'query') and args.query:
-                got_content, need_confirm, output_text = execute_single_query(
+                got_content, need_confirm, task_failed, output_text = execute_single_query(
                     message_handler, session, args.query,
                     output_mode=output_mode, output_dir=session_dir,
                     data_source=data_source
@@ -183,19 +190,22 @@ def run_worker_with_handler(
             else:
                 # Provide a simple default query execution - customize per command type
                 default_queries = ["What can you help me with?"]
-                got_content, need_confirm, output_text = execute_query_batch(
+                got_content, need_confirm, task_failed, output_text = execute_query_batch(
                     message_handler, session, default_queries,
                     output_mode=output_mode, output_dir=session_dir,
                     data_source=data_source
                 )
 
         # Handle results
-        handle_worker_completion(session_dir, need_confirm)
+        handle_worker_completion(session_dir, need_confirm, task_failed=task_failed)
+        if task_failed:
+            exit_code = 1
 
     except Exception as e:
         # Handle error
         handle_worker_completion(session_dir, error=e)
         print(f"Error: {e}", file=sys.stderr, flush=True)
+        exit_code = 1
     finally:
         release_worker_lock(session_dir)
         # Close structured logging files
@@ -209,4 +219,4 @@ def run_worker_with_handler(
         sys.stderr = _orig_stderr
         log_file.close()
 
-    sys.exit(0)
+    sys.exit(exit_code)
