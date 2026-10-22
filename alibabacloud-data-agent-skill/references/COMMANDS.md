@@ -18,7 +18,8 @@ CLI commands load `.env` and process environment variables through `DataAgentCon
 | `DATA_AGENT_DMS_UNIT` | Optional explicit DMSUnit override for Data Agent session APIs (alias `DATA_AGENT_DMSUNIT`); `ListTagMetaAsset` discovery tags still use `DATA_AGENT_REGION` |
 | `DATA_AGENT_WORKSPACE_ID` | Optional default workspace ID when `--workspace-id` is omitted |
 | `DATA_AGENT_CUSTOM_AGENT_ID` | Optional default custom agent ID when `--custom-agent-id` is omitted; when set, `db` data-source parameters are not required |
-| `DATA_AGENT_ENDPOINT` | Explicit gateway override for Data Agent APIs, defaults derived from region |
+| `DATA_AGENT_ENDPOINT` | Explicit gateway override for Data Agent control-plane APIs, defaults derived from region |
+| `DATA_AGENT_STREAM_ENDPOINT` | Explicit override for the API_KEY data-plane (stream) gateway, default `dataagent-stream-{region}.aliyuncs.com/apikey`; set alongside `DATA_AGENT_ENDPOINT` when targeting non-public gateways (ignored under AK/SK auth) |
 | `DATA_AGENT_DMS_ENTERPRISE_ENDPOINT` | Optional dms-enterprise host for the discovery APIs (`ls`, `dms`, `import`, route lookup), default `dms-enterprise.{region}.aliyuncs.com`; use a VPC endpoint when public egress is unavailable |
 | `DATA_AGENT_CREDENTIALS_FILE` | Path to a plain credentials file (default `~/.data-agent-credentials.json`); see [CREDENTIALS.md](CREDENTIALS.md) |
 | `DATA_AGENT_CREDENTIALS_ENV` / `DATA_AGENT_CREDENTIALS_PROFILE` | Credentials-file environment / profile selectors (default `default`) |
@@ -246,7 +247,8 @@ Send a single message, printing the response. Without `--session-id` a new sessi
 | `--dms-instance-id` / `--db-name` / `--tables` | Database data source attached to the session |
 | `--permission-file` / `--permission-default-action` | SQL permission control (see [PERMISSIONS.md](PERMISSIONS.md)) |
 | `--poll` / `--timeout` | Wait after sending until the analysis completes (timeout in seconds, default 300) |
-| `--endpoint` | Explicit gateway endpoint override |
+| `--endpoint` | Explicit gateway endpoint override (control plane) |
+| `--stream-endpoint` | Explicit API_KEY data-plane (stream) endpoint override; ignored under AK/SK auth |
 
 ### Examples
 

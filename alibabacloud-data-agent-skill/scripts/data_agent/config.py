@@ -121,6 +121,11 @@ class DataAgentConfig:
             Defaults to dms-enterprise.{region}.aliyuncs.com. Set it for VPC-only
             egress or non-public-cloud deployments. Note that ``endpoint`` only
             covers the Data Agent APIs, not these metadata calls.
+        stream_endpoint: Optional API-key data-plane endpoint (GetChatContent /
+            SendChatMessage). Defaults to dataagent-stream.{region}.aliyuncs.com/
+            apikey. Together with ``endpoint`` (the API-key control plane) it
+            routes API_KEY traffic to non-public gateways; AK/SK traffic ignores
+            it.
         credentials_file: Optional path to a plain credentials JSON file
             (DATA_AGENT_CREDENTIALS_FILE; defaults to ~/.data-agent-credentials.json)
         credentials_env: Environment key inside the credentials file. The
@@ -150,6 +155,7 @@ class DataAgentConfig:
     dms_unit: Optional[str] = None
     custom_agent_id: Optional[str] = None
     dms_enterprise_endpoint: Optional[str] = None
+    stream_endpoint: Optional[str] = None
     credentials_file: Optional[str] = None
     credentials_env: str = "default"
     credentials_profile: str = "default"
@@ -160,6 +166,7 @@ class DataAgentConfig:
         self.dms_unit = _none_if_blank(self.dms_unit)
         self.custom_agent_id = _none_if_blank(self.custom_agent_id)
         self.dms_enterprise_endpoint = _none_if_blank(self.dms_enterprise_endpoint)
+        self.stream_endpoint = _none_if_blank(self.stream_endpoint)
         self.credentials_file = _none_if_blank(self.credentials_file)
 
         # Resolve the credentials-file entry before endpoint derivation: an
@@ -211,6 +218,18 @@ class DataAgentConfig:
         if self.dms_enterprise_endpoint:
             return self.dms_enterprise_endpoint
         return f"dms-enterprise.{region_id or self.region}.aliyuncs.com"
+
+    def resolve_api_key_stream_endpoint(self) -> str:
+        """Return the API-key data-plane endpoint (GetChatContent / SendChatMessage).
+
+        The configured override wins (non-public deployments such as the pre
+        gateways have no region-derived host); otherwise the public default
+        ``dataagent-stream-<region>.aliyuncs.com/apikey`` is derived. Only
+        consulted in API_KEY mode — AK/SK traffic is served by ``endpoint``.
+        """
+        if self.stream_endpoint:
+            return self.stream_endpoint
+        return f"dataagent-stream-{self.region}.aliyuncs.com/apikey"
 
     def build_credential_client(self):
         """Build a credentials SDK client honouring the credentials file.
@@ -292,6 +311,7 @@ class DataAgentConfig:
             dms_unit=os.environ.get("DATA_AGENT_DMS_UNIT") or os.environ.get("DATA_AGENT_DMSUNIT"),
             custom_agent_id=os.environ.get("DATA_AGENT_CUSTOM_AGENT_ID"),
             dms_enterprise_endpoint=os.environ.get("DATA_AGENT_DMS_ENTERPRISE_ENDPOINT"),
+            stream_endpoint=os.environ.get("DATA_AGENT_STREAM_ENDPOINT"),
             credentials_file=os.environ.get("DATA_AGENT_CREDENTIALS_FILE"),
             credentials_env=os.environ.get("DATA_AGENT_CREDENTIALS_ENV", "default"),
             credentials_profile=os.environ.get("DATA_AGENT_CREDENTIALS_PROFILE", "default"),
@@ -323,6 +343,7 @@ class DataAgentConfig:
             dms_unit=config_dict.get("dms_unit") or config_dict.get("DMSUnit"),
             custom_agent_id=config_dict.get("custom_agent_id") or config_dict.get("CustomAgentId"),
             dms_enterprise_endpoint=config_dict.get("dms_enterprise_endpoint"),
+            stream_endpoint=config_dict.get("stream_endpoint"),
             credentials_file=config_dict.get("credentials_file"),
             credentials_env=config_dict.get("credentials_env", "default"),
             credentials_profile=config_dict.get("credentials_profile", "default"),
@@ -350,6 +371,8 @@ class DataAgentConfig:
             result["custom_agent_id"] = self.custom_agent_id
         if self.dms_enterprise_endpoint:
             result["dms_enterprise_endpoint"] = self.dms_enterprise_endpoint
+        if self.stream_endpoint:
+            result["stream_endpoint"] = self.stream_endpoint
         if self.credentials_file:
             result["credentials_file"] = self.credentials_file
         if self.credentials_env != "default":

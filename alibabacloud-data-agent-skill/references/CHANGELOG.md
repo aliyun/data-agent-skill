@@ -2,6 +2,14 @@
 
 Full version history of the Data Agent CLI skill. The latest entry is mirrored in short form in [SKILL.md](../SKILL.md).
 
+## v2.7.2 (2026-10-21)
+
+API_KEY data-plane endpoint override — companion to the v2.7.1 control-plane `endpoint` fix.
+
+### New capability
+
+- **`--stream-endpoint` / `DATA_AGENT_STREAM_ENDPOINT`: API_KEY data-plane (stream gateway) endpoint override.** Consulted only in API_KEY mode, for the two stream-gateway actions (`SendChatMessage` / `GetChatContent`, both direct HTTP and SSE); the default is unchanged (`dataagent-stream-{region}.aliyuncs.com/apikey`) and it is ignored under AK/SK auth. Point it alongside `DATA_AGENT_ENDPOINT` at the non-public gateway hosts (e.g. pre-release `pre-dataagent-stream.aliyuncs.com/apikey`) — without it, API_KEY streaming against such gateways goes to the public region host and fails with `Invalid ApiKey`.
+
 ## v2.7.1 (2026-10-21)
 
 Regression-matrix hardening: six fixes ([REGRESSION.md](REGRESSION.md)).

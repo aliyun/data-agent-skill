@@ -14,13 +14,14 @@ domain: AIOps
 ---
 metadata:
   author: DataAgent Team
-  version: "2.7.1"
+  version: "2.7.2"
 ---
 
 # Changelog
 
 One line per version — the detail lives in [CHANGELOG.md](references/CHANGELOG.md).
 
+- **v2.7.2**: API_KEY data-plane (stream gateway) endpoint override — `--stream-endpoint` / `DATA_AGENT_STREAM_ENDPOINT`.
 - **v2.7.1**: Regression-matrix hardening: six fixes — analysis failures no longer fake success, `attach -q` keeps monitoring after a confirmation, API_KEY business failures render their real code/message, credentials-file AK works for every consumer, API_KEY endpoint routing fixed, API_KEY SSE wire repaired.
 - **v2.7.0**: `db` / `file` create the session implicitly via the first SendChatMessage on a shared send path; data sources unify on `DataSources`; `send --session-mode`; new read-only `status` subcommand; session-status normalization.
 - **v2.6.1**: `DataSources` database entries always carry `DmsDatabaseId` (`--dms-db-id` required, fail-fast); `--dms-db-id` flag on `send` / `legacy-send`.
@@ -90,7 +91,8 @@ This Skill supports three authentication modes: Alibaba Cloud default credential
 | `DATA_AGENT_DMS_UNIT` | DMSUnit override (alias `DATA_AGENT_DMSUNIT`) | auto-resolved |
 | `DATA_AGENT_WORKSPACE_ID` | Default workspace ID | auto personal workspace |
 | `DATA_AGENT_CUSTOM_AGENT_ID` | Default custom agent ID | — |
-| `DATA_AGENT_ENDPOINT` | Custom endpoint | auto-generated |
+| `DATA_AGENT_ENDPOINT` | Custom endpoint (control plane) | auto-generated |
+| `DATA_AGENT_STREAM_ENDPOINT` | API_KEY data-plane (stream) endpoint override | `dataagent-stream-{region}.aliyuncs.com/apikey` |
 | `DATA_AGENT_DMS_ENTERPRISE_ENDPOINT` | dms-enterprise host for discovery APIs (not covered by `DATA_AGENT_ENDPOINT`); set for VPC-only egress | `dms-enterprise.{region}.aliyuncs.com` |
 | `DATA_AGENT_TIMEOUT` | Request timeout (seconds) | `300` |
 | `DATA_AGENT_MAX_RETRY` | Max retry attempts | `3` |
@@ -171,7 +173,7 @@ python3 scripts/data_agent_cli.py <command> [options]
 | `workspace` | List available workspaces |
 | `agent` | List / describe / create / update / publish custom agents |
 
-Common options: `--region` (default `DATA_AGENT_REGION` or `cn-hangzhou`), `--endpoint` (explicit gateway override, defaults derived from region), `--workspace-id`, `--custom-agent-id`, `--session-mode`, `--plan-mode`, `--output summary|detail|raw`, `--async-run`.
+Common options: `--region` (default `DATA_AGENT_REGION` or `cn-hangzhou`), `--endpoint` (explicit gateway override, defaults derived from region), `--stream-endpoint` (API_KEY stream-gateway override, ignored under AK/SK), `--workspace-id`, `--custom-agent-id`, `--session-mode`, `--plan-mode`, `--output summary|detail|raw`, `--async-run`.
 
 ### Core Concepts
 

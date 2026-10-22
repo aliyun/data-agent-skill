@@ -24,12 +24,18 @@ from cli.cmd_agent import cmd_agent
 
 
 def _add_common_endpoint(parent: argparse.ArgumentParser) -> None:
-    """Register the shared --endpoint override on a subparser parent."""
+    """Register the shared --endpoint overrides on a subparser parent."""
     parent.add_argument(
         "--endpoint",
         default=None,
         metavar="HOST",
         help="Explicit API gateway endpoint override (defaults derived from region; also settable via DATA_AGENT_ENDPOINT)",
+    )
+    parent.add_argument(
+        "--stream-endpoint",
+        default=None,
+        metavar="HOST",
+        help="API_KEY data-plane (stream) endpoint override, e.g. pre gateways; ignored under AK/SK (also settable via DATA_AGENT_STREAM_ENDPOINT)",
     )
 
 
@@ -945,10 +951,12 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # Propagate an explicit --endpoint before any component reads the
-    # environment; worker subprocesses inherit it automatically.
+    # Propagate explicit overrides before any component reads the
+    # environment; worker subprocesses inherit them automatically.
     if getattr(args, "endpoint", None):
         os.environ["DATA_AGENT_ENDPOINT"] = args.endpoint
+    if getattr(args, "stream_endpoint", None):
+        os.environ["DATA_AGENT_STREAM_ENDPOINT"] = args.stream_endpoint
 
     try:
         args.func(args)

@@ -475,12 +475,12 @@ class DataAgentClient:
         # "Invalid Action" on the stream gateway.
         data_plane_actions = ['SendChatMessage', 'GetChatContent']
 
-        # Choose the correct endpoint based on the action type. The control
-        # plane honors the configured ``endpoint`` override (non-public
-        # gateways such as the pre deployments); the data plane uses the
-        # region-derived public stream host.
+        # Choose the correct endpoint based on the action type. Both honor the
+        # configured overrides (``endpoint`` for the control plane,
+        # ``stream_endpoint`` for the data plane) so API_KEY traffic can target
+        # non-public gateways; the defaults match the region-derived public hosts.
         if action in data_plane_actions:
-            base_endpoint = f"dataagent-stream-{self._config.region}.aliyuncs.com/apikey"
+            base_endpoint = self._config.resolve_api_key_stream_endpoint()
         else:
             base_endpoint = self._config.endpoint
 

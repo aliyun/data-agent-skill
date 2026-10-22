@@ -205,8 +205,8 @@ class SSEClient:
     ) -> Iterator[SSEEvent]:
         """Stream with API_KEY authentication."""
         # GetChatContent is a data-plane API served by the stream gateway
-        # (region-derived public default).
-        base_endpoint = f"dataagent-stream-{self._config.region}.aliyuncs.com/apikey"
+        # (region-derived public default, overridable via stream_endpoint).
+        base_endpoint = self._config.resolve_api_key_stream_endpoint()
         url = f"https://{base_endpoint}"
 
         # Build request body. AgentId is deliberately omitted: on the API-key
@@ -554,8 +554,8 @@ class AsyncSSEClient:
     ) -> AsyncIterator[SSEEvent]:
         """Async stream with API_KEY authentication."""
         # GetChatContent is a data-plane API served by the stream gateway
-        # (region-derived public default).
-        base_endpoint = f"dataagent-stream-{self._config.region}.aliyuncs.com/apikey"
+        # (region-derived public default, overridable via stream_endpoint).
+        base_endpoint = self._config.resolve_api_key_stream_endpoint()
         url = f"https://{base_endpoint}"
 
         # Build request body. AgentId is deliberately omitted: on the API-key
