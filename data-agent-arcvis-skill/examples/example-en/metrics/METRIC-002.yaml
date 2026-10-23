@@ -1,0 +1,27 @@
+metric_id: METRIC-002
+metric_name: Sales Target Achievement Rate
+type: ratio
+format: percentage
+definition: Monthly sales ÷ monthly target, measuring target completion; >= 1.0 counts as met
+when_to_use: |
+  - Monthly achievement diagnosis: judge whether targets are met at overall or track granularity
+  - Accountability: locate unmet entities track by track (detail sorted by achievement rate ascending)
+  - Not applicable: cumulative multi-month achievement (a separate cumulative definition is required); this metric is a rate and cannot be averaged across tracks / months
+numerator: {table: track_sales_month, measure: Sales}
+denominator: {table: track_target_month, measure: Target}
+cross_table: {no_join: true, align_dimensions: [Month, Track]}
+thresholds:
+  - {verdict: Met, condition: ">= 1.0"}
+  - {verdict: Missed, condition: "< 1.0"}
+exceptions:
+  - denominator is 0 or NULL → record the result as "—", excluded from ranking and verdicts
+  - the target table lacks the track's row for the month → list the track on a separate "—" row; never compute an achievement rate against target 0
+  - sales_qty is NULL (no invoiced activity) → not counted, per the [METRIC-001] semantics
+notes: ratios are non-additive — when switching granularity, aggregate the numerator and denominator first, then divide; never SUM/AVG the achievement rate itself
+authority: truth
+sql_template: |
+  SELECT
+    (SELECT SUM(sales_qty) FROM track_sales_month WHERE biz_month = '{month}') /
+    NULLIF((SELECT SUM(target_qty) FROM track_target_month WHERE biz_month = '{month}'), 0) AS achievement_rate
+parameters:
+  - {name: month, example: "202512"}

@@ -1,0 +1,24 @@
+{
+  "report_month": "202512",
+  "headline": "数字单曲渠道贡献近六成，整体达成承压，未达标曲目集中在目标偏高的新发行侧。",
+  "highlights": [
+    {"text": "数字单曲渠道贡献过半销量，为当月结构基本盘"},
+    {"text": "整体销量达成未过线，未达标曲目占参与判定曲目的多数"},
+    {"text": "达成率靠后的曲目多为目标设定偏高的新发行曲目，建议复核目标基准"}
+  ],
+  "channel_rows": [
+    {"channel": "数字单曲", "sales_qty": 58000, "sales_amount": 116000.00, "share_pct": 0.58},
+    {"channel": "数字专辑", "sales_qty": 30000, "sales_amount": 450000.00, "share_pct": 0.30},
+    {"channel": "会员单曲包", "sales_qty": 12000, "sales_amount": 12000.00, "share_pct": 0.12}
+  ],
+  "track_rows": [
+    {"track_id": "T0107", "track_name": "目光之外", "sales_qty": 4800, "target_qty": 12000, "achievement": 0.4000, "verdict": "未达标"},
+    {"track_id": "T0058", "track_name": "潮汐信笺", "sales_qty": 6150, "target_qty": 12000, "achievement": 0.5125, "verdict": "未达标"},
+    {"track_id": "T0012", "track_name": "星轨漫游", "sales_qty": 8400, "target_qty": 14000, "achievement": 0.6000, "verdict": "未达标"},
+    {"track_id": "T0031", "track_name": "晚风电台", "sales_qty": 9900, "target_qty": 15000, "achievement": 0.6600, "verdict": "未达标"},
+    {"track_id": "T0044", "track_name": "银河修理员", "sales_qty": 13550, "target_qty": 16500, "achievement": 0.8212, "verdict": "未达标"},
+    {"track_id": "T0072", "track_name": "无人便利店", "sales_qty": 15300, "target_qty": 18000, "achievement": 0.8500, "verdict": "未达标"},
+    {"track_id": "T0009", "track_name": "城市候鸟", "sales_qty": 18900, "target_qty": 21000, "achievement": 0.9000, "verdict": "未达标"},
+    {"track_id": "T0001", "track_name": "夏夜频率", "sales_qty": 23000, "target_qty": 21000, "achievement": 1.0952, "verdict": "达标"}
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Music-Retail Monthly Sales Report Data",
+  "type": "object",
+  "properties": {
+    "report_month": {
+      "type": "string",
+      "description": "Reporting month, yyyyMM string (e.g. 202512), same month as the two on-disk details"
+    },
+    "headline": {
+      "type": "string",
+      "description": "One-sentence overview: a directional summary of this month's structural and achievement conclusions; writing concrete sales/achievement numbers by hand is forbidden (all numbers are shown by the page's KPI cards)"
+    },
+    "highlights": {
+      "type": "array",
+      "description": "Monthly highlights, 2~4 items",
+      "items": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "One highlight: a directional description of the channel or achievement dimension; channel/track names may be cited, but writing concrete numbers by hand is forbidden"
+          }
+        },
+        "required": ["text"]
+      }
+    },
+    "channel_rows": {
+      "type": "array",
+      "description": "Channel sales distribution ($read direct-read of channel_sales_distribution.csv), descending by sales",
+      "items": {
+        "type": "object",
+        "properties": {
+          "channel": {"type": "string", "description": "Channel name: Digital Singles / Digital Albums / Membership Single Bundle"},
+          "sales_qty": {"type": "number", "description": "Monthly sales (copies)"},
+          "sales_amount": {"type": "number", "description": "Monthly revenue (CNY)"},
+          "share_pct": {"type": "number", "description": "Sales share, decimal between 0 and 1"}
+        },
+        "required": ["channel", "sales_qty", "sales_amount", "share_pct"]
+      },
+      "x-direct-read-allowed": {
+        "orient": "records",
+        "column_map": {
+          "Channel": "channel",
+          "Sales Qty": "sales_qty",
+          "Revenue": "sales_amount",
+          "Sales Share": "share_pct"
+        }
+      }
+    },
+    "track_rows": {
+      "type": "array",
+      "description": "Track achievement detail ($read direct-read of track_achievement_detail.csv), achievement rate ascending",
+      "items": {
+        "type": "object",
+        "properties": {
+          "track_id": {"type": "string", "description": "Track ID, e.g. T0107"},
+          "track_name": {"type": "string", "description": "Track name"},
+          "sales_qty": {"type": "number", "description": "Monthly sales (copies)"},
+          "target_qty": {"type": "number", "description": "Monthly target (copies)"},
+          "achievement": {
+            "type": ["number", "string"],
+            "description": "Achievement rate (decimal, typically 0~2); the string \"—\" when the target is missing"
+          },
+          "verdict": {"type": "string", "description": "Met / Missed / — (missing target)"}
+        },
+        "required": ["track_id", "track_name", "sales_qty", "target_qty", "achievement", "verdict"]
+      },
+      "x-direct-read-allowed": {
+        "orient": "records",
+        "column_map": {
+          "Track ID": "track_id",
+          "Track Name": "track_name",
+          "Monthly Sales": "sales_qty",
+          "Monthly Target": "target_qty",
+          "Achievement Rate": "achievement",
+          "Verdict": "verdict"
+        }
+      }
+    }
+  },
+  "required": ["report_month", "headline", "highlights", "channel_rows", "track_rows"]
+}

@@ -1,0 +1,34 @@
+table_name: track_target_month
+business_description: Track monthly target table, assigning sales targets by month × track (covering the full catalog of listed tracks)
+granularity: one row = the sales target of one track (track_id) for one month (biz_month)
+columns:
+  - column_name: biz_month
+    type: string
+    meaning: business month
+    time_format: "yyyyMM, e.g. 202512 (stored as a string, not a date type)"
+    null_representation: no NULLs
+    data_distribution: "202501 ~ 202512, 12 months in total"
+    authority: truth
+  - column_name: track_id
+    type: string
+    meaning: track ID
+    null_representation: no NULLs
+    data_distribution: "T0001 ~ T0120, 120 tracks in total (covering the full catalog of listed tracks)"
+    authority: truth
+  - column_name: track_name
+    type: string
+    meaning: track name
+    null_representation: no NULLs
+    data_distribution: "one-to-one with track_id"
+    authority: truth
+  - column_name: target_qty
+    type: bigint
+    meaning: monthly sales target (copies)
+    null_representation: no NULLs (tracks without an assigned target have no row; record "—" in verdicts)
+    data_distribution: "min=3000, p50=9000, p95=18000, max=22000"
+    authority: truth
+dimensions:
+  - {name: Month, column: biz_month, type: time, granularity: month, nullable: false, authority: truth}
+  - {name: Track, column: track_id, type: categorical, nullable: false, authority: truth}
+measures:
+  - {name: Target, aggregation: SUM, column: target_qty, additivity: fully additive, authority: truth}

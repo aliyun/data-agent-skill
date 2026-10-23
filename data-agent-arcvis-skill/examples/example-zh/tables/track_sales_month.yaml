@@ -1,0 +1,51 @@
+table_name: track_sales_month
+business_description: 曲目月度销量事实表，按月×曲目×渠道统计数字音乐付费销量与收入
+granularity: 一行 = 某月(biz_month) 的 某曲目(track_id) 在某渠道(channel_name) 的销量汇总
+columns:
+  - column_name: biz_month
+    type: string
+    meaning: 业务月份
+    time_format: "yyyyMM，如 202512（字符串存储，非 date 类型）"
+    null_representation: 无空值
+    data_distribution: "202501 ~ 202512，共 12 个月"
+    authority: 真理
+  - column_name: track_id
+    type: string
+    meaning: 曲目编号
+    null_representation: 无空值
+    data_distribution: "T0001 ~ T0120，共 120 个曲目（与目标表曲目全集一致）"
+    authority: 真理
+  - column_name: track_name
+    type: string
+    meaning: 曲目名称
+    null_representation: 无空值
+    data_distribution: "与 track_id 一一对应"
+    authority: 真理
+  - column_name: channel_name
+    type: string
+    meaning: 销售渠道
+    null_representation: 无空值
+    enum_distribution:
+      - {value: 数字单曲, ratio: 58%}
+      - {value: 数字专辑, ratio: 30%}
+      - {value: 会员单曲包, ratio: 12%}
+    authority: 真理
+  - column_name: sales_qty
+    type: bigint
+    meaning: 当月销量份数
+    null_representation: "NULL 表示该渠道当月未开票（≠ 0；0 表示确认零销量）"
+    data_distribution: "min=0, p50=180, p95=2400, max=9800；NULL 占 2%"
+    authority: 真理
+  - column_name: sales_amount
+    type: decimal(18,2)
+    meaning: 当月销售收入（元）
+    null_representation: "NULL 表示该渠道当月未开票（≠ 0）"
+    data_distribution: "min=0.00, p50=360.00, p95=36000.00, max=147000.00；NULL 占 2%"
+    authority: 真理
+dimensions:
+  - {name: 月份, column: biz_month, type: 时间, granularity: 月, nullable: false, authority: 真理}
+  - {name: 曲目, column: track_id, type: 分类, nullable: false, authority: 真理}
+  - {name: 渠道, column: channel_name, type: 分类, nullable: false, authority: 真理}
+measures:
+  - {name: 销量, aggregation: SUM, column: sales_qty, additivity: 完全可加, authority: 真理}
+  - {name: 收入, aggregation: SUM, column: sales_amount, additivity: 完全可加, authority: 真理}

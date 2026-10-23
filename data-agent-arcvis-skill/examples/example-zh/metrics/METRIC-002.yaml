@@ -1,0 +1,27 @@
+metric_id: METRIC-002
+metric_name: 销量达成率
+type: 比值
+format: 百分比
+definition: 当月销量 ÷ 当月目标量，衡量销售目标的完成程度；>= 1.0 即达标
+when_to_use: |
+  - 月度达成诊断：整体或曲目粒度判断目标是否完成
+  - 责任定位：按曲目逐个定位未达成主体（明细按达成率升序）
+  - 不适用：跨月累计达成（须另行定义累计口径）；本指标是率，不能跨曲目 / 跨月求平均
+numerator: {table: track_sales_month, measure: 销量}
+denominator: {table: track_target_month, measure: 目标}
+cross_table: {no_join: true, align_dimensions: [月份, 曲目]}
+thresholds:
+  - {verdict: 达标, condition: ">= 1.0"}
+  - {verdict: 未达标, condition: "< 1.0"}
+exceptions:
+  - 分母为 0 或 NULL → 结果记 "—"，不参与排名与判定
+  - 目标表缺该曲目当月数据 → 该曲目单列 "—" 行，禁止按目标 0 计算达成率
+  - sales_qty 为 NULL（未开票）→ 沿用 [METRIC-001] 口径不计数
+notes: 率类非可加——换粒度时先聚合分子、分母再相除，绝不能对达成率本身 SUM/AVG
+authority: 真理
+sql_template: |
+  SELECT
+    (SELECT SUM(sales_qty) FROM track_sales_month WHERE biz_month = '{月份}') /
+    NULLIF((SELECT SUM(target_qty) FROM track_target_month WHERE biz_month = '{月份}'), 0) AS 销量达成率
+parameters:
+  - {name: 月份, example: "202512"}

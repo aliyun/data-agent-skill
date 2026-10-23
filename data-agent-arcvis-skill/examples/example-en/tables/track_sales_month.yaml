@@ -1,0 +1,51 @@
+table_name: track_sales_month
+business_description: Track monthly sales fact table, aggregating digital music paid sales and revenue by month × track × channel
+granularity: one row = the sales aggregate of one track (track_id) in one channel (channel_name) for one month (biz_month)
+columns:
+  - column_name: biz_month
+    type: string
+    meaning: business month
+    time_format: "yyyyMM, e.g. 202512 (stored as a string, not a date type)"
+    null_representation: no NULLs
+    data_distribution: "202501 ~ 202512, 12 months in total"
+    authority: truth
+  - column_name: track_id
+    type: string
+    meaning: track ID
+    null_representation: no NULLs
+    data_distribution: "T0001 ~ T0120, 120 tracks in total (identical to the full track set in the target table)"
+    authority: truth
+  - column_name: track_name
+    type: string
+    meaning: track name
+    null_representation: no NULLs
+    data_distribution: "one-to-one with track_id"
+    authority: truth
+  - column_name: channel_name
+    type: string
+    meaning: sales channel
+    null_representation: no NULLs
+    enum_distribution:
+      - {value: Digital Singles, ratio: 58%}
+      - {value: Digital Albums, ratio: 30%}
+      - {value: Membership Single Bundle, ratio: 12%}
+    authority: truth
+  - column_name: sales_qty
+    type: bigint
+    meaning: monthly sales volume (copies)
+    null_representation: "NULL means the channel had no invoiced activity that month (≠ 0; 0 means confirmed zero sales)"
+    data_distribution: "min=0, p50=180, p95=2400, max=9800; NULL accounts for 2%"
+    authority: truth
+  - column_name: sales_amount
+    type: decimal(18,2)
+    meaning: monthly sales revenue (CNY)
+    null_representation: "NULL means the channel had no invoiced activity that month (≠ 0)"
+    data_distribution: "min=0.00, p50=360.00, p95=36000.00, max=147000.00; NULL accounts for 2%"
+    authority: truth
+dimensions:
+  - {name: Month, column: biz_month, type: time, granularity: month, nullable: false, authority: truth}
+  - {name: Track, column: track_id, type: categorical, nullable: false, authority: truth}
+  - {name: Channel, column: channel_name, type: categorical, nullable: false, authority: truth}
+measures:
+  - {name: Sales, aggregation: SUM, column: sales_qty, additivity: fully additive, authority: truth}
+  - {name: Revenue, aggregation: SUM, column: sales_amount, additivity: fully additive, authority: truth}

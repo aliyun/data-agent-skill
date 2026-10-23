@@ -1,0 +1,3 @@
+report_schema = "standalone"
+schema_version = "1"
+description = "Music-retail monthly sales report template: overall KPIs, channel-mix bars, track achievement detail table; both details are $read direct-reads of objective on-disk outputs (channel_sales_distribution.csv / track_achievement_detail.csv), no metrics.jsonl exception channel"
