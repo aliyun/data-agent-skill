@@ -320,3 +320,26 @@ Read-only query of a session's current state — cheap to run anytime, no stream
 ```bash
 python3 scripts/data_agent_cli.py status --session-id <SESSION_ID>
 ```
+
+---
+
+## runtime release — Refresh Runtime Resources (Destructive)
+
+Release only the runtime instance belonging to the currently authenticated sub-account. This manages runtime resources, not custom-agent definitions. **Running sessions become unavailable.** Use cautiously and obtain explicit approval for the disruption; do not use as an automatic recovery step or after every custom-agent update.
+
+```bash
+# Show the warning without sending any request (exit code 2).
+python3 scripts/data_agent_cli.py runtime release
+
+# Only after checking the current credentials/region and approving the impact:
+python3 scripts/data_agent_cli.py runtime release --yes
+```
+
+| Parameter | Description |
+|------|------|
+| `--yes` / `-y` | Required to send the release request; confirms the disruption to running sessions |
+| `--endpoint` | Optional control-plane gateway override; also settable via `DATA_AGENT_ENDPOINT` |
+
+No instance, session, workspace or custom-agent ID is accepted. Credentials and region follow the normal environment configuration (`DATA_AGENT_REGION`, default `cn-hangzhou`); verify the selected credentials-file environment/profile when using multiple accounts.
+
+After release, start a **new** analysis with `db`, `file` or `send` to provision the latest runtime resources. This command does not provision a replacement, verify readiness or resume interrupted sessions. Read-only `status` and progress-only `attach` do not trigger provisioning. A failed or ambiguous release is reported as an error and is not automatically retried.

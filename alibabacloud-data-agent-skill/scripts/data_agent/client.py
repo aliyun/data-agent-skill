@@ -653,6 +653,29 @@ class DataAgentClient:
 
         raise ApiError(message, code=code, request_id=request_id)
 
+    def delete_data_agent(self) -> dict:
+        """Release the runtime instance belonging to the authenticated caller.
+
+        No business parameters are required; DMSUnit is deprecated and omitted.
+        Running sessions become unavailable. Starting a new analysis afterwards
+        provisions the latest runtime resources; this call does not provision them.
+        """
+        # Do not retry an identity-scoped deletion: an ambiguous first result
+        # could otherwise cause a retry to release a newly provisioned runtime.
+        response = self._call_api(
+            action="DeleteDataAgent",
+            version="2025-04-14",
+            params={},
+        )
+        if str(response.get("success", "")).lower() != "true":
+            raise ApiError(
+                response.get("errorMessage") or response.get("message")
+                or "DeleteDataAgent did not confirm success.",
+                code=response.get("errorCode") or response.get("code") or "Unknown",
+                request_id=response.get("requestId"),
+            )
+        return response
+
     @retry_on_error(max_retries=3)
     def create_session(
         self,
@@ -1707,6 +1730,10 @@ class AsyncDataAgentClient:
             None,
             functools.partial(func, *args, **kwargs),
         )
+
+    async def delete_data_agent(self) -> dict:
+        """Release the caller's runtime asynchronously; running sessions become unavailable."""
+        return await self._run_in_executor(self._sync_client.delete_data_agent)
 
     async def create_session(
         self,

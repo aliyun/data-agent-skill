@@ -13,6 +13,7 @@ from cli.cmd_ls import cmd_ls
 from cli.cmd_file import cmd_file
 from cli.cmd_attach import cmd_attach
 from cli.cmd_cancel import cmd_cancel
+from cli.cmd_runtime import cmd_runtime_release
 from cli.cmd_status import cmd_status
 from cli.cmd_upload import cmd_upload
 from cli.cmd_send import cmd_send, cmd_send_legacy
@@ -582,6 +583,40 @@ Mode Description:
         help="Workspace ID if the session is workspace-bound",
     )
     cancel_parser.set_defaults(func=cmd_cancel)
+
+    # Runtime resources are separate from custom-agent definitions (agent).
+    runtime_parser = subparsers.add_parser(
+        "runtime",
+        help="Manage the current caller's runtime resources (destructive)",
+    )
+    runtime_actions = runtime_parser.add_subparsers(dest="runtime_action", required=True)
+    release_parser = runtime_actions.add_parser(
+        "release",
+        help="Release your runtime; running sessions become unavailable",
+        description=(
+            "Release only the runtime instance belonging to the authenticated sub-account.\n"
+            "WARNING: Running sessions will become unavailable. Use cautiously.\n"
+            "No instance, session, workspace or custom-agent ID is accepted.\n"
+            "After release, start a new analysis to provision the latest resources;\n"
+            "this command does not restart the runtime or resume interrupted sessions.\n\n"
+            "No request is sent unless --yes is explicitly supplied.\n"
+            "Example:\n"
+            "  python3 scripts/data_agent_cli.py runtime release --yes"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    release_parser.add_argument(
+        "--endpoint",
+        default=None,
+        metavar="HOST",
+        help="Control-plane endpoint override (or DATA_AGENT_ENDPOINT)",
+    )
+    release_parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Confirm that running sessions will become unavailable",
+    )
+    release_parser.set_defaults(func=cmd_runtime_release)
 
     # -- status subcommand --
     status_parser = subparsers.add_parser(

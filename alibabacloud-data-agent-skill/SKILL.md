@@ -21,6 +21,7 @@ metadata:
 
 One line per version — the detail lives in [CHANGELOG.md](references/CHANGELOG.md).
 
+- **Unreleased**: `runtime release --yes` explicitly releases the caller's runtime for a resource refresh; running sessions become unavailable.
 - **v2.7.2**: API_KEY data-plane (stream gateway) endpoint override — `--stream-endpoint` / `DATA_AGENT_STREAM_ENDPOINT`.
 - **v2.7.1**: Regression-matrix hardening: six fixes — analysis failures no longer fake success, `attach -q` keeps monitoring after a confirmation, API_KEY business failures render their real code/message, credentials-file AK works for every consumer, API_KEY endpoint routing fixed, API_KEY SSE wire repaired.
 - **v2.7.0**: `db` / `file` create the session implicitly via the first SendChatMessage on a shared send path; data sources unify on `DataSources`; `send --session-mode`; new read-only `status` subcommand; session-status normalization.
@@ -170,6 +171,7 @@ python3 scripts/data_agent_cli.py <command> [options]
 | `status` | Read-only session status query — status / title / mode; WAIT_INPUT sessions get the attach confirmation guidance |
 | `reports` | List and download session-generated reports / charts |
 | `cancel` | Cancel a running session |
+| `runtime release` | Release only the authenticated caller's runtime; requires `--yes`, makes running sessions unavailable |
 | `workspace` | List available workspaces |
 | `agent` | List / describe / create / update / publish custom agents |
 
@@ -314,6 +316,20 @@ python3 scripts/data_agent_cli.py cancel --session-id <SESSION_ID>
 ```
 
 Cancels a running analysis session (agent ID is resolved automatically). Use it to clean up test sessions or stop long-running tasks that are no longer needed.
+
+---
+
+## Refresh Runtime Resources (Destructive)
+
+`runtime release` releases only the runtime instance belonging to the currently authenticated sub-account, not a custom-agent definition. **Running sessions become unavailable.** Use it cautiously when a runtime refresh is necessary to pick up the latest resources.
+
+**Never invoke it as an automatic troubleshooting step or as part of a routine custom-agent update. Explain the disruption and obtain explicit user approval before passing `--yes`.** Check the active credentials and region first; there is no target instance or session ID to narrow the impact.
+
+```bash
+python3 scripts/data_agent_cli.py runtime release --yes
+```
+
+Without `--yes`, no request is sent. After release, start a **new** analysis with `db`, `file` or `send` to provision the latest runtime resources. Release alone does not restart the runtime, verify readiness or resume interrupted sessions; read-only progress monitoring does not provision a replacement.
 
 ---
 
