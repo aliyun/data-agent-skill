@@ -14,14 +14,14 @@ domain: AIOps
 ---
 metadata:
   author: DataAgent Team
-  version: "2.7.2"
+  version: "2.7.3"
 ---
 
 # Changelog
 
 One line per version — the detail lives in [CHANGELOG.md](references/CHANGELOG.md).
 
-- **Unreleased**: `runtime release --yes` explicitly releases the caller's runtime for a resource refresh; running sessions become unavailable.
+- **v2.7.3**: `runtime release --yes` explicitly releases the caller's runtime for a resource refresh; running sessions become unavailable.
 - **v2.7.2**: API_KEY data-plane (stream gateway) endpoint override — `--stream-endpoint` / `DATA_AGENT_STREAM_ENDPOINT`.
 - **v2.7.1**: Regression-matrix hardening: six fixes — analysis failures no longer fake success, `attach -q` keeps monitoring after a confirmation, API_KEY business failures render their real code/message, credentials-file AK works for every consumer, API_KEY endpoint routing fixed, API_KEY SSE wire repaired.
 - **v2.7.0**: `db` / `file` create the session implicitly via the first SendChatMessage on a shared send path; data sources unify on `DataSources`; `send --session-mode`; new read-only `status` subcommand; session-status normalization.

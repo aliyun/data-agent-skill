@@ -2,7 +2,7 @@
 
 Full version history of the Data Agent CLI skill. The latest entry is mirrored in short form in [SKILL.md](../SKILL.md).
 
-## Unreleased
+## v2.7.3 (2026-10-27)
 
 - Added `runtime release --yes` for explicitly releasing the runtime instance belonging to the authenticated caller. It is separate from custom-agent configuration management and invalidates running sessions. The command refuses to send a request without confirmation; starting a new analysis afterwards provisions the latest runtime resources, while release alone does not restart or verify them.
 - Added synchronous and asynchronous `delete_data_agent()` client methods for `DeleteDataAgent` (`2025-04-14`, POST), with an empty business-parameter payload. The deprecated `DMSUnit` is neither resolved nor sent; no instance/session/workspace/custom-agent ID is accepted. Business failures retain their code, message and request ID. No automatic retries are performed because identity-scoped deletion has no idempotency token and could otherwise release a newly provisioned runtime after an ambiguous response.
