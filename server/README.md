@@ -5,14 +5,14 @@ native `data_agent_*` tools: 19 with the gateway disabled, 28 with its nine base
 metadata tools, or 30 with P2b's two read-only control-plane data-source summary
 tools also enabled (11 gateway tools, before host-side filtering).
 Historical P2a/P2b automated and cloud checks passed for the tested identities
-and 19/28/30 configurations **before security remediation**. The
-[security remediation implementation](SECURITY_REMEDIATION_SPEC.md) is complete
-locally. Final native binaries passed real-cloud metadata checks across three
-transports and all three configurations, plus protocol-boundary, dacli, and
-same-role cross-user local-history checks. A two-turn analysis completed, but its
-strict follow-up marker assertion failed. Deployment, real JWT-platform, and
-differential-role release gates remain **unverified**; these bounded checks are
-not production validation. See the security spec, section 9, for current evidence.
+and 19/28/30 configurations **before security remediation**. The security
+remediation implementation is complete locally. Final native binaries passed
+real-cloud metadata checks across three transports and all three configurations,
+plus protocol-boundary, dacli, and same-role cross-user local-history checks.
+A two-turn analysis completed, but its strict follow-up marker assertion failed.
+Deployment, real JWT-platform, and differential-role release gates remain
+**unverified**; these bounded checks are not production validation. Follow the
+[release checklist](../alibabacloud-data-agent-mcp-skill/references/INSTALLATION.md#post-remediation-release-gate--not-yet-verified).
 This directory is a standalone Go project; the
 distributable skill wrapper lives in
 [`../alibabacloud-data-agent-mcp-skill/`](../alibabacloud-data-agent-mcp-skill/)
@@ -49,9 +49,8 @@ Verify the actual compiler is **Go 1.26.10 or newer, supported and rescanned**;
 rebuild Server, dacli and every target-platform artifact. Inspect `go version -m`
 and run source and binary govulncheck, full tests/race/vet/mod verification and
 bounded fuzzing as listed in the [release gate](../alibabacloud-data-agent-mcp-skill/references/INSTALLATION.md#post-remediation-release-gate--not-yet-verified).
-Changing a version declaration does not fix an old binary. Current local results
-and remaining deployment gates are recorded in the security Spec; rerun checks
-for the exact artifacts being deployed.
+Changing a version declaration does not fix an old binary. Rerun checks for the
+exact artifacts being deployed and retain the results as release evidence.
 
 ## Configure
 

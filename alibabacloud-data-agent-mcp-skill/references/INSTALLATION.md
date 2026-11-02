@@ -321,7 +321,7 @@ No automatic chmod, chown, moving, secret rotation or migration occurs. Obtain e
 
 ### Post-remediation release gate — not yet verified
 
-The [security remediation spec](../../server/SECURITY_REMEDIATION_SPEC.md#9-实施与验证记录2026-11-02) records the implemented local fixes, actual checks and remaining gates. Historical gateway results below/above are not evidence that the remediated deployment passes acceptance. Keep P2b off by default and real configuration, roles, policies and deployments unchanged unless separately authorized.
+The [server README](../../server/README.md) summarizes the implemented local fixes and bounded verification; the release checks below remain mandatory. Historical gateway results below/above are not evidence that the remediated deployment passes acceptance. Keep P2b off by default and real configuration, roles, policies and deployments unchanged unless separately authorized.
 
 Build with **Go 1.26.10 minimum**, or a newer supported and rescanned toolchain. Verify the actual toolchain and rebuild Server, dacli and every target-platform artifact; a changed version declaration or old cached binary is insufficient. From `server/`, the release checks include:
 
@@ -338,7 +338,7 @@ govulncheck -mode=binary bin/data-agent-mcp-server
 govulncheck -mode=binary bin/dacli
 ```
 
-Record actual versions/results, repeat binary checks for each platform artifact, and run bounded path/identity/JSON fuzzing. Distinguish vulnerability findings from scanner execution failure; exit zero alone is not a clean scan. The security Spec records current local results; rerun checks for the exact artifacts being deployed. Keep the pinned x/net v0.62.0 security update as well as Go 1.26.10 or newer.
+Record actual versions/results, repeat binary checks for each platform artifact, and run bounded path/identity/JSON fuzzing. Distinguish vulnerability findings from scanner execution failure; exit zero alone is not a clean scan. Rerun checks for the exact artifacts being deployed and retain the results as release evidence. Keep the pinned x/net v0.62.0 security update as well as Go 1.26.10 or newer.
 
 External gates remain open: real JWT-platform credentials on initialize, continuous SSE, notifications and DELETE with renewal; all enabled Actions through stdio/HTTP/SSE with real SDK/STS; differential roles with an explicit **A-allowed/B-denied** resource (both list non-enumeration and denial by A's known ID); same-role local history/protocol isolation separately from cloud scope; and old read-only analysis/follow-up without duplicate sends. No local signed fixture, equal positive role results or passing unit test substitutes for these gates. Shared denials lacking upstream RequestId remain un-attributed. Do not grant permissions to manufacture a passing result or claim production acceptance while gates are incomplete; see [RAM validation](ram-policies.md#validation-still-required).
 

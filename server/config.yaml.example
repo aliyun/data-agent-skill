@@ -1,6 +1,6 @@
 # Data Agent MCP Server configuration (YAML).
 # Security-remediation implementation is under validation, NOT release acceptance.
-# See README.md and SECURITY_REMEDIATION_SPEC.md before upgrading a deployment.
+# See README.md and its release checklist before upgrading a deployment.
 # Location: $DATA_AGENT_CONFIG > ./config.yaml > ~/.data-agent/config.yaml
 #           > ~/.data-agent/config.json (legacy)
 # Priority: env vars > .env file > this file > defaults.
