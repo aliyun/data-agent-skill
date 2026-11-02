@@ -1,33 +1,23 @@
-// Package tenant maps upstream end-user identities (forwarded as HTTP
-// headers by callers such as Feishu Aily, gateways, or portals) to per-user
-// Alibaba Cloud RAM roles (STS AssumeRole) and manages isolated Data Agent
-// clients and session managers for each tenant.
-//
-// Flow (matches the multi-tenant architecture):
-//
-//	identity headers (user / email / token)  →  group → RAM role ARN
-//	→ AssumeRole via credentials-go ram_role_arn provider (auto-refresh)
-//	→ per-tenant dataagent.Client + session.Manager (own sessions dir)
-//
-// RAM access policies and DMS data permissions attached to the role decide
-// what each user can query; the MCP server itself performs no data-level
-// authorization.
+// Package tenant authenticates remote principals and owns their isolated clients
+// and session managers. Local storage identity is not a cloud authorization ACL.
 package tenant
 
 import (
 	"context"
-	"fmt"
+	"crypto/sha256"
+	"crypto/subtle"
+	"errors"
 	"log"
-	"path/filepath"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
-
-	credential "github.com/aliyun/credentials-go/credentials"
+	"time"
 
 	"github.com/alibabacloud/data-agent-mcp-server/internal/config"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/dataagent"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/session"
+	credential "github.com/aliyun/credentials-go/credentials"
 )
 
 type ctxKey string
@@ -38,15 +28,12 @@ const (
 	ctxKeyToken ctxKey = "identity-token"
 )
 
-// WithIdentity stores the end-user identity headers in the request context.
+// WithIdentity carries untrusted transport values. It does not authenticate.
 func WithIdentity(ctx context.Context, user, email, token string) context.Context {
 	ctx = context.WithValue(ctx, ctxKeyUser, user)
 	ctx = context.WithValue(ctx, ctxKeyEmail, email)
-	ctx = context.WithValue(ctx, ctxKeyToken, token)
-	return ctx
+	return context.WithValue(ctx, ctxKeyToken, token)
 }
-
-// IdentityFromContext extracts the identity previously stored by WithIdentity.
 func IdentityFromContext(ctx context.Context) (user, email, token string) {
 	user, _ = ctx.Value(ctxKeyUser).(string)
 	email, _ = ctx.Value(ctxKeyEmail).(string)
@@ -54,61 +41,53 @@ func IdentityFromContext(ctx context.Context) (user, email, token string) {
 	return
 }
 
-// Tenant bundles the per-user client and session manager.
-type Tenant struct {
-	Key     string // upstream user id (or email fallback)
-	Group   string // identity group name ("default" for the catch-all)
-	RoleArn string
-	Client  *dataagent.Client
-	Manager *session.Manager
-	// Defaults carries the group-level session defaults applied when a tool
-	// call omits them (custom_agent_id, mode).
-	Defaults config.IdentityGroup
+type GatewayCaller struct{ UserID, Email, Group, RoleArn string }
+type gatewayIdentityKey struct{}
 
-	provider credential.Credential // ram_role_arn provider with built-in refresh
-	mu       sync.Mutex
-	snapshot *dataagent.Credential
+func WithGatewayIdentity(ctx context.Context) (context.Context, *GatewayCaller) {
+	caller := &GatewayCaller{}
+	return context.WithValue(ctx, gatewayIdentityKey{}, caller), caller
 }
 
-// currentCredential pulls the current STS credential from the provider.
-// credentials-go caches the AssumeRole result internally and refreshes it
-// ahead of expiry, so this is cheap on the hot path. On provider errors the
-// last known snapshot is returned so in-flight work can proceed.
+type Tenant struct {
+	Key             string // canonical principal ID, never a raw user or role name
+	Group           string
+	RoleArn         string
+	Client          *dataagent.Client
+	Manager         *session.Manager
+	Defaults        config.IdentityGroup
+	provider        credential.Credential
+	mu              sync.Mutex
+	snapshot        *dataagent.Credential
+	roleSessionName string
+	root            *os.Root
+}
+
+// Legacy analysis may retain its same-principal snapshot on refresh failure.
 func (t *Tenant) currentCredential() *dataagent.Credential {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
-	model, err := t.provider.GetCredential()
+	current, err := dataagent.CredentialFromProvider(t.provider)
 	if err != nil {
-		log.Printf("tenant %s: refresh STS credential: %v (using last snapshot)", t.Key, redactCredentials(err.Error()))
+		log.Printf("tenant credential refresh failed (using last snapshot)")
 		return t.snapshot
 	}
-	ak, sk, token := strVal(model.AccessKeyId), strVal(model.AccessKeySecret), strVal(model.SecurityToken)
-	if t.snapshot == nil || t.snapshot.AccessKeyID != ak || t.snapshot.SecurityToken != token {
-		t.snapshot = &dataagent.Credential{
-			AccessKeyID:     ak,
-			AccessKeySecret: sk,
-			SecurityToken:   token,
-		}
+	t.snapshot = current
+	return current
+}
+func (t *Tenant) strictCredential() (*dataagent.Credential, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	current, err := dataagent.CredentialFromProvider(t.provider)
+	if err != nil {
+		return nil, &dataagent.GatewayError{Code: "GATEWAY_CREDENTIAL_ERROR", Message: "Gateway credentials unavailable."}
 	}
-	return t.snapshot
+	t.snapshot = current
+	return current, nil
 }
 
-func strVal(p *string) string {
-	if p == nil {
-		return ""
-	}
-	return *p
-}
-
-// credentialQueryParams matches query-string parameters that must never reach
-// the log. STS AssumeRole (2015-04-01) signs through the query string, so an
-// error from the credentials provider embeds the full URL — including the
-// caller's AccessKeyId and request signature.
 var credentialQueryParams = regexp.MustCompile(`(?i)(AccessKeyId|AccessKeySecret|SecurityToken|Signature)=[^&"\s]*`)
 
-// redactCredentials strips credential-bearing query parameters from text that
-// is about to be logged.
 func redactCredentials(s string) string {
 	return credentialQueryParams.ReplaceAllStringFunc(s, func(m string) string {
 		if i := strings.Index(m, "="); i > 0 {
@@ -118,231 +97,430 @@ func redactCredentials(s string) string {
 	})
 }
 
-// Registry resolves request identities to tenants, creating them lazily.
-type Registry struct {
-	baseCtx context.Context // process-lifetime context for tenant daemons
-	cfg     config.Config
-	base    *dataagent.Credential // long-term AK/SK used to call AssumeRole
+const maxInitializations = 8
+const initializationTimeout = 15 * time.Second
+const maxRestores = 4
 
-	mu      sync.Mutex
-	tenants map[string]*Tenant // keyed by upstream user identity (user id / email)
-
-	// newProviderFn builds the STS credential provider; overridable in tests.
-	newProviderFn func(key, roleArn string) (credential.Credential, error)
+type initialization struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+	auth   verifiedIdentity
+	tenant *Tenant
+	err    error
 }
 
-// NewRegistry creates a tenant registry. base must be a long-term AK/SK
-// credential with sts:AssumeRole permission on the mapped roles. baseCtx
-// scopes the per-tenant background daemons (SSE watchers, housekeeping) to
-// the server process lifetime rather than a single request.
-func NewRegistry(baseCtx context.Context, cfg config.Config, base *dataagent.Credential) *Registry {
-	r := &Registry{baseCtx: baseCtx, cfg: cfg, base: base, tenants: make(map[string]*Tenant)}
+type Registry struct {
+	baseCtx       context.Context
+	cancel        context.CancelFunc
+	cfg           config.Config
+	base          credential.Credential
+	mu            sync.Mutex
+	tenants       map[string]*Tenant
+	inflight      map[string]*initialization
+	closed        bool
+	wg            sync.WaitGroup
+	closeOnce     sync.Once
+	closeErr      error
+	initLimit     int
+	initTimeout   time.Duration
+	restores      chan struct{}
+	newProviderFn func(string, string) (credential.Credential, error)
+	restoreFn     func(context.Context, *session.Manager)
+}
+
+func NewRegistry(baseCtx context.Context, cfg config.Config, base credential.Credential) *Registry {
+	// Freeze mutable configuration collections: no hot-reload or external map
+	// mutation can silently alter a cached authorization context.
+	cfg.ApplyDefaults()
+	if cfg.Identity.MaxTenants == 0 {
+		cfg.Identity.MaxTenants = 128
+	}
+	groups := make(map[string]config.IdentityGroup, len(cfg.Identity.Groups))
+	for name, g := range cfg.Identity.Groups {
+		g.Users = append([]string(nil), g.Users...)
+		groups[name] = g
+	}
+	cfg.Identity.Groups = groups
+	if cfg.Identity.Default != nil {
+		g := *cfg.Identity.Default
+		g.Users = append([]string(nil), g.Users...)
+		cfg.Identity.Default = &g
+	}
+	cfg.Identity.JWT.Secrets = append([]string(nil), cfg.Identity.JWT.Secrets...)
+	prefix := cfg.Identity.Prefix()
+	cfg.Identity.SessionNamePrefix = &prefix
+	ctx, cancel := context.WithCancel(baseCtx)
+	r := &Registry{baseCtx: ctx, cancel: cancel, cfg: cfg, base: base, tenants: map[string]*Tenant{}, inflight: map[string]*initialization{}, initLimit: maxInitializations, initTimeout: initializationTimeout, restores: make(chan struct{}, maxRestores)}
 	r.newProviderFn = r.newRoleProvider
+	r.restoreFn = func(ctx context.Context, m *session.Manager) { m.RestoreSessions(ctx) }
 	return r
 }
 
-// Resolve returns the tenant for the identity carried in ctx.
-//
-// identity.auth_token authenticates every request first, on both paths: it is
-// what proves the call came from the trusted upstream, so it is checked before
-// any identity is read. Identity itself is then resolved:
-//   - a signed JWT (identity.jwt) when the caller sends one — the signature
-//     names the user; and
-//   - the plain identity headers otherwise.
-//
-// Fail-closed rules when identity mode is enabled:
-//   - auth_token configured but the token header is missing/mismatched → error
-//   - a JWT is present but unverifiable → error (never retried against the
-//     headers, which would let a broken token downgrade to the weaker path)
-//   - identity absent and require_identity=true → error
-//   - identity present but no role mapping → error
-//
-// When identity is absent and require_identity=false, (nil, nil) is returned
-// and the caller falls back to the default server identity.
-func (r *Registry) Resolve(ctx context.Context) (*Tenant, error) {
-	// auth_token guards both paths, so it is verified once up front rather than
-	// only inside the header branch.
-	if r.cfg.Identity.AuthToken != "" {
-		if _, _, token := IdentityFromContext(ctx); token != r.cfg.Identity.AuthToken {
-			return nil, fmt.Errorf("identity request rejected: missing or invalid %s header", r.cfg.Identity.Headers.Token)
+// Authenticate performs only token verification, strict identity parsing and
+// per-request mapping. It never creates providers, tenants or disk roots.
+func (r *Registry) Authenticate(ctx context.Context) (context.Context, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if r.baseCtx.Err() != nil {
+		return nil, errClosed
+	}
+	id := r.cfg.Identity
+	user, email, token := IdentityFromContext(ctx)
+	expectedHash, actualHash := sha256.Sum256([]byte(id.AuthToken)), sha256.Sum256([]byte(token))
+	if !id.Enabled || !id.RequireIdentity || strings.TrimSpace(id.AuthToken) == "" || !config.ValidNamespace(id.Namespace) || subtle.ConstantTimeCompare(expectedHash[:], actualHash[:]) != 1 {
+		return nil, errAuthentication
+	}
+	var claims *Claims
+	var err error
+	mode := "headers"
+	if id.JWT.Enabled {
+		mode = "jwt"
+		claims, err = VerifyJWT(JWTFromContext(ctx), id.JWT.AllSecrets()...)
+	} else {
+		claims = &Claims{}
+		claims.UserID, err = config.NormalizeIdentity(user)
+		if err == nil {
+			claims.Email, err = config.NormalizeIdentity(email)
 		}
 	}
-
-	// A signed token is preferred whenever the caller sends one; only its
-	// absence falls through to the headers. A token that is present but
-	// unverifiable is rejected inside resolveFromJWT, so a deliberately broken
-	// token cannot be used to reach the header path.
-	if r.cfg.Identity.JWT.Enabled {
-		if raw := JWTFromContext(ctx); raw != "" {
-			return r.resolveFromJWT(raw)
-		}
-	}
-	return r.resolveFromHeaders(ctx)
-}
-
-// resolveFromJWT verifies the signed identity token and resolves its tenant.
-func (r *Registry) resolveFromJWT(raw string) (*Tenant, error) {
-	claims, err := VerifyJWT(raw, r.cfg.Identity.JWT.AllSecrets()...)
 	if err != nil {
-		return nil, fmt.Errorf("identity request rejected: %w", err)
+		return nil, errAuthentication
 	}
-
-	sessionValue, err := claims.Field(r.cfg.Identity.SessionNameClaim)
+	principal, err := makePrincipal(id.Namespace, mode, claims)
 	if err != nil {
-		return nil, fmt.Errorf("identity request rejected: %w", err)
+		return nil, errAuthentication
 	}
-	// The token is expected to carry whichever claim was configured, so an
-	// empty one is a misconfiguration worth surfacing rather than silently
-	// auditing every user under the same name.
+	sessionValue, err := claims.Field(id.SessionNameClaim)
+	if err != nil {
+		return nil, errAuthentication
+	}
+	// The default audit field follows the same user-id/email subject rule as
+	// Principal. Explicit alternative claims must be present, without fallback.
+	if sessionValue == "" && (id.SessionNameClaim == "" || id.SessionNameClaim == "user_id") {
+		sessionValue = principal.SubjectValue
+	}
 	if sessionValue == "" {
-		return nil, fmt.Errorf("identity request rejected: claim %q selected for the role session name is empty in the token",
-			r.cfg.Identity.SessionNameClaim)
+		return nil, errAuthentication
 	}
-	return r.tenantFor(claims, sessionValue)
-}
-
-// resolveFromHeaders resolves the tenant from the plain identity headers.
-// auth_token has already been checked by Resolve.
-func (r *Registry) resolveFromHeaders(ctx context.Context) (*Tenant, error) {
-	user, email, _ := IdentityFromContext(ctx)
-
-	if user == "" && email == "" {
-		if r.cfg.Identity.RequireIdentity {
-			return nil, fmt.Errorf("identity request rejected: %s/%s header required",
-				r.cfg.Identity.Headers.User, r.cfg.Identity.Headers.Email)
-		}
-		return nil, nil // default identity
-	}
-
-	claims := &Claims{UserID: user, Email: email}
-	sessionValue, err := claims.Field(r.cfg.Identity.SessionNameClaim)
-	if err != nil {
-		return nil, fmt.Errorf("identity request rejected: %w", err)
-	}
-	// The headers only carry a user id and an email, so a claim such as
-	// employee_no has no source here. Fall back to the tenant key rather than
-	// rejecting, which would make this path unusable for a deployment that
-	// picked a JWT-only claim.
-	if sessionValue == "" {
-		sessionValue = identityKey(claims)
-	}
-	return r.tenantFor(claims, sessionValue)
-}
-
-// tenantFor maps a resolved identity to its group and tenant. sessionValue is
-// the already-selected role session name.
-func (r *Registry) tenantFor(claims *Claims, sessionValue string) (*Tenant, error) {
-	// Groups list members by user id or email, so match on those regardless of
-	// which claim was chosen for the session name.
-	groupName, mapped, err := r.cfg.ResolveGroup(claims.UserID, claims.Email)
+	group, mapped, err := r.cfg.ResolveGroup(config.IdentityClaims{AuthMode: mode, TenantID: claims.TenantID, AgentID: claims.AgentID, UserID: claims.UserID, Email: claims.Email})
 	if err != nil {
 		return nil, err
 	}
-	return r.tenant(identityKey(claims), groupName, mapped, sessionValue)
+	auth := &verifiedIdentity{registry: r, principal: *principal, group: group, mapped: mapped, sessionValue: sessionValue, roleSessionName: sessionName(id.Prefix(), sessionValue)}
+	return context.WithValue(ctx, verifiedKey{}, auth), nil
 }
 
-// identityKey is the value tenants are cached and isolated by: the user id,
-// falling back to the email when the upstream sends only that.
-func identityKey(claims *Claims) string {
-	if claims.UserID != "" {
-		return claims.UserID
+// Resolve accepts only Authenticate's private, registry-bound capability. It
+// never trusts raw WithClaims/WithIdentity/WithJWT and never falls back to AK.
+func (r *Registry) Resolve(ctx context.Context) (*Tenant, error) {
+	caller, _ := ctx.Value(gatewayIdentityKey{}).(*GatewayCaller)
+	if caller != nil {
+		*caller = GatewayCaller{}
 	}
-	return claims.Email
-}
-
-// tenant returns the cached tenant for the user or creates it.
-//
-// The cache is keyed by user identity, not group/role: several users may
-// share one RAM role, but each must get its own STS provider so AssumeRole
-// carries that user's RoleSessionName in ActionTrail audit logs, and its own
-// session manager/directory for isolation.
-//
-// sessionValue is the identity field chosen for the RoleSessionName, which is
-// not necessarily the cache key: identity.session_name_claim may select e.g.
-// the employee number while grouping and isolation still key on the user id.
-func (r *Registry) tenant(key, groupName string, mapped config.IdentityGroup, sessionValue string) (*Tenant, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if t, ok := r.tenants[key]; ok {
-		return t, nil
+	auth, _ := ctx.Value(verifiedKey{}).(*verifiedIdentity)
+	if auth == nil || auth.registry != r || !auth.principal.ExpiresAt.IsZero() && !time.Now().Before(auth.principal.ExpiresAt) {
+		return nil, gatewayFailure(caller, errAuthentication)
 	}
-
-	provider, err := r.newProviderFn(sessionValue, mapped.RoleArn)
+	t, err := r.tenant(ctx, auth)
 	if err != nil {
-		return nil, fmt.Errorf("assume role %s for user %s: %w", mapped.RoleArn, key, err)
+		return nil, gatewayFailure(caller, err)
 	}
-
-	t := &Tenant{Key: key, Group: groupName, RoleArn: mapped.RoleArn, Defaults: mapped, provider: provider}
-	// Prime the credential once so misconfigured roles fail fast at first use.
-	if cred := t.currentCredential(); cred == nil {
-		return nil, fmt.Errorf("assume role %s for user %s: no credential returned", mapped.RoleArn, key)
+	if caller != nil {
+		*caller = GatewayCaller{UserID: auth.principal.UserID, Email: auth.principal.Email, Group: auth.group, RoleArn: auth.mapped.RoleArn}
 	}
-
-	opts := []dataagent.ClientOption{dataagent.WithCredentialProvider(t.currentCredential)}
-	if r.cfg.DMSUnit != "" {
-		opts = append(opts, dataagent.WithDMSUnit(r.cfg.DMSUnit))
-	}
-	// Endpoint overrides; empty values keep the region-derived defaults.
-	opts = append(opts,
-		dataagent.WithDataAgentEndpoint(r.cfg.DataAgentEndpoint),
-		dataagent.WithDMSEnterpriseEndpoint(r.cfg.DMSEnterpriseEndpoint),
-		dataagent.WithAPIKeyEndpoint(r.cfg.APIKeyEndpoint),
-		dataagent.WithAPIKeyStreamEndpoint(r.cfg.APIKeyStreamEndpoint),
-	)
-	workspaceID := mapped.WorkspaceID
-	if workspaceID == "" {
-		workspaceID = r.cfg.WorkspaceID
-	}
-	if workspaceID != "" {
-		opts = append(opts, dataagent.WithWorkspaceID(workspaceID))
-	}
-	// The static credential is only a fallback; the provider drives signing.
-	t.Client = dataagent.NewClient(t.snapshot, r.cfg.Region, opts...)
-
-	// Per-tenant session dir keeps session listing/attach isolated between users.
-	sessDir := filepath.Join(r.cfg.SessionsDir, "identity", sanitize(key))
-	t.Manager = session.NewManager(t.Client, sessDir)
-	t.Manager.RestoreSessions(r.baseCtx)
-	go t.Manager.RunHousekeeping(r.baseCtx)
-
-	r.tenants[key] = t
-	log.Printf("tenant created: user=%s group=%s role=%s session_name=%s sessions=%s",
-		key, groupName, mapped.RoleArn, sessionName(r.cfg.Identity.Prefix(), sessionValue), sessDir)
 	return t, nil
 }
 
-// newRoleProvider builds a credentials-go ram_role_arn provider, which calls
-// STS AssumeRole with the base AK/SK and transparently refreshes the
-// temporary credential before expiry (same mechanism as the Java demo's
-// AgentAssumeRoleLoginHelper.assumeRole, minus the manual refresh).
-//
-// sessionValue is the identity field selected by identity.session_name_claim.
-func (r *Registry) newRoleProvider(sessionValue, roleArn string) (credential.Credential, error) {
-	conf := new(credential.Config).
-		SetType("ram_role_arn").
-		SetAccessKeyId(r.base.AccessKeyID).
-		SetAccessKeySecret(r.base.AccessKeySecret).
-		SetRoleArn(roleArn).
-		SetRoleSessionName(sessionName(r.cfg.Identity.Prefix(), sessionValue)).
-		SetRoleSessionExpiration(r.cfg.STS.SessionExpiration).
-		SetSTSEndpoint(r.cfg.STSEndpoint())
-	if r.base.SecurityToken != "" {
-		conf.SetSecurityToken(r.base.SecurityToken)
+func gatewayFailure(caller *GatewayCaller, err error) error {
+	if caller == nil {
+		return err
 	}
-	return credential.NewCredential(conf)
+	code, message := "GATEWAY_CREDENTIAL_ERROR", "Gateway credentials unavailable."
+	if IsAuthenticationError(err) || errors.Is(err, errMappingChanged) {
+		code, message = "GATEWAY_IDENTITY_REJECTED", "Gateway identity rejected."
+	}
+	if errors.Is(err, config.ErrIdentityGroupConflict) || errors.Is(err, config.ErrIdentityUnmapped) {
+		code, message = "GATEWAY_IDENTITY_UNMAPPED", "Gateway identity has no role mapping."
+	}
+	return &dataagent.GatewayError{Code: code, Message: message}
 }
+
+func sameAuthorization(t *Tenant, a *verifiedIdentity) bool {
+	return t.Group == a.group && t.RoleArn == a.mapped.RoleArn && t.roleSessionName == a.roleSessionName && t.Defaults.WorkspaceID == a.mapped.WorkspaceID && t.Defaults.CustomAgentID == a.mapped.CustomAgentID && t.Defaults.Mode == a.mapped.Mode
+}
+func samePending(a, b *verifiedIdentity) bool {
+	return a.group == b.group && a.roleSessionName == b.roleSessionName && a.mapped.RoleArn == b.mapped.RoleArn && a.mapped.WorkspaceID == b.mapped.WorkspaceID && a.mapped.CustomAgentID == b.mapped.CustomAgentID && a.mapped.Mode == b.mapped.Mode
+}
+
+func (r *Registry) tenant(ctx context.Context, a *verifiedIdentity) (*Tenant, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	if r.closed || r.baseCtx.Err() != nil {
+		r.mu.Unlock()
+		return nil, errClosed
+	}
+	key := a.principal.ID
+	if t := r.tenants[key]; t != nil {
+		r.mu.Unlock()
+		if !sameAuthorization(t, a) {
+			return nil, errMappingChanged
+		}
+		return t, nil
+	}
+	job := r.inflight[key]
+	if job != nil && !samePending(&job.auth, a) {
+		r.mu.Unlock()
+		return nil, errMappingChanged
+	}
+	if job == nil {
+		if len(r.tenants)+len(r.inflight) >= r.cfg.Identity.MaxTenants || len(r.inflight) >= r.initLimit {
+			r.mu.Unlock()
+			return nil, errBusy
+		}
+		jobCtx, cancel := context.WithTimeout(r.baseCtx, r.initTimeout)
+		job = &initialization{ctx: jobCtx, cancel: cancel, done: make(chan struct{}), auth: *a}
+		r.inflight[key] = job
+		r.wg.Add(1)
+		go r.initialize(job)
+	}
+	r.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-job.ctx.Done():
+		if r.baseCtx.Err() != nil {
+			return nil, errClosed
+		}
+		// Normal completion cancels the timer as well; prefer its published
+		// result when both channels are ready.
+		select {
+		case <-job.done:
+			return completedInitialization(ctx, job, a)
+		default:
+			return nil, errInitTimeout
+		}
+	case <-job.done:
+		return completedInitialization(ctx, job, a)
+	}
+}
+
+func completedInitialization(ctx context.Context, job *initialization, a *verifiedIdentity) (*Tenant, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if job.err != nil {
+		return nil, job.err
+	}
+	if !a.principal.ExpiresAt.IsZero() && !time.Now().Before(a.principal.ExpiresAt) {
+		return nil, errAuthentication
+	}
+	return job.tenant, nil
+}
+
+func (r *Registry) initialize(job *initialization) {
+	defer r.wg.Done()
+	defer job.cancel()
+	t, err := r.buildTenant(job.ctx, &job.auth)
+	r.mu.Lock()
+	if err == nil && (job.ctx.Err() != nil || r.closed) {
+		err = errInitTimeout
+	}
+	if err == nil {
+		r.tenants[t.Key] = t
+		r.wg.Add(1)
+		go r.runTenant(t)
+	}
+	r.mu.Unlock()
+	// Timed out non-cancellable SDK work keeps its slot until ALL actual work
+	// and handle cleanup finish. Never publish late or release at waiter timeout.
+	if err != nil && t != nil {
+		_ = closeTenant(t)
+	}
+	r.mu.Lock()
+	delete(r.inflight, job.auth.principal.ID)
+	job.tenant, job.err = t, err
+	close(job.done)
+	r.mu.Unlock()
+}
+
+func (r *Registry) buildTenant(ctx context.Context, a *verifiedIdentity) (*Tenant, error) {
+	if ctx.Err() != nil {
+		return nil, errInitTimeout
+	}
+	provider, err := r.newProviderFn(a.sessionValue, a.mapped.RoleArn)
+	if err != nil {
+		return nil, errors.New("assume role credential provider unavailable")
+	}
+	t := &Tenant{Key: a.principal.ID, Group: a.group, RoleArn: a.mapped.RoleArn, Defaults: a.mapped, roleSessionName: a.roleSessionName, provider: provider}
+	if ctx.Err() != nil {
+		return t, errInitTimeout
+	}
+	if _, err = t.strictCredential(); err != nil {
+		return t, err
+	}
+	if ctx.Err() != nil {
+		return t, errInitTimeout
+	}
+	opts := []dataagent.ClientOption{
+		dataagent.WithCredentialProvider(t.currentCredential), dataagent.WithStrictCredentialProvider(t.strictCredential),
+		dataagent.WithGatewayOptions(dataagent.GatewayOptions{Endpoint: r.cfg.AgentGateway.Endpoint, RequestTimeout: time.Duration(r.cfg.AgentGateway.RequestTimeoutSeconds) * time.Second, MaxResponseBytes: r.cfg.AgentGateway.MaxResponseBytes}),
+		dataagent.WithDataAgentEndpoint(r.cfg.DataAgentEndpoint), dataagent.WithDMSEnterpriseEndpoint(r.cfg.DMSEnterpriseEndpoint),
+	}
+	if r.cfg.DMSUnit != "" {
+		opts = append(opts, dataagent.WithDMSUnit(r.cfg.DMSUnit))
+	}
+	workspace := a.mapped.WorkspaceID
+	if workspace == "" {
+		workspace = r.cfg.WorkspaceID
+	}
+	if workspace != "" {
+		opts = append(opts, dataagent.WithWorkspaceID(workspace))
+	}
+	t.Client = dataagent.NewClient(t.snapshot, r.cfg.Region, opts...)
+	root, dir, err := openTenantRoot(r.cfg.SessionsDir, t.Key)
+	if err != nil {
+		return t, err
+	}
+	t.root = root
+	if ctx.Err() != nil {
+		return t, errInitTimeout
+	}
+	t.Manager, err = session.NewManager(t.Client, dir)
+	if err != nil {
+		return t, errors.New("tenant session storage unavailable")
+	}
+	return t, nil
+}
+
+func (r *Registry) runTenant(t *Tenant) {
+	defer r.wg.Done()
+	select {
+	case r.restores <- struct{}{}:
+	case <-r.baseCtx.Done():
+		return
+	}
+	if r.baseCtx.Err() == nil {
+		r.restoreFn(r.baseCtx, t.Manager)
+	}
+	<-r.restores
+	if r.baseCtx.Err() == nil {
+		t.Manager.RunHousekeeping(r.baseCtx)
+	}
+}
+
+func closeTenant(t *Tenant) error {
+	var errs []error
+	if t.Manager != nil {
+		if err := t.Manager.Close(); err != nil {
+			errs = append(errs, errors.New("tenant manager close failed"))
+		}
+	}
+	if t.root != nil {
+		if err := t.root.Close(); err != nil {
+			errs = append(errs, errors.New("tenant root close failed"))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Close waits for actual SDK work, restoration and housekeeping before closing
+// managers/roots. credentials-go cannot be interrupted; Close may wait for its
+// configured network timeouts or for an external provider to return.
+func (r *Registry) Close() error {
+	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		r.closed = true
+		r.cancel()
+		tenants := r.tenants
+		r.mu.Unlock()
+		// Cancel manager work immediately, including operations created before
+		// that tenant reached the restoration queue. Manager.Close joins its
+		// operations/restoration/watchers before releasing its own root.
+		var closing sync.WaitGroup
+		errorsByTenant := make(chan error, len(tenants))
+		for _, t := range tenants {
+			closing.Add(1)
+			go func() { defer closing.Done(); errorsByTenant <- closeTenant(t) }()
+		}
+		r.wg.Wait()
+		closing.Wait()
+		close(errorsByTenant)
+		for err := range errorsByTenant {
+			r.closeErr = errors.Join(r.closeErr, err)
+		}
+		r.mu.Lock()
+		r.tenants = map[string]*Tenant{}
+		r.mu.Unlock()
+	})
+	return r.closeErr
+}
+
+// Retain the renewable default SDK provider. STS timeouts are milliseconds.
+func (r *Registry) newRoleProvider(sessionValue, roleArn string) (credential.Credential, error) {
+	return &rotatingRoleProvider{base: r.base, build: func(base *dataagent.Credential) (credential.Credential, error) {
+		conf := new(credential.Config).SetType("ram_role_arn").SetAccessKeyId(base.AccessKeyID).SetAccessKeySecret(base.AccessKeySecret).SetSecurityToken(base.SecurityToken).SetRoleArn(roleArn).SetRoleSessionName(sessionName(r.cfg.Identity.Prefix(), sessionValue)).SetRoleSessionExpiration(r.cfg.STS.SessionExpiration).SetSTSEndpoint(r.cfg.STSEndpoint()).SetConnectTimeout(5000).SetTimeout(10000)
+		return credential.NewCredential(conf)
+	}}, nil
+}
+
+type rotatingRoleProvider struct {
+	mu       sync.Mutex
+	base     credential.Credential
+	previous *dataagent.Credential
+	role     credential.Credential
+	build    func(*dataagent.Credential) (credential.Credential, error)
+}
+
+func (p *rotatingRoleProvider) GetCredential() (*credential.CredentialModel, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	base, err := dataagent.CredentialFromProvider(p.base)
+	if err != nil {
+		return nil, errors.New("base credential provider unavailable")
+	}
+	if p.role == nil || p.previous == nil || *base != *p.previous {
+		role, err := p.build(base)
+		if err != nil || role == nil {
+			return nil, errors.New("role credential provider unavailable")
+		}
+		p.role, p.previous = role, base
+	}
+	current, err := dataagent.CredentialFromProvider(p.role)
+	if err != nil {
+		return nil, errors.New("role credential provider unavailable")
+	}
+	return &credential.CredentialModel{AccessKeyId: &current.AccessKeyID, AccessKeySecret: &current.AccessKeySecret, SecurityToken: &current.SecurityToken}, nil
+}
+func (p *rotatingRoleProvider) GetAccessKeyId() (*string, error) {
+	m, err := p.GetCredential()
+	if err != nil {
+		return nil, err
+	}
+	return m.AccessKeyId, nil
+}
+func (p *rotatingRoleProvider) GetAccessKeySecret() (*string, error) {
+	m, err := p.GetCredential()
+	if err != nil {
+		return nil, err
+	}
+	return m.AccessKeySecret, nil
+}
+func (p *rotatingRoleProvider) GetSecurityToken() (*string, error) {
+	m, err := p.GetCredential()
+	if err != nil {
+		return nil, err
+	}
+	return m.SecurityToken, nil
+}
+func (p *rotatingRoleProvider) GetBearerToken() *string { s := ""; return &s }
+func (p *rotatingRoleProvider) GetType() *string        { s := "ram_role_arn"; return &s }
 
 var sessionNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9._@-]`)
 
-// sessionName builds the STS RoleSessionName, which shows up in ActionTrail
-// audit logs and must stay recognizable per user.
-//
-// An empty prefix is honoured as "no prefix" and yields the bare identity
-// value; config resolves an unset setting to "aily" before this point, so
-// empty here is always deliberate. STS requires 2-64 characters, so a value
-// too short to stand alone is padded rather than rejected — losing the audit
-// trail over a one-character user id would be worse than a padded name.
 func sessionName(prefix, key string) string {
 	name := sessionNameSanitizer.ReplaceAllString(key, "_")
 	if prefix != "" {
@@ -355,11 +533,4 @@ func sessionName(prefix, key string) string {
 		name += "_"
 	}
 	return name
-}
-
-var pathSanitizer = regexp.MustCompile(`[^a-zA-Z0-9._@-]`)
-
-func sanitize(s string) string {
-	s = pathSanitizer.ReplaceAllString(s, "_")
-	return strings.Trim(s, ".")
 }

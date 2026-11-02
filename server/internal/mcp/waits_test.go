@@ -9,7 +9,9 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/alibabacloud/data-agent-mcp-server/internal/config"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/session"
+	"github.com/alibabacloud/data-agent-mcp-server/internal/tenant"
 )
 
 // waitManager fakes the blocking wait paths so the handlers can be exercised
@@ -142,7 +144,7 @@ func TestWaitResultDuplicateDegrades(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		s.waits.mu.Lock()
-		_, inflight := s.waits.inflight["s1"]
+		_, inflight := s.waits.inflight[blockingWaitKey(context.Background(), "s1")]
 		s.waits.mu.Unlock()
 		if inflight {
 			break
@@ -168,7 +170,7 @@ func TestWaitResultDuplicateDegrades(t *testing.T) {
 	<-first
 
 	// The registry must be clean afterwards so later waits can block again.
-	if !s.waits.enter("s1") {
+	if !s.waits.enter(context.Background(), "s1") {
 		t.Error("registry still marks s1 in flight after the wait returned")
 	}
 }
@@ -201,5 +203,50 @@ func TestStatusLongPollSkipsPollSeqAndClamps(t *testing.T) {
 	out = decodeResult(t, res)
 	if out["poll_seq"] == nil {
 		t.Error("bare status must report poll_seq")
+	}
+}
+
+func TestBlockingWaitsArePrincipalScoped(t *testing.T) {
+	cfg := config.Config{Identity: config.Identity{
+		Enabled: true, RequireIdentity: true, Namespace: "wait-tests", AuthToken: "synthetic-token",
+		Groups: map[string]config.IdentityGroup{
+			"shared-role": {RoleArn: "acs:ram::123456789012:role/synthetic", Users: []string{"A", "B"}},
+		},
+	}}
+	registry := tenant.NewRegistry(context.Background(), cfg, nil)
+	t.Cleanup(func() { _ = registry.Close() })
+	a, err := registry.Authenticate(tenant.WithIdentity(context.Background(), "A", "", "synthetic-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := registry.Authenticate(tenant.WithIdentity(context.Background(), "B", "", "synthetic-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waits := newWaitRegistry()
+	if !waits.enter(a, "shared-session") {
+		t.Fatal("first wait rejected")
+	}
+	mgr := &waitManager{reason: "timeout", snap: session.StateSnapshot{SessionID: "shared-session", Status: session.StatusRunning}}
+	s := &Server{mgr: mgr, waits: waits}
+	request := waitReq("data_agent_wait_result", map[string]any{"session_id": "shared-session"})
+	res, err := s.handleWaitResult(b, request)
+	if err != nil || res.IsError || decodeResult(t, res)["reason"] != "timeout" {
+		t.Fatalf("B wait was affected by A: %v %v", err, res)
+	}
+	res, err = s.handleWaitResult(a, request)
+	if err != nil || res.IsError || decodeResult(t, res)["reason"] != "duplicate_wait" {
+		t.Fatalf("same-principal duplicate not blocked: %v %v", err, res)
+	}
+	res, err = s.handleStatus(b, waitReq("data_agent_status", map[string]any{"session_id": "shared-session", "wait_timeout": float64(30)}))
+	if err != nil || res.IsError || mgr.changeTimeout != 30*time.Second {
+		t.Fatalf("B status wait was affected by A: %v %v", err, res)
+	}
+	waits.exit(a, "shared-session")
+	if len(waits.inflight) != 0 {
+		t.Fatal("completed waits retained entries")
+	}
+	if blockingWaitKey(tenant.WithIdentity(context.Background(), "spoofed", "", ""), "shared-session") != blockingWaitKey(context.Background(), "shared-session") {
+		t.Fatal("unverified header influenced wait ownership")
 	}
 }

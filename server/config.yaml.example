@@ -1,129 +1,139 @@
 # Data Agent MCP Server configuration (YAML).
+# Security-remediation implementation is under validation, NOT release acceptance.
+# See README.md and SECURITY_REMEDIATION_SPEC.md before upgrading a deployment.
 # Location: $DATA_AGENT_CONFIG > ./config.yaml > ~/.data-agent/config.yaml
 #           > ~/.data-agent/config.json (legacy)
 # Priority: env vars > .env file > this file > defaults.
-# Credentials (AK/SK) belong in .env or the credential chain — never here.
+# Prefer environment/managed secret injection and the SDK credential chain.
+# Actual secret-bearing YAML/JSON/.env files must be process-owned regular files
+# with POSIX mode 0600/0400 in trusted directories; public placeholders may be 0644.
+# The server does not chmod/chown, migrate files, or authorize deployment changes.
 
 region: cn-hangzhou
 dms_unit: ""              # empty = auto-resolved via GetActiveRouteUnit
 workspace_id: ""          # empty = auto personal workspace
-custom_agent_id: ""       # default custom agent; empty = the backend's built-in agent
+custom_agent_id: ""       # empty = the backend's built-in agent
 sessions_dir: ~/.data-agent/sessions
-api_key: ""               # API Key auth; leave empty for AK/SK (required for identity mode)
 
-# Endpoint overrides. Each is empty by default and then derived from `region`.
-# Set them for VPC-only egress or non-public-cloud deployments; every host the
-# server talks to is listed here, so a fully private deployment needs no other
-# network change (the OSS upload host comes from the signature response).
+# Only SDK default credential-chain AK/STS authentication is supported. Legacy
+# API Key inputs cause a sanitized migration error even with the gateway off;
+# remove old keys/variables rather than leaving empty YAML keys (see README.md).
 
-# AK/SK-signed Data Agent API (2025-04-14): create/send/status + SSE stream.
-# Empty = dms.{region}.aliyuncs.com. Env: DATA_AGENT_ENDPOINT.
-data_agent_endpoint: ""
+# Existing Data Agent / DMS overrides default to hosts derived from region.
+# Signed API/SSE clients reject redirects; do not change targets to bypass errors.
+# The OSS upload host still comes from the upload signature response.
+data_agent_endpoint: ""      # default: dms.{region}.aliyuncs.com; DATA_AGENT_ENDPOINT
+dms_enterprise_endpoint: ""  # default: dms-enterprise.{region}.aliyuncs.com
+                            # env: DATA_AGENT_DMS_ENTERPRISE_ENDPOINT
 
-# dms-enterprise (2018-11-01) metadata APIs: database/table/instance discovery,
-# import tagging, GetActiveRouteUnit.
-# Empty = dms-enterprise.{region}.aliyuncs.com. Env: DATA_AGENT_DMS_ENTERPRISE_ENDPOINT.
-dms_enterprise_endpoint: ""
+# 19 tools off / 28 base (9 gateway) / 30 with P2b (11 gateway).
+# Prior cloud checks are historical, not post-remediation release evidence.
+# Real JWT/platform, differential-role and least-privilege gates remain open.
+agent_gateway:
+  enabled: false
+  # P2b read-only control-plane summaries require enabled=true and operator
+  # acceptance of the upstream principal's visibility, not chat-user database ACL.
+  # Same-role sessions do not provide independent cloud row/column permissions.
+  data_sources_enabled: false
+  # Explicit when enabled: public dms.<region>.aliyuncs.com, matching region.
+  # Host only: no scheme, port, path, query, userinfo, fragment or VPC endpoint.
+  endpoint: dms.cn-hangzhou.aliyuncs.com
+  request_timeout_seconds: 30     # outbound HTTP budget, not end-to-end STS time
+  max_response_bytes: 4194304     # 4 MiB after decompression, success and errors
 
-# API Key auth only (ignored with AK/SK): control plane and streaming plane.
-# Empty = dataagent-{region}.aliyuncs.com / dataagent-stream-{region}.aliyuncs.com.
-# Env: DATA_AGENT_API_KEY_ENDPOINT / DATA_AGENT_API_KEY_STREAM_ENDPOINT.
-api_key_endpoint: ""
-api_key_stream_endpoint: ""
-
-# STS AssumeRole settings used by identity multi-tenant mode.
 sts:
-  endpoint: ""            # default: sts.{region}.aliyuncs.com
+  endpoint: ""                   # default: sts.{region}.aliyuncs.com
   session_expiration: 3600
 
-# Blocking-wait ceiling for data_agent_wait_result and data_agent_status
-# (wait_timeout), in seconds. Requests above the cap are clamped so the tool
-# response always beats reverse-proxy and client timeouts (~120s in common
-# clients and nginx default proxy_read_timeout 60s) — a graceful reason=timeout with progress info instead of a
-# "context canceled" error. Raise it only if every client's tool-call timeout
-# is known to be higher. Env override: DATA_AGENT_WAIT_CAP (default 55).
+# Remote ingress only. Omitted numeric settings use defaults; explicit zero or
+# negative values are rejected, not interpreted as disabling a safety limit.
+# Per-principal/session limits cannot exceed their corresponding totals.
+http:
+  max_request_bytes: 1048576             # every MCP POST, including notifications
+  max_header_bytes: 65536                # Go header parser semantics + fixed slack
+  read_header_timeout_seconds: 5
+  read_body_timeout_seconds: 10          # body reading only, cleared before dispatch
+  idle_timeout_seconds: 60               # idle keep-alive, not an active stream
+  max_sessions: 4096                    # process total, including init reservations
+  max_sessions_per_principal: 64
+  max_inflight_requests: 256            # accepted dispatch until actually finished
+  max_inflight_per_session: 8           # SSE 202 does not release a running task
+  session_idle_timeout_seconds: 1800    # HTTP: no connection and no in-flight calls
+  max_stream_lifetime_seconds: 3600     # JWT exp may end a stream sooner; reconnect
 
-# Logging. Everything goes to stderr: on stdio the host agent captures it, on
-# the HTTP transports the supervisor (systemd, container runtime) does.
+# Blocking waits retain DATA_AGENT_WAIT_CAP (default 55 seconds). Configure proxy
+# and client timeouts above it; do not apply a short timeout to the whole stream.
 log:
-  # Per-tool-call logging:
-  #   basic — tool name, caller identity, outcome, duration
-  #   full  — adds arguments with sensitive values redacted; these carry user
-  #           questions and table names, so prefer it for troubleshooting
-  #           rather than steady-state operation
-  #   off   — no per-call logging
-  # Empty keeps the transport default: basic for a standalone deployment
-  # (streamable-http / sse), off under stdio where the host agent owns the
-  # console. The identity token is never logged at any level.
-  # Env override: DATA_AGENT_LOG_REQUESTS.
+  # basic: tool, verified caller, outcome, duration; full adds redacted arguments
+  # for OLD tools (may include business questions); use only for diagnostics.
+  # off: no per-call logging. Empty: basic remotely, off under stdio.
+  # Logs go to stderr, with single-line escaping and output budgets. Gateway full
+  # still excludes parameters, returned data and raw errors; never log credentials.
+  # Env: DATA_AGENT_LOG_REQUESTS.
   requests: ""
 
-# Multi-tenant identity mode (generic; legacy section name "aily" still works).
-# The upstream caller (Feishu Aily, a gateway, a portal, ...) forwards the
-# end-user identity as HTTP headers on every MCP request. The server maps the
-# identity to a RAM role, assumes it via STS, and runs all Data Agent calls
-# with the per-user temporary credential — RAM access policies and DMS data
-# permissions apply per end user.
-#
-# Two mapping styles (combinable; named groups win over default):
-#   1. Global sharing: identity.default — one role (+ workspace/agent/mode
-#      defaults) for every identified user.
-#   2. Groups: identity.groups.<name> — each group has its own role and
-#      defaults, and lists its member users.
+# This template defaults to LOCAL STDIO ONLY. All HTTP/SSE deployments, gateway
+# on OR off, must explicitly set enabled=true, require_identity=true, a nonempty
+# auth_token via environment, and a valid namespace. No anonymous/global fallback
+# for any remote tool or protocol method; no weak-compatibility switch.
+# Every initialize/tools/list/call/notification and GET/POST/DELETE authenticates.
+# Protocol IDs are server-issued, principal-owned and leased (see README.md).
 identity:
   enabled: false
-  # Upstream-signed identity (Feishu Aily "JWT 身份验签"). The platform signs
-  # the end-user identity with an HS256 secret shown in its MCP editor and
-  # sends it on every request, so the signature identifies the user.
-  # A JWT is used whenever the caller sends one; a request without one falls
-  # back to the identity headers below. A token that is present but invalid is
-  # always rejected, never retried against the headers. auth_token is checked
-  # first on both paths (see below) and is required whenever identity is on.
-  jwt:
-    enabled: false
-    secret: ""            # HMAC key, used as-is (no base64). Prefer .env / env IDENTITY_JWT_SECRET
-    # secrets lets several upstream agents share this server, each signing with
-    # its own key; a token is accepted if any key (secret + these) verifies it.
-    # Env override: IDENTITY_JWT_SECRETS (comma-separated).
-    secrets: []
-    header: ""            # default: x-aily-jwt (bare token, no "Bearer " prefix)
-  # Which identity field becomes the STS RoleSessionName segment
-  # ("<session_name_prefix>-<value>"), i.e. what ActionTrail records:
-  #   user_id (default) | email | enterprise_email | employee_no
-  #   | tenant_id | agent_id
-  # Group membership is always matched on user_id and email, independent of
-  # this setting, so changing it does not affect role mapping.
-  session_name_claim: user_id
-  # Reject requests without identity headers instead of using the server identity.
   require_identity: true
-  # Caller authentication: must equal the token header on every request, so
-  # only the trusted upstream platform can act on behalf of users. Configure
-  # the same value as a custom header in the upstream MCP registration.
-  # Env override: IDENTITY_AUTH_TOKEN (legacy: shared_secret / AILY_SHARED_SECRET).
-  auth_token: ""
-  # STS RoleSessionName: "<prefix>-<user_id>", what ActionTrail records.
-  # Leave the key out to keep the historical "aily-<user_id>"; set it to an
-  # empty string to drop the prefix entirely ("<user_id>" alone); or set any
-  # other value for "<value>-<user_id>".
-  # Env override: IDENTITY_SESSION_NAME_PREFIX (empty value = no prefix).
+  # Required remotely: stable administrator-chosen non-secret trust domain,
+  # 1-64 chars [a-z0-9][a-z0-9_-]*. Never derive it from a request or RAM role.
+  namespace: ""
+  # Cached Tenants + in-progress initialization reservations, NOT connections.
+  # No automatic eviction; closing a protocol session does not free a Tenant.
+  max_tenants: 128
+  auth_token: ""                 # inject IDENTITY_AUTH_TOKEN; trusted platform only
+  jwt:
+    enabled: false              # explicit trusted-header mode; not JWT fallback
+    # When true, ALL remote requests need a valid HS256 JWT with exp, nonempty
+    # tenant_id + agent_id, and user_id or email. Missing/invalid JWT is rejected.
+    secret: ""                  # inject IDENTITY_JWT_SECRET; HMAC key used as-is
+    # All keys have equivalent signing authority within ONE trusted domain.
+    # Use for rotation/mutually trusted apps, never unrelated organizations.
+    # Independent trust domains need separate instances/config/storage roots.
+    secrets: []                 # env: IDENTITY_JWT_SECRETS (comma-separated)
+    header: ""                  # default x-aily-jwt; bare token, no Bearer prefix
+  # RoleSessionName attribution only; mapping always uses scoped user_id/email.
+  # user_id | email | enterprise_email | employee_no | tenant_id | agent_id
+  session_name_claim: user_id
+  # Omit prefix for historical "aily-<value>"; empty string means bare value.
+  # Env: IDENTITY_SESSION_NAME_PREFIX (empty is meaningful).
   #session_name_prefix: ""
-  # Identity header names; defaults are Feishu Aily compatible.
+  # Header mode: trusted proxy must overwrite client identity headers, keep the
+  # platform token from end users, and guarantee unique IDs within namespace.
   headers:
-    user: ""              # default: x-aily-user
-    email: ""             # default: x-aily-email
-    token: ""             # default: x-aily-token
-  # Style 1 — global sharing: catch-all for every identified user.
-  # Remove/empty it to reject users that belong to no group (fail-closed).
-  default:
-    role_arn: ""          # e.g. acs:ram::<account-id>:role/da-default
-    workspace_id: ""      # optional session defaults for this group
-    custom_agent_id: ""
-    mode: ""              # auto | lite | pro | ultra
-  # Style 2 — groups: per-group role + defaults + member list.
+    user: ""                    # default x-aily-user
+    email: ""                   # default x-aily-email
+    token: ""                   # default x-aily-token
+  # No default mapping: unmatched identities are rejected. To add a default,
+  # configure a real role and exact JWT tenant/agent scope (empty in header mode).
+  # Named groups win ONLY within the exact scope; multiple group matches reject,
+  # even if they have the same role. No wildcard or cross-scope default.
+  #default:
+  #  tenant_id: "<trusted-tenant-id>"  # JWT only; use "" in header mode
+  #  agent_id: "<trusted-agent-id>"    # JWT only; use "" in header mode
+  #  role_arn: "acs:ram::<account-id>:role/<default-role>"
+  #  workspace_id: ""
+  #  custom_agent_id: ""
+  #  mode: lite
   groups: {}
   #  analysts:
-  #    role_arn: acs:ram::<account-id>:role/da-analysts
-  #    workspace_id: ws-analysts
-  #    custom_agent_id: ca-xxxx
+  #    tenant_id: "<trusted-tenant-id>" # JWT only; use "" in header mode
+  #    agent_id: "<trusted-agent-id>"   # JWT only; use "" in header mode
+  #    role_arn: "acs:ram::<account-id>:role/<analyst-role>"
+  #    workspace_id: "<workspace-id>"
+  #    custom_agent_id: ""
   #    mode: pro
-  #    users: [ou_alice, bob@example.com]   # user id or email; one group per user
+  #    users: ["<user-id>", "<user-email>"]
+
+# Remote local history: sessions_dir/identity-v2/<principal_id>/ with owner.json.
+# Principal hashes namespace, auth mode, tenant/agent and typed user_id/email.
+# No automatic old identity/<sanitized-key> fallback, claiming or migration.
+# Historical import requires separately authorized admin ownership verification.
+# Owner markers/local isolation do not establish cloud session ACL or row isolation.
+# stdio uses one confined local process root, never per-chat-user authorization.

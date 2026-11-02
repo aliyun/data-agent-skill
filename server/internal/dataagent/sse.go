@@ -29,21 +29,14 @@ type SSEClient struct {
 	credFn     func() *Credential           // optional dynamic credential provider
 	dmsUnitFn  func(context.Context) string // optional DMSUnit resolver (set by Client)
 	endpoint   string                       // AK/SK signed host, e.g. "dms.cn-hangzhou.aliyuncs.com"
-	// streamEndpoint is the API Key data-plane host, e.g.
-	// "dataagent-stream-cn-hangzhou.aliyuncs.com". Client keeps it in sync
-	// with its own endpoint overrides.
-	streamEndpoint string
-	region         string
 }
 
 // NewSSEClient creates a new SSE streaming client.
 func NewSSEClient(cred *Credential, region string) *SSEClient {
 	return &SSEClient{
-		httpClient:     &http.Client{Timeout: 0}, // no timeout; SSE streams are long-lived
-		cred:           cred,
-		endpoint:       fmt.Sprintf("dms.%s.aliyuncs.com", region),
-		streamEndpoint: fmt.Sprintf("dataagent-stream-%s.aliyuncs.com", region),
-		region:         region,
+		httpClient: &http.Client{Timeout: 0, CheckRedirect: rejectSignedRedirect}, // no timeout; SSE streams are long-lived
+		cred:       cred,
+		endpoint:   fmt.Sprintf("dms.%s.aliyuncs.com", region),
 	}
 }
 
@@ -63,7 +56,7 @@ func (c *SSEClient) StreamEvents(ctx context.Context, agentID, sessionID string,
 	go func() {
 		defer close(ch)
 		if _, err := c.doStream(ctx, agentID, sessionID, checkpoint, ch); err != nil && ctx.Err() == nil {
-			log.Printf("[sse:%s] connection ended: %v", sessionID, err)
+			log.Printf("[sse:%.128q] connection ended with an upstream error", sessionID)
 		}
 	}()
 	return ch, nil
@@ -88,64 +81,39 @@ func (c *SSEClient) doStream(
 		params["Checkpoint"] = strconv.Itoa(checkpoint)
 	}
 
-	var req *http.Request
-	sseCred := c.credential()
-	if sseCred.IsAPIKey() {
-		// API Key mode: POST JSON body to stream endpoint with x-api-key header.
-		host := c.streamEndpoint
-		bodyMap := map[string]string{
-			"Action":   "GetChatContent",
-			"Version":  "2025-04-14",
-			"RegionId": c.region,
-		}
-		for k, v := range params {
-			bodyMap[k] = v
-		}
-		bodyBytes, _ := json.Marshal(bodyMap)
-		reqURL := fmt.Sprintf("https://%s/apikey", host)
-		var err2 error
-		req, err2 = http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(string(bodyBytes)))
-		if err2 != nil {
-			return false, fmt.Errorf("build SSE request: %w", err2)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("x-api-key", sseCred.APIKey)
-		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("User-Agent", userAgent)
-	} else {
-		// AK/SK mode: signed POST with query string.
-		host := c.endpoint
-		headers := SignRequest(sseCred, "POST", host, "GetChatContent", params, "")
-		headers["Accept"] = "text/event-stream"
-		headers["User-Agent"] = userAgent
+	host := c.endpoint
+	cred := c.credential()
+	headers := SignRequest(cred, "POST", host, "GetChatContent", params, "")
+	headers["Accept"] = "text/event-stream"
+	headers["User-Agent"] = userAgent
 
-		qs := BuildSignedQueryString("GetChatContent", "2025-04-14", params)
-		reqURL := fmt.Sprintf("https://%s/?%s", host, qs)
-
-		var err2 error
-		req, err2 = http.NewRequestWithContext(ctx, "POST", reqURL, nil)
-		if err2 != nil {
-			return false, fmt.Errorf("build SSE request: %w", err2)
-		}
-		for k, v := range headers {
-			req.Header.Set(k, v)
-		}
+	qs := BuildSignedQueryString("GetChatContent", "2025-04-14", params)
+	reqURL := fmt.Sprintf("https://%s/?%s", host, qs)
+	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, nil)
+	if err != nil {
+		return false, fmt.Errorf("build SSE request: %w", &signedHTTPError{cause: err})
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("SSE connect: %w", err)
+		return false, fmt.Errorf("SSE connect: %w", &signedHTTPError{cause: err})
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return false, signedRedirectError(resp, cred)
+	}
 
 	debugSSE := os.Getenv("DATA_AGENT_DEBUG_SSE") != ""
 	if debugSSE {
-		log.Printf("[sse:%s] HTTP %d content-type=%q request-id=%s",
-			sessionID, resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("x-acs-request-id"))
+		log.Printf("[sse:%.128q] HTTP %d request-id=%q",
+			sessionID, resp.StatusCode, gatewaySafeRequestID(resp.Header.Get("x-acs-request-id"), cred))
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		requestID := resp.Header.Get("x-acs-request-id")
+		requestID := gatewaySafeRequestID(resp.Header.Get("x-acs-request-id"), cred)
 		return false, fmt.Errorf("SSE HTTP %d (request-id: %s)", resp.StatusCode, requestID)
 	}
 
@@ -158,11 +126,7 @@ func (c *SSEClient) doStream(
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if debugSSE && line != "" {
-			if len(line) > 300 {
-				log.Printf("[sse:%s] raw: %s...", sessionID, line[:300])
-			} else {
-				log.Printf("[sse:%s] raw: %s", sessionID, line)
-			}
+			log.Printf("[sse:%.128q] received line bytes=%d", sessionID, len(line))
 		}
 		if line == "" {
 			continue

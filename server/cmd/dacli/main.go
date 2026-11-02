@@ -49,6 +49,7 @@ type client struct {
 	user  string
 	email string
 	token string
+	jwt   string
 	sid   string // Mcp-Session-Id
 	http  *http.Client
 	rpcID int
@@ -62,26 +63,58 @@ func (c *client) post(body map[string]interface{}) (*http.Response, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	c.authenticate(req)
+	return c.http.Do(req)
+}
+
+func (c *client) authenticate(req *http.Request) {
 	if c.sid != "" {
 		req.Header.Set("Mcp-Session-Id", c.sid)
 	}
-	// Aily identity headers.
-	if c.user != "" {
-		req.Header.Set("x-aily-user", c.user)
-	}
-	if c.email != "" {
-		req.Header.Set("x-aily-email", c.email)
+	if c.jwt == "" {
+		if c.user != "" {
+			req.Header.Set("x-aily-user", c.user)
+		}
+		if c.email != "" {
+			req.Header.Set("x-aily-email", c.email)
+		}
 	}
 	if c.token != "" {
 		req.Header.Set("x-aily-token", c.token)
 	}
-	return c.http.Do(req)
+	if c.jwt != "" {
+		req.Header.Set("x-aily-jwt", c.jwt)
+	}
+}
+
+func (c *client) close() error {
+	if c.sid == "" {
+		return nil
+	}
+	req, err := http.NewRequest(http.MethodDelete, c.url, nil)
+	if err != nil {
+		return err
+	}
+	c.authenticate(req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("session close rejected (HTTP %d)", resp.StatusCode)
+	}
+	c.sid = ""
+	return nil
 }
 
 // decode extracts the JSON-RPC payload, handling both plain JSON and
 // text/event-stream framed responses.
 func decode(resp *http.Response) (map[string]interface{}, error) {
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("request rejected (HTTP %d)", resp.StatusCode)
+	}
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(resp.Body); err != nil {
 		return nil, err
@@ -145,7 +178,10 @@ func (c *client) connect() error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("initialization notification rejected (HTTP %d)", resp.StatusCode)
+	}
 	return nil
 }
 
@@ -173,12 +209,11 @@ func (c *client) callTool(name string, args map[string]interface{}) (string, []i
 }
 
 func pretty(text string) string {
-	var v interface{}
-	if err := json.Unmarshal([]byte(text), &v); err != nil {
+	var formatted bytes.Buffer
+	if err := json.Indent(&formatted, []byte(text), "", "  "); err != nil {
 		return text
 	}
-	b, _ := json.MarshalIndent(v, "", "  ")
-	return string(b)
+	return formatted.String()
 }
 
 func (c *client) simple(tool string, args map[string]interface{}) error {
@@ -463,17 +498,22 @@ func main() {
 	url := flag.String("url", envDefault("AILY_MCP_URL", "http://localhost:61026/mcp"), "MCP server endpoint")
 	user := flag.String("user", os.Getenv("AILY_USER"), "x-aily-user (Feishu user_id)")
 	email := flag.String("email", os.Getenv("AILY_EMAIL"), "x-aily-email (Feishu email)")
-	token := flag.String("token", os.Getenv("AILY_TOKEN"), "x-aily-token (shared secret)")
+	token := flag.String("token", os.Getenv("AILY_TOKEN"), "x-aily-token (prefer AILY_TOKEN environment variable)")
+	jwt := flag.String("jwt", os.Getenv("AILY_JWT"), "x-aily-jwt (prefer AILY_JWT environment variable)")
 	flag.Parse()
 
 	c := &client{
-		url: *url, user: *user, email: *email, token: *token,
-		http: &http.Client{Timeout: 310 * time.Second},
+		url: *url, user: *user, email: *email, token: *token, jwt: *jwt,
+		http: &http.Client{Timeout: 310 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
 	}
 	if err := c.connect(); err != nil {
+		_ = c.close()
 		fmt.Fprintln(os.Stderr, "connect:", err)
 		os.Exit(1)
 	}
+	defer c.close()
 
 	args := flag.Args()
 	if len(args) == 1 && args[0] == "repl" {
@@ -481,6 +521,7 @@ func main() {
 		return
 	}
 	if err := c.dispatch(args); err != nil {
+		_ = c.close()
 		fmt.Fprintln(os.Stderr, "ERROR:", err)
 		os.Exit(1)
 	}

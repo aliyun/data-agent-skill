@@ -3,13 +3,16 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/alibabacloud/data-agent-mcp-server/internal/config"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/tenant"
 )
 
@@ -49,6 +52,28 @@ func TestParseRequestLogLevel(t *testing.T) {
 		if got := ParseRequestLogLevel(in); got != want {
 			t.Errorf("ParseRequestLogLevel(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+func TestRequestLogVerifiedPrincipal(t *testing.T) {
+	cfg := config.Config{Identity: config.Identity{
+		Enabled: true, RequireIdentity: true, Namespace: "log-tests", AuthToken: "synthetic-platform-token",
+		Default: &config.IdentityGroup{RoleArn: "acs:ram::123456789012:role/synthetic"},
+	}}
+	registry := tenant.NewRegistry(context.Background(), cfg, nil)
+	t.Cleanup(func() { _ = registry.Close() })
+	ctx, err := registry.Authenticate(tenant.WithIdentity(context.Background(), "verified-user", "", "synthetic-platform-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := tenant.PrincipalFromContext(ctx)
+	s := &Server{reqLog: RequestLogBasic}
+	out := captureLog(t, func() {
+		rec := s.startToolCall(ctx, callReq("data_agent_status", nil))
+		rec.finish(mcp.NewToolResultText("ok"), nil)
+	})
+	if !strings.Contains(out, "caller="+quoteForLog(principal.ID)) || strings.Contains(out, "verified-user") || strings.Contains(out, "synthetic-platform-token") {
+		t.Fatalf("principal log is missing or reveals raw identity: %q", out)
 	}
 }
 
@@ -113,8 +138,8 @@ func TestRequestLogNeverContainsIdentityToken(t *testing.T) {
 		if strings.Contains(out, secret) {
 			t.Fatalf("level %v leaked the identity token: %q", level, out)
 		}
-		if !strings.Contains(out, "ou_alice") {
-			t.Errorf("level %v should record the caller: %q", level, out)
+		if strings.Contains(out, "ou_alice") {
+			t.Errorf("level %v must not trust unauthenticated headers: %q", level, out)
 		}
 	}
 }
@@ -153,8 +178,8 @@ func TestRequestLogOutcomes(t *testing.T) {
 		rec := s.startToolCall(context.Background(), callReq("t", nil))
 		rec.finish(nil, errors.New("boom"))
 	})
-	if !strings.Contains(out, "error") || !strings.Contains(out, "boom") {
-		t.Errorf("handler error not reported: %q", out)
+	if !strings.Contains(out, "error") || strings.Contains(out, "boom") {
+		t.Errorf("handler error category missing or raw error leaked: %q", out)
 	}
 
 	// A tool-level failure, which the MCP layer returns as a result.
@@ -162,8 +187,8 @@ func TestRequestLogOutcomes(t *testing.T) {
 		rec := s.startToolCall(context.Background(), callReq("t", nil))
 		rec.finish(mcp.NewToolResultError("db not found"), nil)
 	})
-	if !strings.Contains(out, "tool_error") || !strings.Contains(out, "db not found") {
-		t.Errorf("tool error not reported: %q", out)
+	if !strings.Contains(out, "tool_error") || strings.Contains(out, "db not found") {
+		t.Errorf("tool error category missing or raw error leaked: %q", out)
 	}
 }
 
@@ -239,57 +264,68 @@ func TestApplyRequestLogConfig(t *testing.T) {
 	}
 }
 
-// In JWT mode the plain headers are unverified, so a rejected request must not
-// be attributed in the log to whoever the sender claimed to be.
-func TestRequestLogDoesNotTrustHeadersInJWTMode(t *testing.T) {
+func TestRequestLogDoesNotTrustUnverifiedContext(t *testing.T) {
 	const spoofed = "7620774801438674448"
+	contexts := []context.Context{
+		tenant.WithIdentity(context.Background(), spoofed, "victim@example.com", "fake-token"),
+		tenant.WithJWT(context.Background(), "some.jwt.token"),
+		tenant.WithClaims(context.Background(), &tenant.Claims{UserID: spoofed}),
+	}
+	for _, jwtMode := range []bool{false, true} {
+		for _, ctx := range contexts {
+			s := &Server{reqLog: RequestLogBasic, jwtIdentity: jwtMode}
+			out := captureLog(t, func() {
+				rec := s.startToolCall(ctx, callReq("data_agent_list_workspaces", nil))
+				rec.finish(mcp.NewToolResultError("rejected"), nil)
+			})
+			if strings.Contains(out, spoofed) || strings.Contains(out, "fake-token") || strings.Contains(out, "some.jwt.token") {
+				t.Fatalf("unverified identity or credential logged: %q", out)
+			}
+			if !strings.Contains(out, `caller="-"`) {
+				t.Fatalf("unverified caller must be anonymous: %q", out)
+			}
+		}
+	}
+}
 
-	s := &Server{reqLog: RequestLogBasic, jwtIdentity: true}
-	ctx := tenant.WithIdentity(context.Background(), spoofed, "victim@example.com", "")
+func TestRequestLogRecursiveRedactionAndBudget(t *testing.T) {
+	args := map[string]any{
+		"key\nFORGED\r\x00": map[string]any{
+			"list": []any{map[string]any{"AccessKeyId": "fake-ak", "AccessKeySecret": "fake-sk", "Authorization": "fake-auth"}},
+			"url":  "https://example.invalid/?Signature=fake-signature",
+		},
+		strings.Repeat("x", 300) + "token": "fake-long-key-secret",
+	}
+	for i := 0; i < 500; i++ {
+		args[fmt.Sprintf("arg-%d", i)] = strings.Repeat("\n", 300)
+	}
+	out := formatArgs(args)
+	if len(out) > maxLoggedArgsLen || strings.ContainsAny(out, "\n\r\x00") {
+		t.Fatalf("log must be bounded and single-line: %d", len(out))
+	}
+	for _, leak := range []string{"fake-ak", "fake-sk", "fake-auth", "fake-signature", "fake-long-key-secret"} {
+		if strings.Contains(out, leak) {
+			t.Fatalf("secret leaked: %s", leak)
+		}
+	}
+	if !json.Valid([]byte(out)) {
+		t.Fatalf("bounded args must remain valid JSON: %q", out)
+	}
+	delete(args, "key\nFORGED\r\x00")
+	out = formatArgs(map[string]any{"nested": []any{map[string]any{"password": "fake-secret", "safe": "kept"}}})
+	if strings.Contains(out, "fake-secret") || !strings.Contains(out, "kept") {
+		t.Fatalf("recursive redaction failed: %q", out)
+	}
+}
+
+func TestRequestLogEscapesDynamicFieldsAndOmitsErrors(t *testing.T) {
+	s := &Server{reqLog: RequestLogFull}
 	out := captureLog(t, func() {
-		rec := s.startToolCall(ctx, callReq("data_agent_list_workspaces", nil))
-		rec.finish(mcp.NewToolResultError("identity request rejected"), nil)
+		rec := s.startToolCall(context.Background(), callReq("tool\nFORGED\r\x00", map[string]any{"key\nFORGED": "value\r\n"}))
+		rec.finish(nil, errors.New("https://example.invalid/?Signature=fake-error-secret\nFORGED"))
 	})
-	if strings.Contains(out, spoofed) {
-		t.Errorf("unverified header identity was logged as the caller: %q", out)
-	}
-	if !strings.Contains(out, "caller=-") {
-		t.Errorf("expected an anonymous caller, got %q", out)
-	}
-
-	// A token present but not yet verified is reported as such.
-	ctx = tenant.WithJWT(tenant.WithIdentity(context.Background(), spoofed, "", ""), "some.jwt.token")
-	out = captureLog(t, func() {
-		rec := s.startToolCall(ctx, callReq("data_agent_list_workspaces", nil))
-		rec.finish(mcp.NewToolResultError("rejected"), nil)
-	})
-	if strings.Contains(out, spoofed) {
-		t.Errorf("unverified header identity leaked: %q", out)
-	}
-	if !strings.Contains(out, "jwt(unverified)") {
-		t.Errorf("expected jwt(unverified) caller, got %q", out)
-	}
-
-	// Verified claims are what gets attributed.
-	ctx = tenant.WithClaims(context.Background(), &tenant.Claims{UserID: spoofed, Email: "real@example.com"})
-	out = captureLog(t, func() {
-		rec := s.startToolCall(ctx, callReq("data_agent_list_workspaces", nil))
-		rec.finish(mcp.NewToolResultText("ok"), nil)
-	})
-	if !strings.Contains(out, spoofed+"/real@example.com") {
-		t.Errorf("verified claims should be logged as the caller: %q", out)
-	}
-
-	// Header mode keeps its existing behaviour: auth_token is what vouches
-	// for those headers, so they are the caller.
-	s = &Server{reqLog: RequestLogBasic}
-	ctx = tenant.WithIdentity(context.Background(), "ou_alice", "", "")
-	out = captureLog(t, func() {
-		rec := s.startToolCall(ctx, callReq("t", nil))
-		rec.finish(mcp.NewToolResultText("ok"), nil)
-	})
-	if !strings.Contains(out, "caller=ou_alice") {
-		t.Errorf("header mode should still report the header identity: %q", out)
+	if strings.Count(out, "\n") != 2 || strings.ContainsAny(out, "\r\x00") || strings.Contains(out, "fake-error-secret") {
+		t.Fatalf("unsafe request log: %q", out)
 	}
 }
 

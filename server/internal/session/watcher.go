@@ -8,8 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,11 +20,11 @@ import (
 // raw SSE events into State mutations, handles auto-confirmation when enabled,
 // and supports external message injection for manual confirmations.
 type Watcher struct {
-	state   *State
-	client  watcherClient
-	sessDir string
-	opMu    sync.Mutex
-	exited  bool
+	state  *State
+	client watcherClient
+	store  *sessionStore
+	opMu   sync.Mutex
+	exited bool
 
 	cancelMu sync.Mutex
 	cancel   context.CancelFunc
@@ -42,20 +40,18 @@ type watcherClient interface {
 	SendMessage(context.Context, dataagent.SendMessageOpts) error
 }
 
-// NewWatcher creates a new session watcher. The watcher does not start
-// processing until Run is called.
-func NewWatcher(state *State, client *dataagent.Client, sessDir string) *Watcher {
-	return &Watcher{
-		state:   state,
-		client:  client,
-		sessDir: sessDir,
-	}
+// newWatcher shares the manager's root; it never reopens a naked path.
+func newWatcher(state *State, client *dataagent.Client, store *sessionStore) *Watcher {
+	return &Watcher{state: state, client: client, store: store}
 }
 
 // Run starts the SSE monitoring loop. It blocks until the context is canceled
 // or the stream ends (completed / error / canceled). The caller is expected to
 // invoke this in a goroutine.
 func (w *Watcher) Run(ctx context.Context) {
+	if ValidateSessionID(w.state.GetSessionID()) != nil {
+		return
+	}
 	// Store the cancel function so StopSession can call it.
 	w.cancelMu.Lock()
 	ctx, cancel := context.WithCancel(ctx)
@@ -107,18 +103,18 @@ func (w *Watcher) Run(ctx context.Context) {
 		if isError {
 			consecutiveErrors++
 			if consecutiveErrors > maxConsecutiveErrors {
-				log.Printf("[session:%s] giving up after %d consecutive SSE errors",
-					w.state.GetSessionID(), maxConsecutiveErrors)
+				log.Printf("[session:%q] giving up after %d consecutive SSE errors",
+					logToken(w.state.GetSessionID()), maxConsecutiveErrors)
 				w.opMu.Lock()
 				w.exited = true
 				w.state.SetError("SSE connection failed: too many consecutive errors")
-				w.state.Persist(w.sessDir)
+				w.state.persist(w.store)
 				w.opMu.Unlock()
 				return
 			}
 			wait := time.Duration(min(1<<uint(consecutiveErrors), 60)) * time.Second
-			log.Printf("[session:%s] SSE error, retry %d/%d in %v",
-				w.state.GetSessionID(), consecutiveErrors, maxConsecutiveErrors, wait)
+			log.Printf("[session:%q] SSE error, retry %d/%d in %v",
+				logToken(w.state.GetSessionID()), consecutiveErrors, maxConsecutiveErrors, wait)
 			select {
 			case <-time.After(wait):
 			case <-ctx.Done():
@@ -142,6 +138,9 @@ func (w *Watcher) Stop() {
 var errWatcherExited = errors.New("session watcher has exited")
 
 func (w *Watcher) SendMessage(ctx context.Context, message string) error {
+	if err := ValidateSessionID(w.state.GetSessionID()); err != nil {
+		return err
+	}
 	before := w.state.Snapshot()
 	if before.MessageStatus == SendSending || before.Requests[before.PendingAsk].Status == SendSending {
 		return fmt.Errorf("another message is being sent; inspect session status before retrying")
@@ -160,6 +159,12 @@ func (w *Watcher) SendMessage(ctx context.Context, message string) error {
 
 // The caller holds opMu across event application and sending to bind replies to one ask.
 func (w *Watcher) sendMessage(ctx context.Context, key, message string, auto bool) error {
+	if err := ValidateSessionID(w.state.GetSessionID()); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	snap := w.state.Snapshot()
 	if key == "" && strings.EqualFold(strings.TrimSpace(message), "confirm") {
 		return fmt.Errorf("no pending confirmation request; inspect session status before sending")
@@ -183,7 +188,7 @@ func (w *Watcher) sendMessage(ctx context.Context, key, message string, auto boo
 	}
 
 	w.state.SetSendStatus(key, SendSending, auto)
-	if err := w.state.Persist(w.sessDir); err != nil {
+	if err := w.state.persist(w.store); err != nil {
 		w.state.SetSendStatus(key, SendFailed, auto)
 		return fmt.Errorf("persist send intent: %w", err)
 	}
@@ -201,14 +206,14 @@ func (w *Watcher) sendMessage(ctx context.Context, key, message string, auto boo
 			status = SendFailed
 		}
 		w.state.SetSendStatus(key, status, auto)
-		if persistErr := w.state.Persist(w.sessDir); persistErr != nil {
+		if persistErr := w.state.persist(w.store); persistErr != nil {
 			return fmt.Errorf("send message: %w (cannot persist delivery state: %v)", err, persistErr)
 		}
 		return fmt.Errorf("send message: %w", err)
 	}
 
 	w.state.SetSendStatus(key, SendAcknowledged, auto)
-	persistErr := w.state.Persist(w.sessDir)
+	persistErr := w.state.persist(w.store)
 	w.sseCancelMu.Lock()
 	if w.sseCancel != nil {
 		w.sseCancel()
@@ -226,6 +231,9 @@ func (w *Watcher) sendMessage(ctx context.Context, key, message string, auto boo
 //   - (false, false): caller should reconnect (e.g. after auto-confirmation)
 //   - (false, true): transient SSE error, caller should retry with backoff
 func (w *Watcher) streamOnce(ctx context.Context) (bool, bool) {
+	if ValidateSessionID(w.state.GetSessionID()) != nil {
+		return true, true
+	}
 	w.opMu.Lock()
 	if ctx.Err() != nil {
 		w.opMu.Unlock()
@@ -264,7 +272,7 @@ func (w *Watcher) streamOnce(ctx context.Context) (bool, bool) {
 			if !w.state.EventApplied(key) {
 				w.state.MarkEventApplied(key)
 				w.state.StartTurn(key)
-				w.state.Persist(w.sessDir)
+				w.state.persist(w.store)
 			}
 		}
 		switch ev.EventType {
@@ -331,7 +339,7 @@ func (w *Watcher) streamOnce(ctx context.Context) (bool, bool) {
 			if parsed.Action == event.ActionCompleted && snap.Requests[snap.PendingAsk].Kind == "ask_report_render" {
 				// The report offer precedes the analysis tail; rendering starts a separate turn.
 				w.state.MarkReportReady(snap.PendingAsk)
-				if err := w.state.Persist(w.sessDir); err != nil {
+				if err := w.state.persist(w.store); err != nil {
 					w.state.SetSendStatus(snap.PendingAsk, SendFailed, false)
 					return false, false, true
 				}
@@ -339,7 +347,7 @@ func (w *Watcher) streamOnce(ctx context.Context) (bool, bool) {
 			}
 		}
 		w.handleParsedEvent(parsed)
-		w.state.Persist(w.sessDir)
+		w.state.persist(w.store)
 		w.exited = parsed.Action.IsTerminal()
 		return w.exited, false, false
 	}
@@ -380,11 +388,14 @@ func (w *Watcher) eventKey(ev dataagent.SSEEvent) (string, bool) {
 }
 
 func (w *Watcher) handleConfirmation(ctx context.Context, pe event.ParsedEvent, key string, stable bool) bool {
+	if ValidateSessionID(w.state.GetSessionID()) != nil || ctx.Err() != nil {
+		return false
+	}
 	request, fresh := w.state.RegisterAsk(ConfirmationRequest{Key: key, Kind: pe.Category, Content: pe.Content, Stable: stable})
 	if !fresh {
 		return false
 	}
-	if err := w.state.Persist(w.sessDir); err != nil {
+	if err := w.state.persist(w.store); err != nil {
 		w.state.SetSendStatus(key, SendFailed, false)
 		return false
 	}
@@ -392,7 +403,7 @@ func (w *Watcher) handleConfirmation(ctx context.Context, pe event.ParsedEvent, 
 		return false
 	}
 	if err := w.sendMessage(ctx, key, "confirm", true); err != nil {
-		log.Printf("[session:%s] confirmation request=%s delivery=%s", w.state.GetSessionID(), key[:12], w.state.Snapshot().Requests[key].Status)
+		log.Printf("[session:%q] confirmation request=%q delivery=%q", logToken(w.state.GetSessionID()), logToken(key), logToken(string(w.state.Snapshot().Requests[key].Status)))
 	}
 	return w.state.Snapshot().Requests[key].Status == SendAcknowledged
 }
@@ -440,48 +451,29 @@ func (w *Watcher) handleParsedEvent(pe event.ParsedEvent) {
 // persistImages decodes base64 images and writes them to the session images directory.
 // Returns the list of filenames that were successfully persisted.
 func (w *Watcher) persistImages(images []event.Base64Image) []string {
-	if len(images) == 0 {
+	id := w.state.GetSessionID()
+	if ValidateSessionID(id) != nil || len(images) == 0 {
 		return nil
 	}
-
-	// Allocate contiguous sequence numbers
 	startSeq := w.state.AllocImageSeq(len(images))
-
-	// Create images directory under session dir
-	imgDir := filepath.Join(w.sessDir, w.state.GetSessionID(), "images")
-	if err := os.MkdirAll(imgDir, 0o755); err != nil {
-		log.Printf("[session:%s] mkdir images failed: %v", w.state.GetSessionID(), err)
+	// Persist the sequence allocation first; a crash must not overwrite an old image.
+	if w.state.persist(w.store) != nil {
 		return nil
 	}
-
 	var persisted []string
 	for i, img := range images {
-		seq := startSeq + i
-		filename := fmt.Sprintf("img_%d.%s", seq, img.Format)
-		destPath := filepath.Join(imgDir, filename)
-
-		// Decode base64
+		filename := fmt.Sprintf("img_%d.%s", startSeq+i, img.Format)
+		if !validImageName(filename) {
+			continue
+		}
 		decoded, err := base64.StdEncoding.DecodeString(img.B64Data)
 		if err != nil {
-			log.Printf("[session:%s] decode image %s failed: %v", w.state.GetSessionID(), filename, err)
 			continue
 		}
-
-		// Atomic write: tmp + rename
-		tmpPath := destPath + ".tmp"
-		if err := os.WriteFile(tmpPath, decoded, 0o644); err != nil {
-			log.Printf("[session:%s] write image %s failed: %v", w.state.GetSessionID(), filename, err)
+		if w.store.writeImage(id, filename, decoded) != nil {
 			continue
 		}
-		if err := os.Rename(tmpPath, destPath); err != nil {
-			log.Printf("[session:%s] rename image %s failed: %v", w.state.GetSessionID(), filename, err)
-			os.Remove(tmpPath)
-			continue
-		}
-
 		persisted = append(persisted, filename)
-		log.Printf("[session:%s] persisted image: %s (%d bytes)", w.state.GetSessionID(), filename, len(decoded))
 	}
-
 	return persisted
 }

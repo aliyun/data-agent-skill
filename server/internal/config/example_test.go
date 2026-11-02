@@ -8,6 +8,7 @@ import (
 // The shipped example must stay loadable by the current struct definitions;
 // a key renamed in code but not in the template silently loses its value.
 func TestShippedExampleConfigLoads(t *testing.T) {
+	clearEnv(t)
 	t.Setenv("DATA_AGENT_CONFIG", "../../config.yaml.example")
 
 	cfg, path, err := Load()
@@ -19,6 +20,9 @@ func TestShippedExampleConfigLoads(t *testing.T) {
 	if cfg.Region != "cn-hangzhou" {
 		t.Errorf("region = %q, want cn-hangzhou", cfg.Region)
 	}
+	if cfg.AgentGateway.DataSourcesEnabled {
+		t.Error("agent_gateway.data_sources_enabled must default to false in the template")
+	}
 	// Left unset in the template so the transport-derived default applies.
 	if cfg.Log.Requests != "" {
 		t.Errorf("log.requests = %q, want empty in the template", cfg.Log.Requests)
@@ -27,8 +31,6 @@ func TestShippedExampleConfigLoads(t *testing.T) {
 	for name, got := range map[string]string{
 		"data_agent_endpoint":     cfg.DataAgentEndpoint,
 		"dms_enterprise_endpoint": cfg.DMSEnterpriseEndpoint,
-		"api_key_endpoint":        cfg.APIKeyEndpoint,
-		"api_key_stream_endpoint": cfg.APIKeyStreamEndpoint,
 	} {
 		if got != "" {
 			t.Errorf("%s = %q, want empty in the template", name, got)
@@ -39,6 +41,7 @@ func TestShippedExampleConfigLoads(t *testing.T) {
 // custom_agent_id mirrors workspace_id: a top-level default plus an env
 // override, so a non-identity deployment can pin an agent too.
 func TestCustomAgentIDFromEnvAndYAML(t *testing.T) {
+	clearEnv(t)
 	dir := t.TempDir()
 	path := dir + "/config.yaml"
 	if err := os.WriteFile(path, []byte("region: cn-hangzhou\ncustom_agent_id: ca-from-yaml\n"), 0o600); err != nil {

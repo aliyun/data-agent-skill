@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/alibabacloud/data-agent-mcp-server/internal/config"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/dataagent"
@@ -19,75 +21,83 @@ var version = "dev"
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 	log.SetOutput(os.Stderr)
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
+func run() error {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		log.Println("shutting down...")
-		cancel()
-	}()
-
-	// Configuration: env vars > .env file > YAML config file > defaults.
-	config.LoadDotEnv()
-	cfg, cfgPath, err := config.Load()
+	if err := config.LoadDotEnv(); err != nil {
+		return fmt.Errorf("configuration error: %w", err)
+	}
+	cfg, _, err := config.Load()
 	if err != nil {
-		log.Fatalf("configuration error: %v", err)
+		return fmt.Errorf("configuration error: %w", err)
 	}
-	if cfgPath != "" {
-		log.Printf("loaded config from %s", cfgPath)
+	transport := os.Getenv("MCP_TRANSPORT")
+	if err := cfg.ValidateTransport(transport); err != nil {
+		return fmt.Errorf("configuration error: %w", err)
+	}
+	remote := transport == "sse" || transport == "streamable-http"
+	provider, err := dataagent.NewCredentialProvider()
+	if err != nil {
+		return fmt.Errorf("failed to initialize credentials: %w", err)
 	}
 
-	var cred *dataagent.Credential
-	if cfg.APIKey != "" {
-		cred = &dataagent.Credential{APIKey: cfg.APIKey}
-		log.Println("using API Key authentication")
-	} else {
-		cred, err = dataagent.LoadCredential()
-		if err != nil {
-			log.Fatalf("failed to load credentials: %v", err)
+	var mgr *session.Manager
+	var client *dataagent.Client
+	if !remote {
+		strictCredential := func() (*dataagent.Credential, error) {
+			return dataagent.CredentialFromProvider(provider)
 		}
+		cred, err := strictCredential()
+		if err != nil {
+			return fmt.Errorf("failed to load credentials: %w", err)
+		}
+		client = dataagent.NewClient(cred, cfg.Region,
+			dataagent.WithStrictCredentialProvider(strictCredential),
+			dataagent.WithCredentialProvider(func() *dataagent.Credential {
+				current, err := strictCredential()
+				if err != nil {
+					return cred // Legacy analysis only; the gateway always uses strict refresh.
+				}
+				return current
+			}),
+			dataagent.WithGatewayOptions(dataagent.GatewayOptions{
+				Endpoint:         cfg.AgentGateway.Endpoint,
+				RequestTimeout:   time.Duration(cfg.AgentGateway.RequestTimeoutSeconds) * time.Second,
+				MaxResponseBytes: cfg.AgentGateway.MaxResponseBytes,
+			}),
+			dataagent.WithDMSUnit(cfg.DMSUnit),
+			dataagent.WithDataAgentEndpoint(cfg.DataAgentEndpoint),
+			dataagent.WithDMSEnterpriseEndpoint(cfg.DMSEnterpriseEndpoint),
+			dataagent.WithWorkspaceID(cfg.WorkspaceID),
+		)
+		mgr, err = session.NewManager(client, cfg.SessionsDir)
+		if err != nil {
+			return fmt.Errorf("session storage initialization failed: %w", err)
+		}
+		defer mgr.Close()
+		mgr.RestoreSessions(ctx)
+		go mgr.RunHousekeeping(ctx)
 	}
-
-	var clientOpts []dataagent.ClientOption
-	if cfg.DMSUnit != "" {
-		clientOpts = append(clientOpts, dataagent.WithDMSUnit(cfg.DMSUnit))
-	}
-	// Endpoint overrides; empty values keep the region-derived defaults.
-	clientOpts = append(clientOpts,
-		dataagent.WithDataAgentEndpoint(cfg.DataAgentEndpoint),
-		dataagent.WithDMSEnterpriseEndpoint(cfg.DMSEnterpriseEndpoint),
-		dataagent.WithAPIKeyEndpoint(cfg.APIKeyEndpoint),
-		dataagent.WithAPIKeyStreamEndpoint(cfg.APIKeyStreamEndpoint),
-	)
-	if cfg.WorkspaceID != "" {
-		clientOpts = append(clientOpts, dataagent.WithWorkspaceID(cfg.WorkspaceID))
-	}
-	client := dataagent.NewClient(cred, cfg.Region, clientOpts...)
-	log.Printf("endpoints: data-agent=%s dms-enterprise=%s", client.DataAgentEndpoint(), client.DMSEnterpriseEndpoint())
-	if cred.IsAPIKey() {
-		log.Printf("endpoints: api-key=%s api-key-stream=%s", client.APIKeyEndpoint(), client.APIKeyStreamEndpoint())
-	}
-
-	mgr := session.NewManager(client, cfg.SessionsDir)
-	mgr.RestoreSessions(ctx)
-	go mgr.RunHousekeeping(ctx)
 
 	srv := mcpserver.New(mgr, client, version)
 	srv.SetCustomAgentID(cfg.CustomAgentID)
 	srv.ApplyRequestLogConfig(cfg.Log.Requests)
-
-	// Identity multi-tenant mode: map upstream identity headers (e.g. Feishu
-	// Aily's x-aily-user/x-aily-email) to per-user RAM roles via STS
-	// AssumeRole so RAM/DMS permissions apply per end user.
-	if cfg.Identity.Enabled {
-		registry := tenant.NewRegistry(ctx, cfg, cred)
+	srv.EnableGateway(cfg.AgentGateway.Enabled, cfg.AgentGateway.DataSourcesEnabled, remote)
+	if remote {
+		registry := tenant.NewRegistry(ctx, cfg, provider)
+		defer registry.Close()
 		srv.SetIdentityHeaders(cfg.Identity.Headers.User, cfg.Identity.Headers.Email, cfg.Identity.Headers.Token)
 		if cfg.Identity.JWT.Enabled {
 			srv.EnableJWTIdentity(cfg.Identity.JWT.Header)
+		}
+		if err := srv.ConfigureHTTP(cfg.HTTP, registry.Authenticate); err != nil {
+			return err
 		}
 		srv.SetResolver(func(reqCtx context.Context) (*session.Manager, *dataagent.Client, mcpserver.SessionDefaults, error) {
 			t, err := registry.Resolve(reqCtx)
@@ -95,26 +105,14 @@ func main() {
 				return nil, nil, mcpserver.SessionDefaults{}, err
 			}
 			if t == nil {
-				return nil, nil, mcpserver.SessionDefaults{}, nil // default server identity
+				return nil, nil, mcpserver.SessionDefaults{}, fmt.Errorf("verified identity required")
 			}
-			defaults := mcpserver.SessionDefaults{
+			return t.Manager, t.Client, mcpserver.SessionDefaults{
 				Mode:          t.Defaults.Mode,
 				CustomAgentID: t.Defaults.CustomAgentID,
-			}
-			return t.Manager, t.Client, defaults, nil
+			}, nil
 		})
-		if cfg.Identity.JWT.Enabled {
-			log.Printf("identity multi-tenant mode enabled (jwt=%s, session_name_claim=%s, default_group=%v, groups=%d)",
-				cfg.Identity.JWT.Header, cfg.Identity.SessionNameClaim,
-				cfg.Identity.Default != nil && cfg.Identity.Default.RoleArn != "", len(cfg.Identity.Groups))
-		} else {
-			log.Printf("identity multi-tenant mode enabled (default_group=%v, groups=%d, require_identity=%v, headers=%s/%s)",
-				cfg.Identity.Default != nil && cfg.Identity.Default.RoleArn != "", len(cfg.Identity.Groups),
-				cfg.Identity.RequireIdentity, cfg.Identity.Headers.User, cfg.Identity.Headers.Email)
-		}
+		log.Printf("remote identity enabled namespace=%q jwt=%t groups=%d", cfg.Identity.Namespace, cfg.Identity.JWT.Enabled, len(cfg.Identity.Groups))
 	}
-
-	if err := srv.Run(ctx); err != nil {
-		log.Fatalf("mcp server error: %v", err)
-	}
+	return srv.Run(ctx)
 }

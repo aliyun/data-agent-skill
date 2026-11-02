@@ -1,9 +1,16 @@
 package tenant
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log"
+	"net/http"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	credential "github.com/aliyun/credentials-go/credentials"
 
@@ -12,9 +19,34 @@ import (
 )
 
 func testRegistry(cfg config.Config) *Registry {
-	cfg.ApplyDefaults() // fill Aily-compatible header names and prefix
-	base := &dataagent.Credential{AccessKeyID: "ak", AccessKeySecret: "sk"}
-	return NewRegistry(context.Background(), cfg, base)
+	cfg.ApplyDefaults()
+	cfg.Identity.Namespace = "test-domain"
+	cfg.Identity.RequireIdentity = true
+	if cfg.Identity.AuthToken == "" {
+		cfg.Identity.AuthToken = testAuthToken
+	}
+	return NewRegistry(context.Background(), cfg, &fakeProvider{})
+}
+
+func resolveAuthenticated(r *Registry, ctx context.Context) (*Tenant, error) {
+	verified, err := r.Authenticate(ctx)
+	if err != nil {
+		caller, _ := ctx.Value(gatewayIdentityKey{}).(*GatewayCaller)
+		return nil, gatewayFailure(caller, err)
+	}
+	return r.Resolve(verified)
+}
+
+func expectedPrincipalID(r *Registry, user, email string) string {
+	c := &Claims{UserID: user, Email: email}
+	mode := "headers"
+	if r.cfg.Identity.JWT.Enabled {
+		mode = "jwt"
+		c.TenantID = bigTenantID
+		c.AgentID = "agent_abc"
+	}
+	p, _ := makePrincipal(r.cfg.Identity.Namespace, mode, c)
+	return p.ID
 }
 
 func TestIdentityContextRoundTrip(t *testing.T) {
@@ -38,7 +70,7 @@ func TestResolveRejectsBadAuthToken(t *testing.T) {
 	}})
 
 	ctx := WithIdentity(context.Background(), "ou_alice", "", "wrong")
-	if _, err := r.Resolve(ctx); err == nil || !strings.Contains(err.Error(), "x-aily-token") {
+	if _, err := resolveAuthenticated(r, ctx); !IsAuthenticationError(err) {
 		t.Fatalf("expected shared-secret rejection, got %v", err)
 	}
 }
@@ -49,23 +81,20 @@ func TestResolveRequireIdentityFailClosed(t *testing.T) {
 		RequireIdentity: true,
 	}})
 
-	if _, err := r.Resolve(context.Background()); err == nil || !strings.Contains(err.Error(), "x-aily-user") {
+	if _, err := resolveAuthenticated(r, context.Background()); !IsAuthenticationError(err) {
 		t.Fatalf("expected identity-required rejection, got %v", err)
 	}
 }
 
-func TestResolveFallsBackToDefaultIdentity(t *testing.T) {
+func TestResolveNeverFallsBackToDefaultIdentity(t *testing.T) {
 	r := testRegistry(config.Config{Identity: config.Identity{
 		Enabled:         true,
 		RequireIdentity: false,
 	}})
 
-	tn, err := r.Resolve(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if tn != nil {
-		t.Fatal("expected nil tenant (default identity) when headers absent")
+	tn, err := resolveAuthenticated(r, context.Background())
+	if err == nil || tn != nil {
+		t.Fatal("anonymous fallback accepted")
 	}
 }
 
@@ -77,8 +106,8 @@ func TestResolveRejectsUnmappedUser(t *testing.T) {
 		},
 	}})
 
-	ctx := WithIdentity(context.Background(), "ou_mallory", "mallory@example.com", "")
-	if _, err := r.Resolve(ctx); err == nil || !strings.Contains(err.Error(), "no identity group") {
+	ctx := WithIdentity(context.Background(), "ou_mallory", "mallory@example.com", testAuthToken)
+	if _, err := resolveAuthenticated(r, ctx); !errors.Is(err, config.ErrIdentityUnmapped) {
 		t.Fatalf("expected unmatched-user rejection, got %v", err)
 	}
 }
@@ -136,12 +165,11 @@ func TestSessionNameMeetsStsMinimumWithoutPrefix(t *testing.T) {
 	}
 }
 
-func TestSanitizePath(t *testing.T) {
-	if got := sanitize("../../etc/passwd"); strings.Contains(got, "/") || strings.HasPrefix(got, ".") {
-		t.Fatalf("path traversal not neutralized: %q", got)
-	}
-	if got := sanitize("bob@example.com"); got != "bob@example.com" {
-		t.Fatalf("safe chars mangled: %q", got)
+func TestIdentityPathUsesDigestNotSanitization(t *testing.T) {
+	a, _ := makePrincipal("test", "headers", &Claims{UserID: "a+b"})
+	b, _ := makePrincipal("test", "headers", &Claims{UserID: "a_b"})
+	if a.ID == b.ID || !principalIDPattern.MatchString(a.ID) {
+		t.Fatal("lossy identity path")
 	}
 }
 
@@ -175,6 +203,7 @@ func TestUsersSharingRoleGetSeparateTenants(t *testing.T) {
 			},
 		},
 	})
+	t.Cleanup(func() { _ = r.Close() })
 	var sessionNames []string
 	r.newProviderFn = func(key, roleArn string) (credential.Credential, error) {
 		if roleArn != sharedRole {
@@ -184,11 +213,11 @@ func TestUsersSharingRoleGetSeparateTenants(t *testing.T) {
 		return fakeProvider{}, nil
 	}
 
-	alice, err := r.Resolve(WithIdentity(context.Background(), "ou_alice", "", ""))
+	alice, err := resolveAuthenticated(r, WithIdentity(context.Background(), "ou_alice", "", testAuthToken))
 	if err != nil {
 		t.Fatal(err)
 	}
-	bob, err := r.Resolve(WithIdentity(context.Background(), "ou_bob", "", ""))
+	bob, err := resolveAuthenticated(r, WithIdentity(context.Background(), "ou_bob", "", testAuthToken))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +236,7 @@ func TestUsersSharingRoleGetSeparateTenants(t *testing.T) {
 	}
 
 	// Repeated resolve returns the cached tenant, no extra AssumeRole provider.
-	again, err := r.Resolve(WithIdentity(context.Background(), "ou_alice", "", ""))
+	again, err := resolveAuthenticated(r, WithIdentity(context.Background(), "ou_alice", "", testAuthToken))
 	if err != nil || again != alice {
 		t.Fatalf("cached tenant not reused: %v %v", again, err)
 	}
@@ -234,5 +263,337 @@ func TestRedactCredentials(t *testing.T) {
 	}
 	if !strings.Contains(got, "AccessKeyId=<redacted>") {
 		t.Errorf("expected redaction marker: %s", got)
+	}
+}
+
+func TestGatewayJWTRequiresValidTokenNoHeaderDowngrade(t *testing.T) {
+	for name, raw := range map[string]string{
+		"missing":         "",
+		"invalid":         "not-a-jwt",
+		"wrong signature": signToken(t, "other-secret", ailyClaims(), time.Now().Add(time.Hour)),
+		"expired":         signToken(t, testSecret, ailyClaims(), time.Now().Add(-time.Minute)),
+		"no identity":     signToken(t, testSecret, map[string]any{"tenant_id": "tenant-only"}, time.Now().Add(time.Hour)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, asked := jwtRegistry(t, "user_id", nil)
+			ctx := WithIdentity(WithJWT(context.Background(), raw), bigUserID, "forged@example.com", testAuthToken)
+			ctx, caller := WithGatewayIdentity(ctx)
+			tn, err := resolveAuthenticated(r, ctx)
+			var gatewayErr *dataagent.GatewayError
+			if tn != nil || !errors.As(err, &gatewayErr) || gatewayErr.Code != "GATEWAY_IDENTITY_REJECTED" {
+				t.Fatalf("got tenant=%v error=%v", tn, err)
+			}
+			if *caller != (GatewayCaller{}) || len(*asked) != 0 {
+				t.Fatal("unverified identity reached caller or provider")
+			}
+		})
+	}
+}
+
+func TestGatewayHeaderIdentityRequiredRegardlessLegacySetting(t *testing.T) {
+	for _, user := range []string{"", "   "} {
+		r, asked := identityRegistry(t, config.Identity{
+			Enabled: true, AuthToken: testAuthToken, RequireIdentity: false,
+			Default: &config.IdentityGroup{RoleArn: "acs:ram::123:role/shared"},
+		})
+		ctx, caller := WithGatewayIdentity(WithIdentity(context.Background(), user, "", testAuthToken))
+		if tn, err := resolveAuthenticated(r, ctx); tn != nil || err == nil {
+			t.Fatal("anonymous gateway fallback accepted")
+		}
+		if *caller != (GatewayCaller{}) || len(*asked) != 0 {
+			t.Fatal("anonymous request reached provider")
+		}
+	}
+}
+
+func TestGatewayPlatformTokenAlwaysRequired(t *testing.T) {
+	for _, jwtEnabled := range []bool{true, false} {
+		for _, token := range []string{"", "wrong"} {
+			r, asked := identityRegistry(t, config.Identity{
+				Enabled: true, AuthToken: testAuthToken, JWT: config.JWT{Enabled: jwtEnabled, Secret: testSecret},
+				Default: &config.IdentityGroup{RoleArn: "acs:ram::123:role/shared"},
+			})
+			ctx := WithIdentity(jwtCtx(t, ailyClaims()), bigUserID, "test@example.com", token)
+			ctx, caller := WithGatewayIdentity(ctx)
+			if tn, err := resolveAuthenticated(r, ctx); tn != nil || err == nil {
+				t.Fatal("bad platform token accepted")
+			}
+			if *caller != (GatewayCaller{}) || len(*asked) != 0 {
+				t.Fatal("bad token reached provider")
+			}
+		}
+	}
+	// Hand-built invalid registry configurations must not enable anonymous auth.
+	for _, id := range []config.Identity{{Enabled: false, AuthToken: testAuthToken}, {Enabled: true}} {
+		r := testRegistry(config.Config{Identity: id})
+		ctx, _ := WithGatewayIdentity(WithIdentity(context.Background(), "user", "", testAuthToken))
+		if _, err := resolveAuthenticated(r, ctx); err == nil {
+			t.Fatal("invalid identity config accepted")
+		}
+	}
+}
+
+func TestGatewayVerifiedCallerAndRoleMapping(t *testing.T) {
+	for _, jwtEnabled := range []bool{true, false} {
+		for _, withDefault := range []bool{true, false} {
+			id := config.Identity{
+				Enabled: true, AuthToken: testAuthToken, JWT: config.JWT{Enabled: jwtEnabled, Secret: testSecret},
+				Groups: map[string]config.IdentityGroup{"analysts": {RoleArn: "acs:ram::123:role/analysts", Users: []string{bigUserID, "mapped@example.com"}}},
+			}
+			if withDefault {
+				id.Default = &config.IdentityGroup{RoleArn: "acs:ram::123:role/shared"}
+			}
+			r, _ := identityRegistry(t, id)
+			for _, tc := range []struct{ user, email, group string }{
+				{bigUserID, "verified@example.com", "analysts"},
+				{"email-user", "mapped@example.com", "analysts"},
+				{"unknown", "unknown@example.com", "default"},
+			} {
+				ctx := WithIdentity(context.Background(), tc.user, tc.email, testAuthToken)
+				if jwtEnabled {
+					ctx = WithIdentity(jwtCtx(t, map[string]any{"user_id": tc.user, "email": tc.email}), "forged-user", "forged-email", testAuthToken)
+				}
+				ctx, caller := WithGatewayIdentity(ctx)
+				tn, err := resolveAuthenticated(r, ctx)
+				if tc.group == "default" && !withDefault {
+					var gatewayErr *dataagent.GatewayError
+					if tn != nil || !errors.As(err, &gatewayErr) || gatewayErr.Code != "GATEWAY_IDENTITY_UNMAPPED" || *caller != (GatewayCaller{}) {
+						t.Fatalf("unmapped result: %v", err)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if caller.UserID != tc.user || caller.Email != tc.email || caller.Group != tc.group || caller.RoleArn != tn.RoleArn {
+					t.Fatalf("caller not verified/mapped: %+v", caller)
+				}
+				// A new request gets a distinct caller record, not cached identity data.
+				_, next := WithGatewayIdentity(ctx)
+				if next == caller || *next != (GatewayCaller{}) {
+					t.Fatal("caller record shared across requests")
+				}
+			}
+		}
+	}
+}
+
+func TestGatewayRejectsCachedRoleMappingMismatch(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		for _, sameRole := range []bool{false, true} {
+			defaultRole := "acs:ram::123:role/restricted"
+			if sameRole {
+				defaultRole = "acs:ram::123:role/privileged"
+			}
+			r, asked := identityRegistry(t, config.Identity{
+				Enabled: true, AuthToken: testAuthToken,
+				JWT:     config.JWT{Enabled: true, Secret: testSecret},
+				Default: &config.IdentityGroup{RoleArn: defaultRole},
+				Groups:  map[string]config.IdentityGroup{"privileged": {RoleArn: "acs:ram::123:role/privileged", Users: []string{"admin@example.com"}}},
+			})
+			initial := jwtCtx(t, map[string]any{"user_id": "same-user", "email": "admin@example.com"})
+			if !legacy {
+				initial, _ = WithGatewayIdentity(initial)
+			}
+			if tn, err := resolveAuthenticated(r, initial); err != nil || tn.Group != "privileged" {
+				t.Fatalf("initial tenant: %v", err)
+			}
+			changed, caller := WithGatewayIdentity(jwtCtx(t, map[string]any{"user_id": "same-user"}))
+			tn, err := resolveAuthenticated(r, changed)
+			var failure *dataagent.GatewayError
+			if tn != nil || !errors.As(err, &failure) || failure.Code != "GATEWAY_IDENTITY_REJECTED" || *caller != (GatewayCaller{}) {
+				t.Fatalf("cached role was reused under changed mapping: tenant=%v caller=%+v error=%v", tn, caller, err)
+			}
+			if len(*asked) != 1 {
+				t.Fatal("mapping rejection created another credential provider")
+			}
+		}
+	}
+}
+
+type mutableProvider struct {
+	fakeProvider
+	mu    sync.Mutex
+	value *dataagent.Credential
+	err   error
+	calls int
+}
+
+func (p *mutableProvider) GetCredential() (*credential.CredentialModel, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	if p.err != nil {
+		return nil, p.err
+	}
+	if p.value == nil {
+		return nil, nil
+	}
+	v := *p.value
+	return &credential.CredentialModel{AccessKeyId: &v.AccessKeyID, AccessKeySecret: &v.AccessKeySecret, SecurityToken: &v.SecurityToken}, nil
+}
+
+func TestGatewayCredentialRefreshFailureDoesNotReturnSnapshotOrLogSecrets(t *testing.T) {
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	provider := &mutableProvider{value: &dataagent.Credential{AccessKeyID: "old", AccessKeySecret: "sk", SecurityToken: "token"}}
+	tn := &Tenant{provider: provider}
+	initial, err := tn.strictCredential()
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.err = errors.New("AccessKeyId=secret-ak Signature=secret-signature raw-body-secret")
+	if c, err := tn.strictCredential(); c != nil || err == nil || strings.Contains(err.Error(), "secret-") {
+		t.Fatalf("strict refresh returned snapshot or SDK detail: %v", err)
+	}
+	if c := tn.currentCredential(); c != initial {
+		t.Fatal("legacy analysis fallback changed")
+	}
+	if strings.Contains(logs.String(), "secret") {
+		t.Fatal("credential error leaked to logs")
+	}
+	provider.err = nil
+	provider.value = &dataagent.Credential{AccessKeyID: "new", AccessKeySecret: "new-sk", SecurityToken: "new-token"}
+	if c, err := tn.strictCredential(); err != nil || c.AccessKeyID != "new" {
+		t.Fatalf("refresh did not recover: %v", err)
+	}
+	provider.value = nil
+	if c, err := tn.strictCredential(); c != nil || err == nil {
+		t.Fatal("nil model accepted")
+	}
+}
+
+func TestGatewayResolverSanitizesProviderErrors(t *testing.T) {
+	for _, buildFailure := range []bool{true, false} {
+		r, _ := jwtRegistry(t, "user_id", nil)
+		r.newProviderFn = func(string, string) (credential.Credential, error) {
+			if buildFailure {
+				return nil, errors.New("provider-constructor-secret")
+			}
+			return &mutableProvider{err: errors.New("provider-fetch-secret")}, nil
+		}
+		ctx, caller := WithGatewayIdentity(jwtCtx(t, ailyClaims()))
+		tn, err := resolveAuthenticated(r, ctx)
+		var gatewayErr *dataagent.GatewayError
+		if tn != nil || !errors.As(err, &gatewayErr) || gatewayErr.Code != "GATEWAY_CREDENTIAL_ERROR" || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("unsanitized resolver failure: %v", err)
+		}
+		if *caller != (GatewayCaller{}) {
+			t.Fatal("failed resolution populated caller")
+		}
+	}
+}
+
+func TestRoleProviderTracksDynamicBaseAndNeverDowngrades(t *testing.T) {
+	base := &mutableProvider{value: &dataagent.Credential{AccessKeyID: "base-ak", AccessKeySecret: "base-sk", SecurityToken: "base-sts"}}
+	var seen []dataagent.Credential
+	role := &mutableProvider{value: &dataagent.Credential{AccessKeyID: "role-ak", AccessKeySecret: "role-sk", SecurityToken: "role-sts"}}
+	p := &rotatingRoleProvider{base: base, build: func(c *dataagent.Credential) (credential.Credential, error) {
+		seen = append(seen, *c)
+		return role, nil
+	}}
+	for i := 0; i < 2; i++ {
+		if _, err := p.GetCredential(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(seen) != 1 {
+		t.Fatal("stable base unnecessarily rebuilt provider")
+	}
+	base.value = &dataagent.Credential{AccessKeyID: "base-ak", AccessKeySecret: "rotated-sk", SecurityToken: "base-sts"}
+	if _, err := p.GetCredential(); err != nil {
+		t.Fatal(err)
+	}
+	base.value = &dataagent.Credential{AccessKeyID: "rotated-ak", AccessKeySecret: "rotated-sk", SecurityToken: "rotated-sts"}
+	if _, err := p.GetCredential(); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 3 || seen[1].AccessKeySecret != "rotated-sk" || seen[2].SecurityToken != "rotated-sts" {
+		t.Fatal("base tuple rotation was not propagated")
+	}
+	before := role.calls
+	base.err = errors.New("base-secret-refresh-failure")
+	if c, err := p.GetCredential(); c != nil || err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("base refresh failure: %v", err)
+	}
+	if role.calls != before {
+		t.Fatal("base failure silently used previous role provider")
+	}
+	base.err = nil
+	role.err = errors.New("role-secret-refresh-failure")
+	if c, err := p.GetCredential(); c != nil || err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("role refresh failure: %v", err)
+	}
+	role.err = nil
+	base.value = &dataagent.Credential{AccessKeyID: "third-ak", AccessKeySecret: "third-sk", SecurityToken: "third-sts"}
+	p.build = func(*dataagent.Credential) (credential.Credential, error) { return nil, errors.New("build-secret") }
+	before = role.calls
+	if c, err := p.GetCredential(); c != nil || err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("rebuild failure: %v", err)
+	}
+	if role.calls != before {
+		t.Fatal("failed rotation used old role provider")
+	}
+}
+
+func TestGatewayConcurrentCallersDoNotShareIdentity(t *testing.T) {
+	r, _ := identityRegistry(t, config.Identity{Enabled: true, AuthToken: testAuthToken, Default: &config.IdentityGroup{RoleArn: "acs:ram::123:role/shared"}})
+	var wg sync.WaitGroup
+	for _, user := range []string{"alice", "bob", "carol", "dave"} {
+		wg.Add(1)
+		go func(user string) {
+			defer wg.Done()
+			ctx, caller := WithGatewayIdentity(WithIdentity(context.Background(), user, "", testAuthToken))
+			tn, err := resolveAuthenticated(r, ctx)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if tn.Key != expectedPrincipalID(r, user, "") || caller.UserID != user {
+				t.Error("cross-user identity")
+			}
+		}(user)
+	}
+	wg.Wait()
+	if len(r.tenants) != 4 {
+		t.Fatal("per-user tenant cache lost identities")
+	}
+	// This asserts separate clients/audit identity, not cloud data ACL isolation.
+}
+
+type blockedCredentialTestTransport struct{}
+
+func (blockedCredentialTestTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("network access forbidden in credential test")
+}
+
+func TestTenantGatewayOptionsAndStrictProviderAreWired(t *testing.T) {
+	transport := http.DefaultTransport
+	http.DefaultTransport = blockedCredentialTestTransport{}
+	t.Cleanup(func() { http.DefaultTransport = transport })
+	r, _ := identityRegistry(t, config.Identity{Enabled: true, AuthToken: testAuthToken, Default: &config.IdentityGroup{RoleArn: "acs:ram::123:role/shared"}})
+	r.cfg.AgentGateway = config.AgentGateway{Enabled: true, Endpoint: "dms.cn-hangzhou.aliyuncs.com", RequestTimeoutSeconds: 7, MaxResponseBytes: 12345}
+	provider := &mutableProvider{value: &dataagent.Credential{AccessKeyID: "ak", AccessKeySecret: "sk", SecurityToken: "token"}}
+	r.newProviderFn = func(string, string) (credential.Credential, error) { return provider, nil }
+	ctx, _ := WithGatewayIdentity(WithIdentity(context.Background(), "alice", "", testAuthToken))
+	tn, err := resolveAuthenticated(r, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Inspect option values without introducing production getters or a network
+	// endpoint override solely for tests. This is tied to the pinned Client API.
+	options := reflect.ValueOf(tn.Client).Elem().FieldByName("gateway")
+	if options.FieldByName("Endpoint").String() != r.cfg.AgentGateway.Endpoint ||
+		options.FieldByName("RequestTimeout").Int() != int64(7*time.Second) ||
+		options.FieldByName("MaxResponseBytes").Int() != 12345 {
+		t.Fatal("tenant gateway options were not preserved")
+	}
+	provider.err = errors.New("refresh-secret")
+	_, err = tn.Client.ListAgenticCatalog(ctx, dataagent.GatewayPageOptions{})
+	var gatewayErr *dataagent.GatewayError
+	if !errors.As(err, &gatewayErr) || gatewayErr.Code != "GATEWAY_CREDENTIAL_ERROR" {
+		t.Fatalf("gateway did not use strict tenant provider: %v", err)
 	}
 }

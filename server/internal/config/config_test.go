@@ -1,6 +1,8 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,10 +16,14 @@ func clearEnv(t *testing.T) {
 		"DATA_AGENT_CONFIG", "DATA_AGENT_ENV_FILE", "BUDDY_REGION",
 		"DATA_AGENT_REGION", "DATA_AGENT_DMS_UNIT", "DATA_AGENT_WORKSPACE_ID",
 		"DATA_AGENT_SESSIONS_DIR", "DATA_AGENT_API_KEY", "AILY_SHARED_SECRET",
+		"DATA_AGENT_API_KEY_ENDPOINT", "DATA_AGENT_API_KEY_STREAM_ENDPOINT",
+		"DATA_AGENT_ENDPOINT", "DATA_AGENT_DMS_ENTERPRISE_ENDPOINT", "DATA_AGENT_CUSTOM_AGENT_ID",
+		"IDENTITY_SHARED_SECRET", "IDENTITY_AUTH_TOKEN", "IDENTITY_JWT_SECRET", "IDENTITY_JWT_SECRETS",
+		"IDENTITY_SESSION_NAME_PREFIX", "DATA_AGENT_LOG_REQUESTS", "MCP_TRANSPORT",
 	} {
 		t.Setenv(k, "")
 	}
-	os.Unsetenv("DATA_AGENT_CONFIG")
+	os.Unsetenv("IDENTITY_SESSION_NAME_PREFIX")
 	t.Setenv("DATA_AGENT_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
 }
 
@@ -175,13 +181,199 @@ func TestValidateIdentityRequiresMapping(t *testing.T) {
 	}
 }
 
-func TestValidateIdentityRejectsAPIKey(t *testing.T) {
-	cfg := Config{
-		APIKey:   "dms-da-xxx",
-		Identity: Identity{Enabled: true, Default: &IdentityGroup{RoleArn: "acs:ram::1:role/da-default"}},
+func TestLoadRejectsLegacyAuthentication(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		for _, withAK := range []bool{false, true} {
+			for _, key := range []string{"api_key", "api_key_endpoint", "api_key_stream_endpoint"} {
+				for _, value := range []string{"\"\"", "null", "migration-secret", "{secret: migration-secret}"} {
+					t.Run(fmt.Sprintf("yaml/%v/%v/%s/%s", enabled, withAK, key, value), func(t *testing.T) {
+						clearEnv(t)
+						setTestAK(t, withAK)
+						body := fmt.Sprintf("agent_gateway:\n  enabled: %v\n%s: %s\n", enabled, key, value)
+						writeConfig(t, body)
+						_, _, err := Load()
+						if !errors.Is(err, errLegacyAuthentication) || strings.Contains(err.Error(), "migration-secret") {
+							t.Fatalf("expected sanitized migration error, got %v", err)
+						}
+					})
+				}
+				for _, value := range []string{"migration-secret", " "} {
+					t.Run(fmt.Sprintf("env/%v/%v/%s/%s", enabled, withAK, key, value), func(t *testing.T) {
+						clearEnv(t)
+						setTestAK(t, withAK)
+						writeConfig(t, fmt.Sprintf("agent_gateway:\n  enabled: %v\n", enabled))
+						t.Setenv("DATA_AGENT_"+strings.ToUpper(key), value)
+						_, _, err := Load()
+						if !errors.Is(err, errLegacyAuthentication) {
+							t.Fatalf("got %v", err)
+						}
+					})
+				}
+			}
+		}
 	}
-	if err := cfg.validate(); err == nil {
-		t.Fatal("expected error when aily enabled with api_key auth")
+}
+
+func setTestAK(t *testing.T, enabled bool) {
+	t.Helper()
+	ak, sk := "", ""
+	if enabled {
+		ak, sk = "test-ak", "test-sk"
+	}
+	t.Setenv("ALIBABA_CLOUD_ACCESS_KEY_ID", ak)
+	t.Setenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET", sk)
+}
+
+func writeConfig(t *testing.T, body string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DATA_AGENT_CONFIG", path)
+}
+
+func TestLegacyAuthenticationAliasesAndMerges(t *testing.T) {
+	for _, body := range []string{
+		"legacy: &old {api_key: secret}\n<<: *old\n",
+		"legacy: &old {api_key_endpoint: null}\n<<: [*old, {region: cn-hangzhou}]\n",
+		"legacy: &old {api_key_stream_endpoint: ''}\nintermediate: &middle {<<: *old}\n<<: *middle\n",
+		"key: &old api_key\n*old : null\n",
+		"key: &old api_key_endpoint\n*old : null\n",
+		"key: &old api_key_stream_endpoint\n*old : null\n",
+		"legacy: &old {api_key: secret}\n<<: *old\napi_key: null\n",
+		"region: cn-hangzhou\n---\napi_key: secret\n",
+		"&root {<<: *root, api_key: secret}\n",
+		`{"api_key": null}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			clearEnv(t)
+			writeConfig(t, body)
+			if _, _, err := Load(); !errors.Is(err, errLegacyAuthentication) {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+	clearEnv(t)
+	writeConfig(t, "extension: {api_key: not-a-top-level-key}\n")
+	if _, _, err := Load(); err != nil {
+		t.Fatal(err)
+	}
+	writeConfig(t, "&root {<<: *root}\n")
+	if _, _, err := Load(); err == nil {
+		t.Fatal("cyclic merge accepted")
+	}
+}
+
+func TestGatewayConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, transport string
+		invalid               bool
+	}{
+		{"defaults", "", "", false},
+		{"enabled", "agent_gateway: {enabled: true, endpoint: dms.cn-hangzhou.aliyuncs.com}", "stdio", false},
+		{"explicit limits", "agent_gateway: {enabled: true, endpoint: dms.cn-hangzhou.aliyuncs.com, request_timeout_seconds: 5, max_response_bytes: 1234}", "", false},
+		{"missing endpoint", "agent_gateway: {enabled: true}", "", true},
+		{"unpublished region", "region: cn-unknown\nagent_gateway: {enabled: true, endpoint: dms.cn-unknown.aliyuncs.com}", "stdio", true},
+		{"zero timeout", "agent_gateway: {enabled: true, endpoint: dms.cn-hangzhou.aliyuncs.com, request_timeout_seconds: 0}", "", true},
+		{"zero bytes", "agent_gateway: {enabled: true, endpoint: dms.cn-hangzhou.aliyuncs.com, max_response_bytes: 0}", "", true},
+		{"disabled zero timeout", "agent_gateway: {request_timeout_seconds: 0}", "", true},
+		{"disabled zero bytes", "agent_gateway: {max_response_bytes: 0}", "", true},
+		{"negative timeout", "agent_gateway: {request_timeout_seconds: -1}", "", true},
+		{"negative bytes", "agent_gateway: {max_response_bytes: -1}", "", true},
+		{"overflow timeout", "agent_gateway: {request_timeout_seconds: 9223372037}", "", true},
+		{"overflow bytes", "agent_gateway: {max_response_bytes: 9223372036854775807}", "", true},
+		{"remote sse", "agent_gateway: {enabled: true, endpoint: dms.cn-hangzhou.aliyuncs.com}", "sse", true},
+		{"remote http", "agent_gateway: {enabled: true, endpoint: dms.cn-hangzhou.aliyuncs.com}", "streamable-http", true},
+		{"disabled remote", "agent_gateway: {enabled: false}", "sse", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("MCP_TRANSPORT", tc.transport)
+			writeConfig(t, tc.body)
+			cfg, _, err := Load()
+			if (err != nil) != tc.invalid {
+				t.Fatalf("got %v", err)
+			}
+			if tc.name == "defaults" && (cfg.AgentGateway.RequestTimeoutSeconds != 30 || cfg.AgentGateway.MaxResponseBytes != 4194304 || cfg.AgentGateway.Enabled || cfg.AgentGateway.DataSourcesEnabled || cfg.AgentGateway.Endpoint != "") {
+				t.Fatalf("bad defaults: %+v", cfg.AgentGateway)
+			}
+			if tc.name == "explicit limits" && (cfg.AgentGateway.RequestTimeoutSeconds != 5 || cfg.AgentGateway.MaxResponseBytes != 1234) {
+				t.Fatalf("bad limits: %+v", cfg.AgentGateway)
+			}
+		})
+	}
+}
+
+func TestGatewayDataSourcesConfiguration(t *testing.T) {
+	for _, transport := range []string{"stdio", "sse", "streamable-http"} {
+		for _, tc := range []struct {
+			name, flags string
+			wantEnabled bool
+			wantError   string
+		}{
+			{"omitted", "", false, ""},
+			{"gateway only", "enabled: true", false, ""},
+			{"explicit false", "enabled: true, data_sources_enabled: false", false, ""},
+			{"both enabled", "enabled: true, data_sources_enabled: true", true, ""},
+			{"both disabled", "enabled: false, data_sources_enabled: false", false, ""},
+			{"parent omitted", "data_sources_enabled: true", true, "agent_gateway.data_sources_enabled requires agent_gateway.enabled"},
+			{"parent disabled", "enabled: false, data_sources_enabled: true", true, "agent_gateway.data_sources_enabled requires agent_gateway.enabled"},
+			{"invalid bool", "enabled: true, data_sources_enabled: not-a-bool", false, "invalid server configuration YAML"},
+		} {
+			t.Run(transport+"/"+tc.name, func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("MCP_TRANSPORT", transport)
+				writeConfig(t, fmt.Sprintf("agent_gateway: {endpoint: dms.cn-hangzhou.aliyuncs.com, %s}\nidentity: {enabled: true, require_identity: true, namespace: test-domain, auth_token: test, default: {role_arn: 'acs:ram::1:role/test'}}\n", tc.flags))
+				cfg, _, err := Load()
+				if tc.wantError != "" {
+					if err == nil || err.Error() != tc.wantError {
+						t.Fatalf("expected %q, got %v", tc.wantError, err)
+					}
+					return
+				}
+				if err != nil || cfg.AgentGateway.DataSourcesEnabled != tc.wantEnabled {
+					t.Fatalf("data source flag not preserved: %+v, %v", cfg.AgentGateway, err)
+				}
+			})
+		}
+		if transport != "stdio" {
+			t.Run(transport+"/identity required", func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("MCP_TRANSPORT", transport)
+				writeConfig(t, "agent_gateway: {enabled: true, data_sources_enabled: true, endpoint: dms.cn-hangzhou.aliyuncs.com}\n")
+				if _, _, err := Load(); err == nil || !strings.Contains(err.Error(), "remote transport requires") {
+					t.Fatalf("expected remote identity requirement, got %v", err)
+				}
+			})
+		}
+	}
+	cfg := Config{AgentGateway: AgentGateway{DataSourcesEnabled: true}}
+	if err := cfg.validate(); err == nil || err.Error() != "agent_gateway.data_sources_enabled requires agent_gateway.enabled" {
+		t.Fatalf("hand-built config bypassed parent flag validation: %v", err)
+	}
+}
+
+func TestGatewayEndpointAllowlist(t *testing.T) {
+	for _, endpoint := range []string{
+		"https://dms.cn-hangzhou.aliyuncs.com", "dms.cn-hangzhou.aliyuncs.com/", "dms.cn-hangzhou.aliyuncs.com?x=1", "dms.cn-hangzhou.aliyuncs.com#fragment", "user@dms.cn-hangzhou.aliyuncs.com", "dms.cn-hangzhou.aliyuncs.com:443", "dms.cn-hangzhou.aliyuncs.com.evil.test", "dms.cn-shanghai.aliyuncs.com", "dms-vpc.cn-hangzhou.aliyuncs.com", "127.0.0.1", "dms.cn-hangzhou.aliyuncs.com.",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			clearEnv(t)
+			writeConfig(t, fmt.Sprintf("agent_gateway: {enabled: true, endpoint: %q}", endpoint))
+			if _, _, err := Load(); err == nil {
+				t.Fatal("endpoint accepted")
+			}
+		})
+	}
+	clearEnv(t)
+	t.Setenv("DATA_AGENT_REGION", "cn-shanghai")
+	for _, transport := range []string{"sse", "streamable-http"} {
+		t.Setenv("MCP_TRANSPORT", transport)
+		writeConfig(t, "agent_gateway: {enabled: true, endpoint: dms.cn-shanghai.aliyuncs.com}\nidentity: {enabled: true, require_identity: true, namespace: test-domain, auth_token: test, default: {role_arn: 'acs:ram::1:role/test'}}\n")
+		if _, _, err := Load(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -200,21 +392,21 @@ func TestResolveGroup(t *testing.T) {
 	}}
 
 	// Group membership by user_id.
-	if name, g, err := cfg.ResolveGroup("ou_alice", ""); err != nil || name != "analysts" || g.Mode != "ANALYSIS" {
+	if name, g, err := cfg.ResolveGroup(IdentityClaims{AuthMode: "headers", UserID: "ou_alice"}); err != nil || name != "analysts" || g.Mode != "ANALYSIS" {
 		t.Fatalf("user_id membership: %q %+v %v", name, g, err)
 	}
 	// Group membership by email.
-	if name, _, err := cfg.ResolveGroup("ou_unknown", "bob@example.com"); err != nil || name != "analysts" {
+	if name, _, err := cfg.ResolveGroup(IdentityClaims{AuthMode: "headers", UserID: "ou_unknown", Email: "bob@example.com"}); err != nil || name != "analysts" {
 		t.Fatalf("email membership: %q %v", name, err)
 	}
 	// Everyone else lands on the default group.
-	if name, g, err := cfg.ResolveGroup("ou_charlie", ""); err != nil || name != "default" || g.RoleArn != "acs:ram::123:role/da-default" {
+	if name, g, err := cfg.ResolveGroup(IdentityClaims{AuthMode: "headers", UserID: "ou_charlie"}); err != nil || name != "default" || g.RoleArn != "acs:ram::123:role/da-default" {
 		t.Fatalf("default fallback: %q %+v %v", name, g, err)
 	}
 
 	// Without a default group, unmatched users are rejected (fail-closed).
 	cfg.Identity.Default = nil
-	if _, _, err := cfg.ResolveGroup("ou_charlie", "nobody@example.com"); err == nil {
+	if _, _, err := cfg.ResolveGroup(IdentityClaims{AuthMode: "headers", UserID: "ou_charlie", Email: "nobody@example.com"}); err == nil {
 		t.Fatal("expected fail-closed error for unmatched user")
 	}
 }

@@ -8,12 +8,113 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+// Keep the production clients/policies, injecting only a local TLS transport.
+// Both receivers count requests independently, including method-changing redirects.
+func signedRedirectFixture(t *testing.T, status int, destination string) (*Client, *atomic.Int32, *atomic.Int32) {
+	t.Helper()
+	var initial, redirected atomic.Int32
+	targetHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirected.Add(1)
+		io.WriteString(w, `{"Success":true,"Data":[]}`)
+	})
+	var target *httptest.Server
+	if destination == "downgrade" {
+		target = httptest.NewServer(targetHandler)
+	} else {
+		target = httptest.NewTLSServer(targetHandler)
+	}
+	t.Cleanup(target.Close)
+	cred := &Credential{AccessKeyID: "redirect-test-id", AccessKeySecret: "redirect-test-secret", SecurityToken: "redirect-test-token"}
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/" {
+			targetHandler.ServeHTTP(w, req)
+			return
+		}
+		initial.Add(1)
+		if req.Method != http.MethodPost || req.TLS == nil || req.Header.Get("Authorization") == "" || req.Header.Get("x-acs-security-token") != cred.SecurityToken {
+			t.Error("initial request must be signed with synthetic STS credentials over TLS")
+		}
+		location := "/redirect-target"
+		switch destination {
+		case "crosshost":
+			location = strings.Replace(target.URL, "127.0.0.1", "localhost", 1) + "/redirect-target"
+		case "downgrade":
+			location = target.URL + "/redirect-target"
+		case "malformed":
+			location = "https://redirect.invalid/%zz"
+		}
+		location += "?Signature=synthetic-signature&SecurityToken=" + cred.SecurityToken
+		w.Header().Set("Location", location)
+		w.Header().Set("x-acs-request-id", "redirect-header-id")
+		w.Header().Set("Content-Type", "text/event-stream; secret="+cred.SecurityToken)
+		w.WriteHeader(status)
+		// Neither a JSON error nor SSE-shaped body may leak or become data.
+		if req.Header.Get("Accept") == "text/event-stream" {
+			fmt.Fprintf(w, "event: SSE_FINISH\ndata: {\"content\":%q}\n\n", cred.SecurityToken)
+		} else {
+			json.NewEncoder(w).Encode(map[string]string{"Code": cred.SecurityToken, "Message": location, "RequestId": req.Header.Get("Authorization")})
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	host := strings.TrimPrefix(upstream.URL, "https://")
+	c := NewClient(cred, "cn-shanghai", WithDataAgentEndpoint(host), WithDMSEnterpriseEndpoint(host), WithDMSUnit("test-unit"),
+		WithCredentialProvider(func() *Credential { return cred })) // Tenant-style constructor options.
+	transport := upstream.Client().Transport.(*http.Transport).Clone()
+	transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	// The httptest certificate covers example.com, allowing both local hostnames.
+	transport.TLSClientConfig.ServerName = "example.com"
+	t.Cleanup(transport.CloseIdleConnections)
+	c.http.Transport, c.sse.httpClient.Transport = transport, transport
+	return c, &initial, &redirected
+}
+
+func assertSignedRedirectError(t *testing.T, err error) {
+	t.Helper()
+	if err == nil || IsDefiniteRejection(err) {
+		t.Fatalf("redirect must return an error without claiming definite business rejection: %v", err)
+	}
+	for _, secret := range []string{"redirect-test-id", "redirect-test-secret", "redirect-test-token", "synthetic-signature", "Location", "Authorization", "SecurityToken", "Signature=", "https://", "http://", "ACS3-"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("redirect error leaked %q", secret)
+		}
+	}
+}
+
+func TestSignedAPIRedirectsRejected(t *testing.T) {
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		for _, destination := range []string{"samehost", "crosshost", "downgrade", "malformed"} {
+			for _, version := range []string{"2025-04-14", "2018-11-01"} {
+				t.Run(fmt.Sprintf("%d/%s/%s", status, destination, version), func(t *testing.T) {
+					c, initial, redirected := signedRedirectFixture(t, status, destination)
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					defer cancel()
+					ctx, ids := WithRequestIDs(ctx)
+					var body map[string]interface{}
+					var err error
+					if version == "2018-11-01" {
+						body, err = c.callDMSEnterprise(ctx, c.DMSEnterpriseEndpoint(), "ListTables", version, nil)
+					} else {
+						body, err = c.callAPI(ctx, c.DataAgentEndpoint(), "DescribeDataAgentSession", version, nil)
+					}
+					assertSignedRedirectError(t, err)
+					if body != nil || initial.Load() != 1 || redirected.Load() != 0 || len(ids.Snapshot()) != 0 {
+						t.Fatalf("redirect returned data, retried, or forwarded: initial=%d target=%d", initial.Load(), redirected.Load())
+					}
+				})
+			}
+		}
+	}
+}
 
 func TestBuildUserAgentUsesSkillSessionID(t *testing.T) {
 	sessionID := "0123456789abcdef0123456789ABCDEF"
@@ -199,64 +300,9 @@ func TestListRemoteSessionsAddsCreateTimeRangeForSignedAuth(t *testing.T) {
 						"Mode":        "ANALYSIS",
 						"WorkspaceId": "ws-dev",
 					},
-				},
-			},
-		}), nil
-	})}
-
-	got, err := c.ListRemoteSessions(context.Background(), "")
-	if err != nil {
-		t.Fatalf("ListRemoteSessions() error = %v", err)
-	}
-	if len(got) != 1 || got[0].SessionID != "session-1" {
-		t.Fatalf("ListRemoteSessions() = %+v, want session-1", got)
-	}
-}
-
-func TestListRemoteSessionsAddsTimeRangeForAPIKeyAuth(t *testing.T) {
-	c := NewClient(
-		&Credential{APIKey: "api-key"},
-		"cn-hangzhou",
-		WithDMSUnit("cn-hangzhou"),
-		WithWorkspaceID("ws-dev"),
-	)
-
-	c.http = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		body, err := io.ReadAll(req.Body)
-		if err != nil {
-			t.Fatalf("read request body: %v", err)
-		}
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err != nil {
-			t.Fatalf("parse request body: %v", err)
-		}
-		if got := payload["WorkspaceId"]; got != "ws-dev" {
-			t.Fatalf("WorkspaceId = %v, want ws-dev", got)
-		}
-		if payload["StartTime"] == "" || payload["EndTime"] == "" {
-			t.Fatalf("API key ListRemoteSessions must include StartTime/EndTime, payload=%v", payload)
-		}
-		for _, key := range []string{"StartTime", "EndTime"} {
-			value, ok := payload[key].(string)
-			if !ok {
-				t.Fatalf("%s = %T(%v), want millisecond timestamp string", key, payload[key], payload[key])
-			}
-			ms, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || ms < 1_000_000_000_000 {
-				t.Fatalf("%s = %q, want millisecond timestamp", key, value)
-			}
-		}
-		if payload["CreateStartTime"] != nil || payload["CreateEndTime"] != nil {
-			t.Fatalf("API key ListRemoteSessions should not include signed time params, payload=%v", payload)
-		}
-		return jsonHTTPResponse(t, map[string]any{
-			"success": true,
-			"code":    "success",
-			"data": map[string]any{
-				"Content": []map[string]string{
 					{
-						"SessionId": "session-api-key",
-						"AgentId":   "agent-1",
+						"SessionId": "session-2",
+						"AgentId":   "agent-2",
 						"Status":    "COMPLETED",
 						"Mode":      "ANALYSIS",
 					},
@@ -269,15 +315,15 @@ func TestListRemoteSessionsAddsTimeRangeForAPIKeyAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRemoteSessions() error = %v", err)
 	}
-	if len(got) != 1 || got[0].SessionID != "session-api-key" || got[0].WorkspaceID != "ws-dev" {
-		t.Fatalf("ListRemoteSessions() = %+v, want session-api-key in ws-dev", got)
+	if len(got) != 2 || got[0].SessionID != "session-1" || got[1].SessionID != "session-2" || got[0].WorkspaceID != "ws-dev" || got[1].WorkspaceID != "ws-dev" {
+		t.Fatalf("ListRemoteSessions() = %+v, want both sessions in ws-dev", got)
 	}
 }
 
 func TestSuccessfulAPIRequestIDs(t *testing.T) {
 	testClientAuthModes(t, func(t *testing.T, c *Client) {
 		type requestIDCase struct {
-			name, body, acsHeader, header, want, apiKeyWant string
+			name, body, acsHeader, header, want string
 		}
 		tests := []requestIDCase{
 			{name: "acs header", body: `{}`, acsHeader: "acs-id", header: "other-id", want: "acs-id"},
@@ -291,26 +337,26 @@ func TestSuccessfulAPIRequestIDs(t *testing.T) {
 		}
 		for _, alias := range []string{"RequestId", "requestId", "request_id", "RequestID"} {
 			tests = append(tests, requestIDCase{name: alias, body: fmt.Sprintf(`{%q:"body-id"}`, alias), acsHeader: "header-id", want: "body-id"})
-			tests = append(tests, requestIDCase{name: "inner " + alias, body: fmt.Sprintf(`{"code":"success","requestId":"outer-id","data":{%q:"inner-id"}}`, alias), acsHeader: "header-id", want: "outer-id", apiKeyWant: "inner-id"})
+			tests = append(tests, requestIDCase{name: "inner " + alias, body: fmt.Sprintf(`{"code":"success","requestId":"outer-id","data":{%q:"inner-id"}}`, alias), acsHeader: "header-id", want: "outer-id"})
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				ctx, ids := WithRequestIDs(context.Background())
+				useSignedTLSFixture(t, c, func(w http.ResponseWriter, req *http.Request) {
+					w.Header().Set("x-acs-request-id", tt.acsHeader)
+					w.Header().Set("x-request-id", tt.header)
+					io.WriteString(w, tt.body)
+				})
 				calls := 0
+				transport := c.http.Transport
 				c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 					calls++
 					if req.Context().Value(requestIDsKey{}) != ids {
 						t.Error("HTTP request lost its caller context")
 					}
-					header := make(http.Header)
-					header.Set("x-acs-request-id", tt.acsHeader)
-					header.Set("x-request-id", tt.header)
-					return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(tt.body))}, nil
+					return transport.RoundTrip(req)
 				})
 				want := tt.want
-				if c.cred.IsAPIKey() && tt.apiKeyWant != "" {
-					want = tt.apiKeyWant
-				}
 				body, err := c.callAPI(ctx, c.endpoint, "DescribeDataAgentSession", "2025-04-14", nil)
 				if err != nil {
 					t.Fatal(err)
@@ -401,13 +447,6 @@ func TestRequestIDsConcurrentClientIsolation(t *testing.T) {
 	testClientAuthModes(t, func(t *testing.T, c *Client) {
 		c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			id := req.URL.Query().Get("DatabaseId")
-			if c.cred.IsAPIKey() {
-				var payload map[string]any
-				if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
-					return nil, err
-				}
-				id = firstStr(payload, "DatabaseId")
-			}
 			return jsonHTTPResponse(t, map[string]any{"RequestID": id}), nil
 		})
 		var wg sync.WaitGroup
@@ -491,21 +530,45 @@ func TestDMSEnterpriseEndpoint(t *testing.T) {
 	}
 }
 
+// useSignedTLSFixture exercises the real HTTP transport with synthetic AK/STS
+// credentials. Context and transport-failure tests use roundTripFunc directly.
+func useSignedTLSFixture(t *testing.T, c *Client, handler http.HandlerFunc) {
+	t.Helper()
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		cred := c.credential()
+		if req.TLS == nil || req.Method != http.MethodPost || req.URL.Path != "/" ||
+			!strings.HasPrefix(req.Header.Get("Authorization"), "ACS3-HMAC-SHA256 Credential="+cred.AccessKeyID+",") ||
+			req.Header.Get("x-acs-security-token") != cred.SecurityToken || req.Header.Get("x-api-key") != "" {
+			t.Error("expected signed TLS request")
+			http.Error(w, "invalid authentication", http.StatusBadRequest)
+			return
+		}
+		handler(w, req)
+	}))
+	t.Cleanup(upstream.Close)
+	host := strings.TrimPrefix(upstream.URL, "https://")
+	c.endpoint = host
+	c.dmsEnterpriseEndpoint = host
+	c.sse.endpoint = host
+	c.http.Transport = upstream.Client().Transport
+	c.sse.httpClient.Transport = upstream.Client().Transport
+}
+
 func testClientAuthModes(t *testing.T, run func(*testing.T, *Client)) {
 	t.Helper()
 	for _, auth := range []struct {
 		name string
 		cred *Credential
 	}{
-		{"signed", &Credential{AccessKeyID: "test-ak", AccessKeySecret: "test-sk", SecurityToken: "test-sts"}},
-		{"api-key", &Credential{APIKey: "test-api-key"}},
+		{"signed", &Credential{AccessKeyID: "test-ak", AccessKeySecret: "test-sk"}},
+		{"sts", &Credential{AccessKeyID: "test-ak", AccessKeySecret: "test-sk", SecurityToken: "test-sts"}},
 	} {
 		t.Run(auth.name, func(t *testing.T) {
 			c := NewClient(auth.cred, "cn-hangzhou", WithDMSUnit("test-unit"), WithWorkspaceID("test-workspace"))
-			c.http = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				t.Fatalf("unexpected request: %s", req.URL.Host)
 				return nil, errors.New("unexpected request")
-			})}
+			})
 			run(t, c)
 		})
 	}
@@ -530,28 +593,10 @@ func TestSendMessageMessageType(t *testing.T) {
 					MessageType: tt.messageType,
 					WorkspaceID: "message-type-workspace",
 				}
-				calls := 0
-				c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-					calls++
-					if req.Method != http.MethodPost {
-						t.Fatalf("method = %s, want POST", req.Method)
-					}
-					params := make(map[string]any)
-					if c.cred.IsAPIKey() {
-						if req.URL.Host != c.APIKeyStreamEndpoint() || req.URL.Path != "/apikey" || req.Header.Get("x-api-key") != c.cred.APIKey {
-							t.Fatal("SendMessage did not use API Key data plane authentication")
-						}
-						if err := json.NewDecoder(req.Body).Decode(&params); err != nil {
-							t.Fatalf("decode API Key request body: %v", err)
-						}
-					} else {
-						if req.Header.Get("Authorization") == "" || req.Header.Get("x-acs-security-token") != c.cred.SecurityToken {
-							t.Fatal("SendMessage did not use signed authentication")
-						}
-						for key, values := range req.URL.Query() {
-							params[key] = values[0]
-						}
-					}
+				var calls atomic.Int32
+				useSignedTLSFixture(t, c, func(w http.ResponseWriter, req *http.Request) {
+					calls.Add(1)
+					params := req.URL.Query()
 					for key, want := range map[string]string{
 						"Action":      "SendChatMessage",
 						"MessageType": tt.want,
@@ -560,17 +605,17 @@ func TestSendMessageMessageType(t *testing.T) {
 						"AgentId":     opts.AgentID,
 						"WorkspaceId": opts.WorkspaceID,
 					} {
-						if got := params[key]; got != want {
+						if got := params.Get(key); got != want {
 							t.Errorf("%s = %v, want %q", key, got, want)
 						}
 					}
-					return jsonHTTPResponse(t, map[string]any{"success": true}), nil
+					io.WriteString(w, `{"Success":true}`)
 				})
 				if err := c.SendMessage(context.Background(), opts); err != nil {
 					t.Fatalf("SendMessage() error = %v", err)
 				}
-				if calls != 1 {
-					t.Fatalf("SendMessage made %d requests, want exactly one", calls)
+				if calls.Load() != 1 {
+					t.Fatalf("SendMessage made %d requests, want exactly one", calls.Load())
 				}
 			})
 		}
@@ -603,17 +648,17 @@ func TestSendMessageAPIResponses(t *testing.T) {
 			want: &APIError{Code: busyCode, Message: "busy", RequestID: "outer-request"},
 		},
 		{
-			name: "gateway data envelope preserves outer request id",
-			body: `{"success":true,"code":"success","requestId":"gateway-request","data":{"success":true,"error_code":"DMS.DataAgent.SessionInBusy","error_message":"busy"}}`,
-			want: &APIError{Code: busyCode, Message: "busy", RequestID: "gateway-request"},
+			name: "lowercase data envelope preserves outer request id",
+			body: `{"success":true,"code":"success","requestId":"lowercase-request","data":{"success":true,"error_code":"DMS.DataAgent.SessionInBusy","error_message":"busy"}}`,
+			want: &APIError{Code: busyCode, Message: "busy", RequestID: "lowercase-request"},
 		},
 		{
 			name: "nested envelopes prefer backend request id",
-			body: `{"success":true,"code":"success","requestId":"gateway-request","data":{"Success":true,"Data":{"success":true,"ErrorCode":"DMS.DataAgent.SessionInBusy","ErrorMessage":"busy","RequestID":"backend-request"}}}`,
+			body: `{"success":true,"code":"success","requestId":"lowercase-request","data":{"Success":true,"Data":{"success":true,"ErrorCode":"DMS.DataAgent.SessionInBusy","ErrorMessage":"busy","RequestID":"backend-request"}}}`,
 			want: &APIError{Code: busyCode, Message: "busy", RequestID: "backend-request"},
 		},
 		{
-			name: "outer failure before unwrap",
+			name: "outer failure with successful data",
 			body: `{"success":true,"code":"success","error_code":"DMS.DataAgent.SessionInBusy","data":{"success":true}}`,
 			want: &APIError{Code: busyCode},
 		},
@@ -735,7 +780,7 @@ func TestSendMessageAPIResponses(t *testing.T) {
 		{
 			name: "redirect remains unknown",
 			body: `{}`, status: 302,
-			want: &APIError{Message: "Found"}, unknown: true,
+			want: &APIError{Code: "RedirectRejected", Message: "Signed HTTP redirects are not allowed."}, unknown: true,
 		},
 		{name: "plain success", body: `{"success":true}`},
 		{name: "empty object", body: `{}`},
@@ -744,13 +789,13 @@ func TestSendMessageAPIResponses(t *testing.T) {
 		{name: "numeric success code", body: `{"code":200,"message":"accepted"}`},
 		{name: "zero success code", body: `{"code":0,"message":"accepted"}`},
 		{name: "OK success code", body: `{"Code":"OK","Message":"accepted"}`},
-		{name: "normal gateway envelope", body: `{"success":true,"code":"success","data":{"success":true}}`},
+		{name: "normal lowercase envelope", body: `{"success":true,"code":"success","data":{"success":true}}`},
 		{name: "normal signed envelope", body: `{"Success":true,"Data":{"MessageId":"m-1"}}`},
 		{name: "null and empty error code", body: `{"success":true,"error_code":null,"ErrorCode":""}`},
 		{name: "success error codes", body: `{"error_code":"0","ErrorCode":"success","Message":"accepted"}`},
 		{name: "ordinary top level code", body: `{"code":"business-value"}`},
 		{name: "ordinary data code", body: `{"Data":{"code":"business-value","message":"business description"}}`},
-		{name: "ordinary code after unwrap", body: `{"success":true,"code":"success","data":{"code":"business-value","message":"business description"}}`},
+		{name: "ordinary lowercase data code", body: `{"success":true,"code":"success","data":{"code":"business-value","message":"business description"}}`},
 		{name: "ordinary uppercase data code", body: `{"Data":{"Code":"business-value"}}`},
 		{name: "explicit success with nonstandard code", body: `{"success":true,"code":"business-value","message":"accepted"}`},
 		{name: "do not scan arbitrary business objects", body: `{"Data":{"record":{"success":false,"error_code":"business-value"},"rows":[{"code":"Forbidden","message":"business data"}]}}`},
@@ -763,38 +808,20 @@ func TestSendMessageAPIResponses(t *testing.T) {
 				if status == 0 {
 					status = http.StatusOK
 				}
-				calls := 0
-				c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-					calls++
-					if req.Method != http.MethodPost {
-						t.Fatalf("method = %s, want POST", req.Method)
+				var calls atomic.Int32
+				useSignedTLSFixture(t, c, func(w http.ResponseWriter, req *http.Request) {
+					calls.Add(1)
+					if req.URL.Query().Get("Action") != "SendChatMessage" || req.URL.Query().Get("SessionId") != "test-session" || req.URL.Query().Get("Message") != "hello" {
+						t.Error("SendMessage lost its signed query parameters")
 					}
-					if c.cred.IsAPIKey() {
-						if req.URL.Host != c.APIKeyStreamEndpoint() || req.URL.Path != "/apikey" || req.Header.Get("x-api-key") != c.cred.APIKey {
-							t.Fatal("SendMessage did not use API Key data plane authentication")
-						}
-						var payload map[string]interface{}
-						if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
-							t.Fatal(err)
-						}
-						if payload["Action"] != "SendChatMessage" || payload["SessionId"] != "test-session" || payload["Message"] != "hello" {
-							t.Fatalf("unexpected SendMessage payload: %v", payload)
-						}
-					} else {
-						if req.URL.Query().Get("Action") != "SendChatMessage" || req.URL.Query().Get("Message") != "hello" || req.Header.Get("Authorization") == "" || req.Header.Get("x-acs-security-token") != c.cred.SecurityToken {
-							t.Fatal("SendMessage did not use signed authentication")
-						}
-					}
-					return &http.Response{
-						StatusCode: status,
-						Header:     http.Header{"X-Acs-Request-Id": []string{"header-request"}},
-						Body:       io.NopCloser(strings.NewReader(tt.body)),
-					}, nil
+					w.Header().Set("x-acs-request-id", "header-request")
+					w.WriteHeader(status)
+					io.WriteString(w, tt.body)
 				})
 				ctx, ids := WithRequestIDs(context.Background())
 				err := c.SendMessage(ctx, SendMessageOpts{AgentID: "test-agent", SessionID: "test-session", Message: "hello"})
-				if calls != 1 {
-					t.Fatalf("SendMessage made %d requests, want exactly one", calls)
+				if calls.Load() != 1 {
+					t.Fatalf("SendMessage made %d requests, want exactly one", calls.Load())
 				}
 				if tt.want == nil {
 					if err != nil {
@@ -961,6 +988,50 @@ func TestIsDefiniteRejection(t *testing.T) {
 	}
 }
 
+func TestSignedFileUploadResponses(t *testing.T) {
+	testClientAuthModes(t, func(t *testing.T, c *Client) {
+		for _, dataKey := range []string{"Data", "data"} {
+			t.Run(dataKey, func(t *testing.T) {
+				want := &UploadSignature{
+					UploadHost: "https://upload.example.invalid", UploadDir: "test-dir/",
+					Policy: "test-policy", OssSignature: "test-signature", OssSignatureVersion: "OSS4-HMAC-SHA256",
+					OssDate: "20261027T000000Z", OssSecurityToken: "test-oss-token", OssCredential: "test-oss-credential",
+				}
+				useSignedTLSFixture(t, c, func(w http.ResponseWriter, req *http.Request) {
+					query := req.URL.Query()
+					switch query.Get("Action") {
+					case "DescribeFileUploadSignature":
+						if query.Get("FileName") != "test.csv" || query.Get("FileSize") != "123" {
+							t.Error("upload signature lost file metadata")
+						}
+						json.NewEncoder(w).Encode(map[string]any{dataKey: map[string]string{
+							"UploadHost": want.UploadHost, "UploadDir": want.UploadDir,
+							"Policy": want.Policy, "OssSignature": want.OssSignature, "OssSignatureVersion": want.OssSignatureVersion,
+							"OssDate": want.OssDate, "OssSecurityToken": want.OssSecurityToken, "OssCredential": want.OssCredential,
+						}})
+					case "FileUploadCallback":
+						if query.Get("Filename") != "test.csv" || query.Get("UploadLocation") != "test-dir/test.csv" || query.Get("FileSize") != "123" {
+							t.Error("upload callback lost file metadata")
+						}
+						json.NewEncoder(w).Encode(map[string]any{dataKey: map[string]string{"FileId": "file-1"}})
+					default:
+						t.Errorf("unexpected action %q", query.Get("Action"))
+						http.Error(w, "unexpected action", http.StatusBadRequest)
+					}
+				})
+				got, err := c.GetFileUploadSignature(context.Background(), "test.csv", 123)
+				if err != nil || !reflect.DeepEqual(got, want) {
+					t.Fatalf("signed upload signature = %+v, err=%v, want %+v", got, err, want)
+				}
+				fileID, err := c.FileUploadCallback(context.Background(), "test.csv", "test-dir/test.csv", 123)
+				if err != nil || fileID != "file-1" {
+					t.Fatalf("signed upload callback = %q, err=%v", fileID, err)
+				}
+			})
+		}
+	})
+}
+
 func TestAPIResponsePayloadCompatibility(t *testing.T) {
 	testClientAuthModes(t, func(t *testing.T, c *Client) {
 		inner := map[string]interface{}{"Content": []interface{}{map[string]interface{}{"WorkspaceId": "test-workspace"}}}
@@ -972,12 +1043,8 @@ func TestAPIResponsePayloadCompatibility(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := payload
-		if c.cred.IsAPIKey() {
-			want = inner
-		}
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("response shape changed: got %#v, want %#v", got, want)
+		if !reflect.DeepEqual(got, payload) {
+			t.Fatalf("response shape changed: got %#v, want %#v", got, payload)
 		}
 		for _, status := range []int{201, 400, 503} {
 			c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {

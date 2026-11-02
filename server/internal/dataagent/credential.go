@@ -1,151 +1,106 @@
 package dataagent
 
 import (
-	"encoding/json"
-	"fmt"
+	"errors"
 	"os"
-	"path/filepath"
+	"strings"
+	"sync"
 
 	credential "github.com/aliyun/credentials-go/credentials"
 )
 
-// aliyunConfigFile represents the structure of ~/.aliyun/config.json.
-type aliyunConfigFile struct {
-	Current  string              `json:"current"`
-	Profiles []aliyunProfileItem `json:"profiles"`
+var errCredentialUnavailable = errors.New("Alibaba Cloud credential provider unavailable")
+
+// The SDK captures DEBUG at startup and can print secret-bearing headers to stdout.
+var credentialDebugAtStartup = credentialDebugEnabled()
+
+func credentialDebugEnabled() bool {
+	for _, flag := range strings.Split(os.Getenv("DEBUG"), ",") {
+		if flag == "credential" {
+			return true
+		}
+	}
+	return false
 }
 
-// aliyunProfileItem represents a single profile entry in the config file.
-type aliyunProfileItem struct {
-	Name               string `json:"name"`
-	Mode               string `json:"mode"`
-	AccessKeyID        string `json:"access_key_id"`
-	AccessKeySecret    string `json:"access_key_secret"`
-	STSToken           string `json:"sts_token"`
-	SecurityToken      string `json:"security_token"`
-	STSTokenCamel      string `json:"stsToken"`
-	SecurityTokenCamel string `json:"securityToken"`
-	RegionID           string `json:"region_id"`
+// Retain the SDK chain for renewal; its HTTP budgets are separate from the gateway budget.
+func NewCredentialProvider() (credential.Credential, error) {
+	if credentialDebugAtStartup || credentialDebugEnabled() {
+		return nil, errors.New("credential SDK debug logging must be disabled")
+	}
+	provider, err := credential.NewCredential(nil)
+	if err != nil || provider == nil {
+		return nil, errCredentialUnavailable
+	}
+	return &lockedCredentialProvider{Credential: provider}, nil
 }
 
-// LoadCredential loads Alibaba Cloud credentials using a three-step fallback:
-//  1. Environment variables: ALIBABA_CLOUD_ACCESS_KEY_ID, ALIBABA_CLOUD_ACCESS_KEY_SECRET,
-//     ALIBABA_CLOUD_SECURITY_TOKEN
-//  2. Aliyun config file: ~/.aliyun/config.json (the "current" profile)
-//  3. credentials-go default credential chain
+// Runtime callers must retain NewCredentialProvider instead of this snapshot.
 func LoadCredential() (*Credential, error) {
-	// Step 1: environment variables
-	if cred, ok := loadFromEnv(); ok {
-		return cred, nil
+	provider, err := NewCredentialProvider()
+	if err != nil {
+		return nil, err
 	}
-
-	// Step 2: ~/.aliyun/config.json
-	if cred, ok := loadFromAliyunConfig(); ok {
-		return cred, nil
-	}
-
-	// Step 3: credentials-go default chain
-	return loadFromDefaultChain()
+	return CredentialFromProvider(provider)
 }
 
-// loadFromEnv tries to read AK/SK/STS token from environment variables.
-func loadFromEnv() (*Credential, bool) {
-	akID := os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_ID")
-	akSecret := os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
-	if akID == "" || akSecret == "" {
-		return nil, false
+// SDK errors can contain profile secrets or signed URLs, so expose only generic failures.
+func CredentialFromProvider(provider credential.Credential) (*Credential, error) {
+	model, err := credentialModel(provider)
+	if err != nil {
+		return nil, err
 	}
 	return &Credential{
-		AccessKeyID:     akID,
-		AccessKeySecret: akSecret,
-		SecurityToken:   os.Getenv("ALIBABA_CLOUD_SECURITY_TOKEN"),
-	}, true
+		AccessKeyID:     derefStr(model.AccessKeyId),
+		AccessKeySecret: derefStr(model.AccessKeySecret),
+		SecurityToken:   derefStr(model.SecurityToken),
+	}, nil
 }
 
-// loadFromAliyunConfig reads the "current" profile from ~/.aliyun/config.json.
-func loadFromAliyunConfig() (*Credential, bool) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, false
+func credentialModel(provider credential.Credential) (*credential.CredentialModel, error) {
+	if provider == nil || credentialDebugAtStartup || credentialDebugEnabled() {
+		return nil, errCredentialUnavailable
 	}
-
-	configPath := filepath.Join(home, ".aliyun", "config.json")
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, false
+	model, err := provider.GetCredential()
+	if err != nil || model == nil || strings.TrimSpace(derefStr(model.AccessKeyId)) == "" ||
+		strings.TrimSpace(derefStr(model.AccessKeySecret)) == "" {
+		return nil, errCredentialUnavailable
 	}
-
-	var cfg aliyunConfigFile
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, false
-	}
-
-	profileName := cfg.Current
-	if profileName == "" {
-		profileName = "default"
-	}
-
-	for _, p := range cfg.Profiles {
-		if p.Name == profileName {
-			if p.AccessKeyID == "" || p.AccessKeySecret == "" {
-				return nil, false
-			}
-			return &Credential{
-				AccessKeyID:     p.AccessKeyID,
-				AccessKeySecret: p.AccessKeySecret,
-				SecurityToken:   p.securityToken(),
-			}, true
-		}
-	}
-
-	return nil, false
+	return model, nil
 }
 
-func (p aliyunProfileItem) securityToken() string {
-	for _, token := range []string{
-		p.STSToken,
-		p.SecurityToken,
-		p.STSTokenCamel,
-		p.SecurityTokenCamel,
-	} {
-		if token != "" {
-			return token
-		}
-	}
-	return ""
+// The SDK mutates its provider cache, so serialize shared reads across tenants.
+type lockedCredentialProvider struct {
+	credential.Credential
+	mu sync.Mutex
 }
 
-// loadFromDefaultChain uses github.com/aliyun/credentials-go default provider chain.
-func loadFromDefaultChain() (*Credential, error) {
-	provider, err := credential.NewCredential(nil)
+func (p *lockedCredentialProvider) GetCredential() (*credential.CredentialModel, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return credentialModel(p.Credential)
+}
+
+func (p *lockedCredentialProvider) GetAccessKeyId() (*string, error) {
+	m, err := p.GetCredential()
 	if err != nil {
-		return nil, fmt.Errorf("credentials-go default chain: %w", err)
+		return nil, err
 	}
-
-	akID, err := provider.GetAccessKeyId()
+	return m.AccessKeyId, nil
+}
+func (p *lockedCredentialProvider) GetAccessKeySecret() (*string, error) {
+	m, err := p.GetCredential()
 	if err != nil {
-		return nil, fmt.Errorf("credentials-go GetAccessKeyId: %w", err)
+		return nil, err
 	}
-	akSecret, err := provider.GetAccessKeySecret()
+	return m.AccessKeySecret, nil
+}
+func (p *lockedCredentialProvider) GetSecurityToken() (*string, error) {
+	m, err := p.GetCredential()
 	if err != nil {
-		return nil, fmt.Errorf("credentials-go GetAccessKeySecret: %w", err)
+		return nil, err
 	}
-
-	cred := &Credential{
-		AccessKeyID:     derefStr(akID),
-		AccessKeySecret: derefStr(akSecret),
-	}
-
-	stsToken, err := provider.GetSecurityToken()
-	if err == nil && stsToken != nil {
-		cred.SecurityToken = *stsToken
-	}
-
-	if cred.AccessKeyID == "" || cred.AccessKeySecret == "" {
-		return nil, fmt.Errorf("credentials-go returned empty access key")
-	}
-
-	return cred, nil
+	return m.SecurityToken, nil
 }
 
 // derefStr safely dereferences a *string, returning "" for nil.

@@ -3,7 +3,6 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -12,18 +11,21 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/alibabacloud/data-agent-mcp-server/internal/config"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/dataagent"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/session"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/tenant"
 )
 
 type Server struct {
-	mgr      sessionManager
-	client   dataAgentClient
-	version  string
-	mcp      *server.MCPServer
-	resolve  Resolver
-	defaults SessionDefaults // tenant group defaults for the current request
+	mgr           sessionManager
+	client        dataAgentClient
+	version       string
+	mcp           *server.MCPServer
+	resolve       Resolver
+	defaults      SessionDefaults // tenant group defaults for the current request
+	gatewayClient gatewayClient
+	gatewayRemote bool
 	// customAgentID is the server-wide default custom agent, below any
 	// identity group default.
 	customAgentID string
@@ -46,6 +48,10 @@ type Server struct {
 	// waits tracks in-flight blocking waits per session; shared across
 	// tenant-scoped copies (pointer field).
 	waits *waitRegistry
+
+	// Remote entrypoints remain disabled until ConfigureHTTP installs pure authentication.
+	httpLimits   config.HTTP
+	authenticate func(context.Context) (context.Context, error)
 }
 
 // SessionDefaults are group-level fallbacks applied when a tool call omits
@@ -75,10 +81,9 @@ func (s *Server) resolveCustomAgentID(arg string) string {
 	return s.customAgentID
 }
 
-// Resolver maps a request context to a tenant-scoped session manager, client,
-// and session defaults (identity multi-tenant mode). Returning
-// (nil, nil, _, nil) selects the default server identity; returning an error
-// rejects the call.
+// Resolver maps a trusted request context to a tenant-scoped session manager,
+// client and defaults. Remote requests never fall back to the process identity
+// when resolution is missing or returns nil.
 type Resolver func(ctx context.Context) (*session.Manager, *dataagent.Client, SessionDefaults, error)
 
 type sessionManager interface {
@@ -93,7 +98,7 @@ type sessionManager interface {
 	ListAllSessions() []*session.StateSnapshot
 	StopSession(string) error
 	IncrPollSeq(string) int
-	SessionDir(string) string
+	ReadImages(string) ([]session.Image, error)
 }
 
 type dataAgentClient interface {
@@ -121,11 +126,16 @@ func New(mgr *session.Manager, client *dataagent.Client, version string) *Server
 		waitCap: waitCapFromEnv(),
 		waits:   newWaitRegistry(),
 	}
+	if client != nil {
+		s.gatewayClient = client
+	}
 
 	mcpServer := server.NewMCPServer(
 		"data-agent-mcp-server",
 		version,
 		server.WithToolCapabilities(true),
+		server.WithHooks(remoteHooks()),
+		server.WithToolHandlerMiddleware(remoteLeaseMiddleware),
 	)
 
 	mcpServer.AddTool(listWorkspaceDatabasesTool, s.withTenant((*Server).handleListDatabases))
@@ -196,7 +206,22 @@ func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest
 			rec.tagError(res)
 		}()
 
+		rawID, supplied := req.GetArguments()["session_id"]
+		switch req.Params.Name {
+		case "data_agent_status", "data_agent_wait_result", "data_agent_watch_session", "data_agent_send", "data_agent_result", "data_agent_stop_session", "data_agent_list_files":
+			supplied = true
+		}
+		if supplied {
+			id, ok := rawID.(string)
+			if !ok || session.ValidateSessionID(id) != nil {
+				return mcp.NewToolResultError(session.ErrInvalidSessionID.Error()), nil
+			}
+		}
+
 		if s.resolve == nil {
+			if leaseFrom(ctx) != nil {
+				return mcp.NewToolResultError("Tenant resolution unavailable."), nil
+			}
 			return h(s, ctx, req)
 		}
 		mgr, client, defaults, err := s.resolve(ctx)
@@ -204,7 +229,10 @@ func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		if mgr == nil || client == nil {
-			return h(s, ctx, req) // default server identity
+			if leaseFrom(ctx) != nil {
+				return mcp.NewToolResultError("Tenant resolution unavailable."), nil
+			}
+			return h(s, ctx, req) // local process identity only
 		}
 		scoped := *s
 		scoped.mgr = mgr
@@ -214,9 +242,10 @@ func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest
 	}
 }
 
-// identityHTTPContext copies the identity headers into the request context
-// so tool handlers can resolve the per-user tenant. The JWT is passed through
-// unverified; the tenant registry owns the secret and does the verification.
+// identityHTTPContext copies unverified transport inputs for the pure
+// authentication callback. These values confer no authority: Authenticate must
+// install a trusted Principal before dispatch, and tool-time Resolve consumes
+// only that verified context.
 func (s *Server) identityHTTPContext(ctx context.Context, r *http.Request) context.Context {
 	ctx = tenant.WithJWT(ctx, strings.TrimSpace(r.Header.Get(s.hdrJWT)))
 	return tenant.WithIdentity(ctx,
@@ -226,34 +255,16 @@ func (s *Server) identityHTTPContext(ctx context.Context, r *http.Request) conte
 	)
 }
 
-func (s *Server) Run(_ context.Context) error {
+func (s *Server) Run(ctx context.Context) error {
 	transport := os.Getenv("MCP_TRANSPORT")
 	switch transport {
-	case "sse":
-		addr, err := mcpAddr()
-		if err != nil {
-			return err
-		}
-		log.Printf("starting SSE MCP server on %s", addr)
-		return server.NewSSEServer(s.mcp,
-			server.WithBaseURL("http://"+addr),
-			server.WithSSEContextFunc(s.identityHTTPContext),
-		).Start(addr)
-	case "streamable-http":
-		addr, err := mcpAddr()
-		if err != nil {
-			return err
-		}
-		log.Printf("starting Streamable HTTP MCP server on %s", addr)
-		return server.NewStreamableHTTPServer(s.mcp,
-			server.WithHTTPContextFunc(s.identityHTTPContext),
-		).Start(addr)
-	default:
-		if transport != "" && transport != "stdio" {
-			log.Printf("unknown MCP_TRANSPORT %q, falling back to stdio", transport)
-		}
+	case "sse", "streamable-http":
+		return s.runHTTP(ctx, transport)
+	case "", "stdio":
 		stdio := server.NewStdioServer(s.mcp)
-		return stdio.Listen(context.Background(), os.Stdin, os.Stdout)
+		return stdio.Listen(ctx, os.Stdin, os.Stdout)
+	default:
+		return fmt.Errorf("unsupported MCP transport")
 	}
 }
 
@@ -275,7 +286,7 @@ func isRemoteTransport(transport string) bool {
 
 var listWorkspaceDatabasesTool = mcp.NewTool(
 	"data_agent_list_workspace_databases",
-	mcp.WithDescription("List databases imported into a workspace's Data Agent Data Center. MANDATORY first step before data_agent_create_session — always call this in the same turn, in any auth mode (AK/SK or API Key). Never create a session from guessed or memorized database parameters."),
+	mcp.WithDescription("List databases imported into a workspace's Data Agent Data Center. MANDATORY first step before data_agent_create_session — always call this in the same turn. Never create a session from guessed or memorized database parameters."),
 	mcp.WithString("workspace_id", mcp.Description("Workspace ID to list databases for. Defaults to the configured workspace. Resolve names to IDs via data_agent_list_workspaces; never pass a workspace name.")),
 )
 

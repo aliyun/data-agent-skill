@@ -62,11 +62,7 @@ type Credential struct {
 	AccessKeyID     string
 	AccessKeySecret string
 	SecurityToken   string
-	APIKey          string // API Key auth (alternative to AK/SK)
 }
-
-// IsAPIKey returns true if API Key auth mode is active.
-func (c *Credential) IsAPIKey() bool { return c.APIKey != "" }
 
 // FileInfo from ListFileUpload.
 type FileInfo struct {

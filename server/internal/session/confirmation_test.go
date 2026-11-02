@@ -35,7 +35,7 @@ func (c *confirmationClient) SendMessage(_ context.Context, opts dataagent.SendM
 func confirmationWatcher(t *testing.T, auto bool) (*Watcher, *confirmationClient) {
 	t.Helper()
 	client := &confirmationClient{}
-	return &Watcher{state: &State{SessionID: "test-session", AgentID: "test-agent", Status: StatusRunning, AutoConfirm: auto}, client: client, sessDir: t.TempDir()}, client
+	return &Watcher{state: &State{SessionID: "test-session", AgentID: "test-agent", Status: StatusRunning, AutoConfirm: auto}, client: client, store: testStore(t)}, client
 }
 
 func applyAsk(w *Watcher, ev dataagent.SSEEvent) string {
@@ -106,7 +106,7 @@ func TestUnknownAutoConfirmRemainsSuppressedAfterRestore(t *testing.T) {
 	client.send = func() error { return errors.New("timeout") }
 	ask := eventWithCheckpoint("chat_finish", "ask_plan", "plan", 2)
 	key := applyAsk(w, ask)
-	w.state = stateFromSnapshot(LoadState(w.sessDir, "test-session"))
+	w.state = stateFromSnapshot(loadState(w.store, "test-session"))
 	applyAsk(w, ask)
 	if client.calls.Load() != 1 || w.state.Snapshot().Requests[key].Status != SendUnknown {
 		t.Fatal("restored unknown confirmation was resent")
@@ -117,10 +117,10 @@ func TestSendingIntentRestoresAsUnknown(t *testing.T) {
 	w, client := confirmationWatcher(t, false)
 	key := applyAsk(w, eventWithCheckpoint("chat_finish", "ask_plan", "plan", 2))
 	w.state.SetSendStatus(key, SendSending, false)
-	if err := w.state.Persist(w.sessDir); err != nil {
+	if err := w.state.persist(w.store); err != nil {
 		t.Fatal(err)
 	}
-	w.state = stateFromSnapshot(LoadState(w.sessDir, "test-session"))
+	w.state = stateFromSnapshot(loadState(w.store, "test-session"))
 	if err := w.SendMessage(context.Background(), "confirm"); err == nil || client.calls.Load() != 0 || w.state.Snapshot().Requests[key].Status != SendUnknown {
 		t.Fatal("uncertain crash recovery resent the message")
 	}
@@ -129,11 +129,13 @@ func TestSendingIntentRestoresAsUnknown(t *testing.T) {
 func TestSendIntentMustPersistBeforeNetworkCall(t *testing.T) {
 	w, client := confirmationWatcher(t, false)
 	applyAsk(w, eventWithCheckpoint("chat_finish", "ask_human", "question", 2))
-	blocker := filepath.Join(t.TempDir(), "not-a-directory")
-	if err := os.WriteFile(blocker, []byte("blocked"), 0600); err != nil {
+	// Simulate unavailable storage without changing permissions.
+	if err := w.store.root.Remove("test-session/status.json"); err != nil {
 		t.Fatal(err)
 	}
-	w.sessDir = blocker
+	if err := w.store.root.Mkdir("test-session/status.json", 0700); err != nil {
+		t.Fatal(err)
+	}
 	if err := w.SendMessage(context.Background(), "answer"); err == nil || client.calls.Load() != 0 {
 		t.Fatal("sent without durable intent")
 	}
@@ -175,7 +177,7 @@ func TestFollowUpIgnoresPreviousTurnCompletion(t *testing.T) {
 	w, client := confirmationWatcher(t, false)
 	client.events = []dataagent.SSEEvent{eventWithCheckpoint("chat_finish", "chat", "", 4)}
 	w.streamOnce(context.Background())
-	w = &Watcher{state: stateFromSnapshot(LoadState(w.sessDir, "test-session")), client: client, sessDir: w.sessDir}
+	w = &Watcher{state: stateFromSnapshot(loadState(w.store, "test-session")), client: client, store: w.store}
 	if err := w.SendMessage(context.Background(), "follow-up"); err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +213,7 @@ func TestSharedCheckpointPreservesDistinctAsksAndBatchData(t *testing.T) {
 	if client.calls.Load() != 2 {
 		t.Fatalf("report automatically confirmed: %d", client.calls.Load())
 	}
-	w.state = stateFromSnapshot(LoadState(w.sessDir, "test-session"))
+	w.state = stateFromSnapshot(loadState(w.store, "test-session"))
 	w.streamOnce(context.Background())
 	snap := w.state.Snapshot()
 	if len(snap.Conclusions) != 1 || len(snap.Artifacts) != 1 || client.calls.Load() != 2 || resultReason(&snap) != "waiting_input" {
@@ -275,7 +277,7 @@ func TestLLMFallbackSurvivesReconnectAndRestore(t *testing.T) {
 	w, client := confirmationWatcher(t, false)
 	client.events = askDataLLMEvents("answer")[:3]
 	w.streamOnce(context.Background())
-	w.state = stateFromSnapshot(LoadState(w.sessDir, "test-session"))
+	w.state = stateFromSnapshot(loadState(w.store, "test-session"))
 	client.events = []dataagent.SSEEvent{eventWithCheckpoint("chat_finish", "chat", "", 4)}
 	w.streamOnce(context.Background())
 	if got := w.state.GetConclusions(); len(got) != 1 || got[0] != "answer" {
@@ -321,9 +323,9 @@ func TestNewRequestCanProceedAfterUnknownDelivery(t *testing.T) {
 func TestAcknowledgementPersistenceFailureDoesNotResend(t *testing.T) {
 	w, client := confirmationWatcher(t, false)
 	key := applyAsk(w, eventWithCheckpoint("chat_finish", "ask_plan", "plan", 2))
-	backup := filepath.Join(t.TempDir(), "saved")
+	backup := filepath.Join(t.TempDir(), "test-session")
 	client.send = func() error {
-		dir := filepath.Join(w.sessDir, "test-session")
+		dir := filepath.Join(w.store.root.Name(), "test-session")
 		if err := os.Rename(dir, backup); err != nil {
 			t.Fatal(err)
 		}
@@ -395,7 +397,7 @@ func TestTerminalErrorAndCancellationDetachUnknownRequest(t *testing.T) {
 				t.Fatal("terminal event must detach pending reply but retain delivery history")
 			}
 			client.send = nil
-			w = &Watcher{state: stateFromSnapshot(&snap), client: client, sessDir: w.sessDir}
+			w = &Watcher{state: stateFromSnapshot(&snap), client: client, store: w.store}
 			if err := w.SendMessage(context.Background(), "new question"); err != nil {
 				t.Fatal(err)
 			}
@@ -440,7 +442,7 @@ func TestReportRequiresManualConfirmationAfterAnalysis(t *testing.T) {
 	if len(confirmation) != 1 || confirmation[0].AutoConfirmed || confirmation[0].Type != "ask_report_render" {
 		t.Fatalf("manual report confirmation recorded incorrectly: %+v", confirmation)
 	}
-	w.state = stateFromSnapshot(LoadState(w.sessDir, "test-session"))
+	w.state = stateFromSnapshot(loadState(w.store, "test-session"))
 	client.events = []dataagent.SSEEvent{
 		eventWithCheckpoint("chat_finish", "ask_report_render", "report offer", 2),
 		eventWithCheckpoint("chat_finish", "chat", "", 5),
@@ -499,10 +501,10 @@ func TestReadyReportRestoresWithoutAutomaticSend(t *testing.T) {
 			snap := w.state.Snapshot()
 			snap.AutoConfirm = true
 			w.state = stateFromSnapshot(&snap)
-			if err := w.state.Persist(w.sessDir); err != nil {
+			if err := w.state.persist(w.store); err != nil {
 				t.Fatal(err)
 			}
-			w.state = stateFromSnapshot(LoadState(w.sessDir, "test-session"))
+			w.state = stateFromSnapshot(loadState(w.store, "test-session"))
 			client.events = []dataagent.SSEEvent{ask, eventWithCheckpoint("chat_finish", "chat", "", 3)}
 			for i := 0; i < 3; i++ {
 				w.streamOnce(context.Background())
@@ -585,13 +587,13 @@ func TestConcurrentPersistenceKeepsCompleteLatestState(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			w.state.AddConclusion("row")
-			if err := w.state.Persist(w.sessDir); err != nil {
+			if err := w.state.persist(w.store); err != nil {
 				t.Error(err)
 			}
 		}()
 	}
 	wg.Wait()
-	if snap := LoadState(w.sessDir, "test-session"); snap == nil || len(snap.Conclusions) != 16 {
+	if snap := loadState(w.store, "test-session"); snap == nil || len(snap.Conclusions) != 16 {
 		t.Fatalf("stale snapshot: %+v", snap)
 	}
 }

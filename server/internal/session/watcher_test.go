@@ -20,9 +20,9 @@ func TestStreamOnceUsesLLMDeltaAsASKDataConclusionFallback(t *testing.T) {
 		Mode:      "ASK_DATA",
 	}
 	watcher := &Watcher{
-		state:   state,
-		client:  fakeWatcherClient{events: askDataLLMEvents("这是 ASK_DATA 的答案。")},
-		sessDir: t.TempDir(),
+		state:  state,
+		client: fakeWatcherClient{events: askDataLLMEvents("这是 ASK_DATA 的答案。")},
+		store:  testStore(t),
 	}
 
 	finished, isError := watcher.streamOnce(context.Background())
@@ -60,7 +60,7 @@ func TestStreamOncePrefersOutputConclusionOverLLMFallback(t *testing.T) {
 			eventWithCheckpoint("content_finish", "output_conclusion", "", 6),
 			eventWithCheckpoint("chat_finish", "chat", "", 7),
 		}},
-		sessDir: t.TempDir(),
+		store: testStore(t),
 	}
 
 	finished, isError := watcher.streamOnce(context.Background())
@@ -99,7 +99,7 @@ func TestStreamOnceUsesNotebookOutputInsteadOfApproval(t *testing.T) {
 				eventWithCheckpoint("chat_finish", "ask_report_render", "render report?", 8),
 				eventWithCheckpoint("chat_finish", "chat", "", 9))
 			state := &State{SessionID: "test-session", AgentID: "test-agent", Status: StatusRunning, Mode: "pro", AutoConfirm: true}
-			watcher := &Watcher{state: state, client: fakeWatcherClient{events: events}, sessDir: t.TempDir()}
+			watcher := &Watcher{state: state, client: fakeWatcherClient{events: events}, store: testStore(t)}
 			watcher.streamOnce(context.Background())
 			snap := state.Snapshot()
 			if len(snap.Conclusions) != 1 || snap.Conclusions[0] != output {
@@ -114,7 +114,7 @@ func TestStreamOnceUsesNotebookOutputInsteadOfApproval(t *testing.T) {
 
 func TestStreamOncePrefersFormalConclusionOverNotebookOutput(t *testing.T) {
 	state := &State{SessionID: "test-session", AgentID: "test-agent", Status: StatusRunning}
-	watcher := &Watcher{state: state, sessDir: t.TempDir(), client: fakeWatcherClient{events: []dataagent.SSEEvent{
+	watcher := &Watcher{state: state, store: testStore(t), client: fakeWatcherClient{events: []dataagent.SSEEvent{
 		eventWithCheckpoint("data", "tool_call_response", notebookOutputContent(t, "intermediate rows"), 1),
 		eventWithCheckpoint("data", "output_conclusion", "The final answer is 405.", 2),
 		eventWithCheckpoint("chat_finish", "chat", "", 3),
@@ -141,7 +141,7 @@ func TestStreamOnceFallbackSnapshotAndReplayDoNotDuplicate(t *testing.T) {
 			events := append(append([]dataagent.SSEEvent{}, block...), block...)
 			events = append(events, eventWithCheckpoint("chat_finish", "chat", "", 2))
 			state := &State{SessionID: "test-session", AgentID: "test-agent", Status: StatusRunning}
-			watcher := &Watcher{state: state, sessDir: t.TempDir(), client: fakeWatcherClient{events: events}}
+			watcher := &Watcher{state: state, store: testStore(t), client: fakeWatcherClient{events: events}}
 			watcher.streamOnce(context.Background())
 			if got := state.GetConclusions(); len(got) != 1 || got[0] != "Revenue 360, profit 405." {
 				t.Fatalf("snapshot or replay duplicated fallback: %#v", got)
@@ -152,11 +152,11 @@ func TestStreamOnceFallbackSnapshotAndReplayDoNotDuplicate(t *testing.T) {
 
 func TestNotebookFallbackSurvivesRestoreAndResetsOnNewTurn(t *testing.T) {
 	state := &State{SessionID: "test-session", AgentID: "test-agent", Status: StatusRunning}
-	watcher := &Watcher{state: state, sessDir: t.TempDir(), client: fakeWatcherClient{events: []dataagent.SSEEvent{
+	watcher := &Watcher{state: state, store: testStore(t), client: fakeWatcherClient{events: []dataagent.SSEEvent{
 		eventWithCheckpoint("data", "tool_call_response", notebookOutputContent(t, "Profit 405"), 1),
 	}}}
 	watcher.streamOnce(context.Background())
-	watcher.state = stateFromSnapshot(LoadState(watcher.sessDir, "test-session"))
+	watcher.state = stateFromSnapshot(loadState(watcher.store, "test-session"))
 	watcher.client = fakeWatcherClient{events: []dataagent.SSEEvent{eventWithCheckpoint("chat_finish", "chat", "", 2)}}
 	watcher.streamOnce(context.Background())
 	if got := watcher.state.GetConclusions(); len(got) != 1 || got[0] != "Profit 405" {
@@ -179,7 +179,7 @@ func TestStreamOnceRejectsRestoredApprovalFallback(t *testing.T) {
 		SessionID: "test-session", AgentID: "test-agent", Status: StatusRunning,
 		PendingLLM: `<result>{"action":"approved","reason":"plan confirmed","answers":{}}</result>`,
 	}
-	watcher := &Watcher{state: state, sessDir: t.TempDir(), client: fakeWatcherClient{events: []dataagent.SSEEvent{
+	watcher := &Watcher{state: state, store: testStore(t), client: fakeWatcherClient{events: []dataagent.SSEEvent{
 		eventWithCheckpoint("chat_finish", "chat", "", 1),
 	}}}
 	watcher.streamOnce(context.Background())
@@ -190,7 +190,7 @@ func TestStreamOnceRejectsRestoredApprovalFallback(t *testing.T) {
 
 func TestStreamOnceDoesNotKeepFallbackBeforeNewTurn(t *testing.T) {
 	state := &State{SessionID: "test-session", AgentID: "test-agent", Status: StatusRunning, AwaitingTurn: true}
-	watcher := &Watcher{state: state, sessDir: t.TempDir(), client: fakeWatcherClient{events: []dataagent.SSEEvent{
+	watcher := &Watcher{state: state, store: testStore(t), client: fakeWatcherClient{events: []dataagent.SSEEvent{
 		eventWithCheckpoint("data", "tool_call_response", notebookOutputContent(t, "stale tool result"), 1),
 		eventWithCheckpoint("content_start", "llm", "", 2),
 		eventWithCheckpoint("delta", "llm", "stale LLM", 3),
@@ -206,7 +206,7 @@ func TestStreamOnceDoesNotKeepFallbackBeforeNewTurn(t *testing.T) {
 func TestStreamOnceFlushesOnlySafeUnfinishedFallback(t *testing.T) {
 	for _, content := range []string{"Revenue 360.", `<result>{"action":"approved","reason":"yes","answers":{}}</result>`} {
 		state := &State{SessionID: "test-session", AgentID: "test-agent", Status: StatusRunning}
-		watcher := &Watcher{state: state, sessDir: t.TempDir(), client: fakeWatcherClient{events: []dataagent.SSEEvent{
+		watcher := &Watcher{state: state, store: testStore(t), client: fakeWatcherClient{events: []dataagent.SSEEvent{
 			eventWithCheckpoint("content_start", "llm", "", 1),
 			eventWithCheckpoint("delta", "llm", content, 2),
 			eventWithCheckpoint("chat_finish", "chat", "", 3),
@@ -292,7 +292,7 @@ func TestAutoConfirmNotRepeatedOnInclusiveCheckpointReplay(t *testing.T) {
 		},
 		askCheckpoint: 2,
 	}
-	watcher := &Watcher{state: state, client: client, sessDir: t.TempDir()}
+	watcher := &Watcher{state: state, client: client, store: testStore(t)}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -309,7 +309,7 @@ func TestAutoConfirmNotRepeatedOnInclusiveCheckpointReplay(t *testing.T) {
 func TestManualReplyDoesNotReenterWaitingOnReplay(t *testing.T) {
 	state := &State{SessionID: "session-1", AgentID: "agent-1", Status: StatusRunning, Mode: "pro"}
 	ask := eventWithCheckpoint("chat_finish", "ask_plan", `{"plan_id":"p1","plans":[]}`, 2)
-	watcher := &Watcher{state: state, client: fakeWatcherClient{}, sessDir: t.TempDir()}
+	watcher := &Watcher{state: state, client: fakeWatcherClient{}, store: testStore(t)}
 
 	state.SetCheckpoint(2)
 	key, stable := watcher.eventKey(ask)

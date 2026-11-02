@@ -1,10 +1,13 @@
 package mcp
 
 import (
+	"context"
 	"os"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/alibabacloud/data-agent-mcp-server/internal/tenant"
 )
 
 // defaultWaitCap bounds every server-side blocking wait (data_agent_wait_result
@@ -46,40 +49,55 @@ func (s *Server) effectiveWaitCap() time.Duration {
 // waitRegistry tracks which sessions have a blocking wait in flight so that
 // duplicate parallel calls (a recurring LLM misbehavior) degrade to immediate
 // snapshots instead of stacking multi-minute blocked requests.
+type waitKey struct {
+	principalID string
+	sessionID   string
+}
+
+func blockingWaitKey(ctx context.Context, sessionID string) waitKey {
+	key := waitKey{sessionID: sessionID}
+	if principal := tenant.PrincipalFromContext(ctx); principal != nil {
+		key.principalID = principal.ID
+	}
+	return key
+}
+
 type waitRegistry struct {
 	mu       sync.Mutex
-	inflight map[string]struct{}
+	inflight map[waitKey]struct{}
 }
 
 func newWaitRegistry() *waitRegistry {
-	return &waitRegistry{inflight: make(map[string]struct{})}
+	return &waitRegistry{inflight: make(map[waitKey]struct{})}
 }
 
 // enter marks a blocking wait as in flight for the session. It returns false
 // when another wait is already running, in which case the caller must not
 // block (and must not call exit). Nil-safe: a zero-value Server never blocks
 // duplicates.
-func (w *waitRegistry) enter(sessionID string) bool {
+func (w *waitRegistry) enter(ctx context.Context, sessionID string) bool {
 	if w == nil {
 		return true
 	}
+	key := blockingWaitKey(ctx, sessionID)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, ok := w.inflight[sessionID]; ok {
+	if _, ok := w.inflight[key]; ok {
 		return false
 	}
-	w.inflight[sessionID] = struct{}{}
+	w.inflight[key] = struct{}{}
 	return true
 }
 
 // exit clears the in-flight marker set by a successful enter.
-func (w *waitRegistry) exit(sessionID string) {
+func (w *waitRegistry) exit(ctx context.Context, sessionID string) {
 	if w == nil {
 		return
 	}
+	key := blockingWaitKey(ctx, sessionID)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	delete(w.inflight, sessionID)
+	delete(w.inflight, key)
 }
 
 // duplicateWaitWarning is returned to callers whose blocking wait was degraded

@@ -1,13 +1,21 @@
 # Alibaba Cloud Data Agent MCP Skill
 
-A standalone Agent Skill that exposes **Alibaba Cloud Apsara Data Agent for Analytics** as a native MCP server (`data-agent`, 19 `data_agent_*` tools), built in Go. AI assistants call the tools directly to discover databases, run natural language analysis, track progress via server-side SSE monitoring, and fetch conclusions, charts, and file artifacts (reports / Excel exports).
+A standalone Agent Skill that exposes **Alibaba Cloud Apsara Data Agent for Analytics** as a native Go MCP server (`data-agent`): 19 `data_agent_*` tools by default, 28 with the nine base `data_gateway_*` metadata tools, or 30 with P2b's two read-only control-plane data-source summary tools too (11 gateway tools). AI assistants call the tools directly to discover databases, run natural language analysis, track progress via server-side SSE monitoring, and fetch conclusions, charts, and file artifacts (reports / Excel exports).
+
+P2a adds Catalog/database details and database search under the base gateway switch; the original six tools are unchanged. P2b adds `data_gateway_list_data_sources` / `data_gateway_get_data_source` behind `agent_gateway.data_sources_enabled` (default `false`, requires `enabled=true`). **Historical pre-remediation evidence (2026-10-29):** P2a/P2b automated checks and independent-binary stdio/configured-role HTTP/SSE discovery passed, including 19/28/30 registration, pagination, type filtering, sanitized details and missing-source errors in Hangzhou.
+
+**Security remediation is implemented locally. Deployment and real-cloud release gates remain unverified.** Historical successes do not establish the new binary's storage, ingress or isolation guarantees. Real JWT-platform, differential-role and least-privilege acceptance remain open; do not claim production acceptance. See the [release checklist](references/INSTALLATION.md#post-remediation-release-gate--not-yet-verified).
+
+P2b summaries reflect the **upstream RAM/STS principal's control-plane scope, not the chat user's database ACL**; same-role sessions share permissions. Deployers must accept that summary visibility scope before release or leave P2b disabled. Success does not prove account-wide visibility, cross-role isolation or least privilege. P2b removes authentication/network/permission/unknown fields and `TotalCount`, not all Server Host exposure: root Catalog search still accepts address prefixes. Get requires a valid object; successful `Data:null` support is deferred, and the observed 404 stays `ERROR` (`GATEWAY_UPSTREAM_INCOMPATIBLE`). See [contracts and real evidence](references/INSTALLATION.md#optional-agentic-metadata-gateway) and [RAM documentation discrepancy](references/ram-policies.md#p2b-read-only-control-plane-summaries).
+
+P2c/P3 and Wiki/ACL remain unimplemented; no gateway SQL history/execution, data-source writes, connection tests or Token tools are exposed. The metadata gateway adds no SQL protection to the old Data Agent path; gateway UUIDs/QualifiedName are not session `database_id` values.
 
 > Looking for the Python CLI integration instead? See the repository root [README](../README.md) and [SKILL.md](../alibabacloud-data-agent-skill/SKILL.md).
 
 ## Requirements
 
-- A **data-agent-mcp-server binary**. This skill ships without server source or binaries — build once from the repository's [`server/`](../server) project (Go 1.23+, `cd server && make build`) or place a release binary where the launcher can find it (see Server Binary below)
-- Alibaba Cloud credentials with `AliyunDMSFullAccess` or `AliyunDMSDataAgentFullAccess` (see [references/ram-policies.md](references/ram-policies.md))
+- A **data-agent-mcp-server binary**. This skill ships without server source or binaries — build once from the repository's [`server/`](../server) project (Go 1.26.10+, `cd server && make build`) or place a release binary where the launcher can find it (see Server Binary below)
+- Alibaba Cloud SDK AK/STS credentials with RAM API and service-side data permissions for the enabled tools; Data Agent policies do not establish gateway authorization (see [references/ram-policies.md](references/ram-policies.md))
 - Data sources managed in Alibaba Cloud DMS / Data Agent Data Center
 
 ## Server Binary
@@ -22,66 +30,92 @@ A standalone Agent Skill that exposes **Alibaba Cloud Apsara Data Agent for Anal
 
 Sources and priority (highest wins): **env vars > `.env` file > `config.yaml` > defaults**.
 
-```bash
-cd server                          # the Go server project at the repository root
-cp .env.example .env               # secrets: AK/SK (never commit; gitignored)
-cp config.yaml.example config.yaml # non-secret settings (gitignored)
-```
+The Go Server uses the **credentials-go default chain**, retaining providers for dynamic retrieval and RAM AssumeRole source chaining. It does not hand-read `~/.aliyun/config.json` or guarantee CLI-profile support. Configure a supported SDK provider; static STS environment values do not renew themselves.
+
+**Breaking migration:** API Key runtime mode is removed from the entire Go Server, including SSE, regardless of `agent_gateway.enabled`. Remove obsolete `api_key`, `api_key_endpoint`, `api_key_stream_endpoint` configuration keys and `DATA_AGENT_API_KEY`, `DATA_AGENT_API_KEY_ENDPOINT`, `DATA_AGENT_API_KEY_STREAM_ENDPOINT` environment variables. Any old YAML key (even empty) or nonempty old variable causes an explicit sanitized startup migration error, even with valid SDK credentials and the gateway disabled; no silent fallback. After cleanup, usable SDK credentials are still required. Keep `identity.auth_token`, JWT, dacli `--token`, STS SecurityToken and OSS upload signatures. The Python CLI skill is unchanged. See [credential migration](references/INSTALLATION.md#credentials).
+
+Use the [non-secret YAML example](../server/config.yaml.example) and
+[public environment template](../server/.env.example), preferring managed
+secret/environment injection over file secrets. Actually loaded secret-bearing
+YAML/JSON/dotenv files must be process-owned regular files in trusted directories,
+POSIX **0600/0400**; placeholder-only/non-secret files may be 0644. Windows requires
+verified equivalent ACLs or file-secret deployment is blocked. No automatic
+chmod/chown, secret rotation or migration occurs; changes to real files,
+permissions or deployments require separate administrator authorization. See
+[secret-file requirements](references/INSTALLATION.md#secret-files), including
+projected/symlink limitations. YAML examples do not interpolate `${VAR}` secrets.
 
 ### config.yaml — examples
 
-**Minimal — single tenant, no identity mode.** The server acts as one Alibaba
-Cloud identity (AK/SK from `.env`); every caller shares it.
+**Minimal — local stdio only, gateway disabled.** The server acts as one SDK
+credential-chain process identity, not a multi-user endpoint. **All HTTP/SSE**
+deployments require the mandatory identity configuration below, even on localhost
+or with the gateway off.
 
 ```yaml
 region: cn-hangzhou
 sessions_dir: ~/.data-agent/sessions
+agent_gateway:
+  enabled: false
+  data_sources_enabled: false       # P2b; requires enabled=true and accepted visibility scope
+  endpoint: dms.cn-hangzhou.aliyuncs.com
+  request_timeout_seconds: 30
+  max_response_bytes: 4194304
 # workspace_id / custom_agent_id optional; empty = auto workspace + built-in agent
 ```
 
-**Multi-tenant — Feishu Aily with JWT, groups, and per-user RAM roles.** Every
-request carries a signed identity; the server assumes a per-group RAM role via
-STS so RAM/DMS permissions apply per end user. Secrets stay in `.env`.
+Enable only after configuring the intended access. Gateway accepts an explicit
+public `dms.<region>.aliyuncs.com` host matching `region`, not a scheme, port,
+path, query, fragment, userinfo or VPC endpoint. HTTPS redirects are rejected.
+The 30s HTTP budget does not cover Resolver/STS time; 4 MiB caps decoded responses.
+See the [full gateway contract](references/INSTALLATION.md#optional-agentic-metadata-gateway).
+
+**Remote JWT mode — verified claims, scoped groups and RAM roles.** Every tool
+and protocol request must authenticate. Same-role users normally share cloud
+permissions, not independent row/column scopes. This is an illustrative fragment,
+not approval to deploy or modify roles.
 
 ```yaml
 region: cn-hangzhou
 sessions_dir: ~/.data-agent/sessions
-
 log:
-  requests: full                          # basic | full | off
-
+  requests: basic
 identity:
   enabled: true
+  require_identity: true
+  namespace: example-domain
+  max_tenants: 128
   jwt:
     enabled: true
-    # secret / secrets live in .env (IDENTITY_JWT_SECRET / IDENTITY_JWT_SECRETS)
-  auth_token: ""                # required; set via IDENTITY_AUTH_TOKEN in .env
-  session_name_claim: email     # what ActionTrail records: user_id | email | ...
-  require_identity: true        # reject anonymous requests (fail-closed)
-
-  default:                      # catch-all for identified users in no group
-    role_arn: acs:ram::<account-id>:role/da-default
-    mode: lite
+    # Inject IDENTITY_JWT_SECRET; optional IDENTITY_JWT_SECRETS for same trust domain
+  auth_token: ""                    # inject nonempty IDENTITY_AUTH_TOKEN
+  session_name_claim: user_id
   groups:
     analysts:
-      role_arn: acs:ram::<account-id>:role/da-analysts
-      workspace_id: ws-analysts
-      custom_agent_id: ca-xxxx
+      tenant_id: "<trusted-tenant-id>"
+      agent_id: "<trusted-agent-id>"
+      role_arn: "acs:ram::<account-id>:role/<analyst-role>"
+      workspace_id: "<workspace-id>"
       mode: pro
-      users: [ou_alice, bob@example.com]   # user id or email; one group per user
+      users: ["<user-id>", "<user-email>"]
+  # Optional default for unmatched users ONLY in this exact scope:
+  #default:
+  #  tenant_id: "<trusted-tenant-id>"
+  #  agent_id: "<trusted-agent-id>"
+  #  role_arn: "acs:ram::<account-id>:role/<default-role>"
+  #  mode: lite
 ```
 
-Matching `.env` for the multi-tenant example (secrets never go in `config.yaml`):
+Provision `IDENTITY_AUTH_TOKEN` and `IDENTITY_JWT_SECRET` in the server environment
+through the operator's trusted secret mechanism. All extra keys in
+`IDENTITY_JWT_SECRETS` have equivalent signing authority in **one trusted domain**;
+do not combine unrelated organizations/issuers. The SDK default chain is retained;
+use AK/SK/STS environment values only when that is the intended provider.
 
-```bash
-ALIBABA_CLOUD_ACCESS_KEY_ID=EXAMPLE_b41d7b88eb4fce42      # base AK/SK for STS AssumeRole
-ALIBABA_CLOUD_ACCESS_KEY_SECRET=********
-IDENTITY_AUTH_TOKEN=a-long-random-shared-secret # checked first on every request
-IDENTITY_JWT_SECRET=agent-a-hmac-secret         # HS256 key from Aily's MCP editor
-IDENTITY_JWT_SECRETS=agent-b-secret,agent-c-secret  # optional: more upstream agents
-```
-
-Then start with `MCP_TRANSPORT=streamable-http MCP_PORT=61026 ./data-agent-mcp-server`. See [Identity & RAM Role Assumption](#identity--ram-role-assumption-how-角色扮演-works) for how resolution works and the RAM prerequisites.
+After configuration and applicable validation/authorization, use
+`MCP_TRANSPORT=streamable-http MCP_PORT=61026 ./data-agent-mcp-server`.
+See [Identity & RAM Role Assumption](#identity--ram-role-assumption-how-角色扮演-works)
+for mapping requirements and [all HTTP limits](references/INSTALLATION.md#remote-http-limits-and-protocol-lifecycle).
 
 ### config.yaml (full reference)
 
@@ -94,26 +128,37 @@ Lookup order: `$DATA_AGENT_CONFIG` > `./config.yaml` > `~/.data-agent/config.yam
 | `workspace_id` | auto personal workspace | Default Data Agent workspace |
 | `custom_agent_id` | — | Default custom agent for sessions that omit one. An identity group's `custom_agent_id` wins over this; an explicit tool argument wins over both |
 | `sessions_dir` | `~/.data-agent/sessions` | Local session state directory |
-| `api_key` | — | API Key auth (alternative to AK/SK; **incompatible with identity mode**) |
 | `dms_enterprise_endpoint` | `dms-enterprise.{region}.aliyuncs.com` | Host for the dms-enterprise metadata APIs (database/table/instance discovery, import tagging, `GetActiveRouteUnit`); set a VPC endpoint when public egress is unavailable. Not covered by any Data Agent endpoint setting |
 | `data_agent_endpoint` | `dms.{region}.aliyuncs.com` | Host for the AK/SK-signed Data Agent API (session create/send/status and the SSE stream) |
-| `api_key_endpoint` | `dataagent-{region}.aliyuncs.com` | API Key control-plane host (ignored with AK/SK auth) |
-| `api_key_stream_endpoint` | `dataagent-stream-{region}.aliyuncs.com` | API Key streaming-plane host (ignored with AK/SK auth) |
+| `agent_gateway.enabled` | `false` | Add nine base Agentic metadata tools including P2a (19 off / 28 base); full P0 least-privilege/cross-role acceptance pending |
+| `agent_gateway.data_sources_enabled` | `false` | Add two P2b read-only control-plane summaries (30 total / 11 gateway tools); requires `enabled=true`, otherwise invalid. Enable only after accepting the principal-scoped summary visibility |
+| `agent_gateway.endpoint` | — | Required explicitly when enabled: public `dms.<region>.aliyuncs.com` host matching `region` only |
+| `agent_gateway.request_timeout_seconds` | `30` | Gateway outbound HTTP budget, not total identity/STS time |
+| `agent_gateway.max_response_bytes` | `4194304` | 4 MiB decoded response cap, including errors |
 | `log.requests` | `basic` on HTTP transports, `off` on stdio | Per-tool-call logging: `basic` (tool, caller, outcome, duration) \| `full` (adds redacted arguments) \| `off`. A standalone deployment logs by default; stdio stays quiet because the host agent owns the console. The identity token is never logged |
 | `sts.endpoint` | `sts.{region}.aliyuncs.com` | STS endpoint used for AssumeRole |
 | `sts.session_expiration` | `3600` | Temporary credential lifetime in seconds |
-| `identity.enabled` | `false` | Turn on multi-tenant identity mapping (HTTP/SSE transports only; legacy section name `aily` still accepted) |
-| `identity.jwt.enabled` | `false` | Verify the upstream-signed identity token (Feishu Aily JWT). A JWT is used when the caller sends one; without one the request falls back to the identity headers. A token that is present but invalid is always rejected, never retried against the headers |
-| `identity.jwt.secret` | — | HS256 key from the platform's MCP editor, used as-is (no base64). Prefer `IDENTITY_JWT_SECRET` in `.env` |
-| `identity.jwt.secrets` | `[]` | Additional HS256 keys so several upstream agents can share one server, each signing with its own key; a token passes if `secret` or any of these verifies it. Prefer `IDENTITY_JWT_SECRETS` (comma-separated) in `.env` |
+| `identity.enabled` | `false` (local stdio only) | Must be explicitly `true` for every HTTP/SSE deployment, gateway on or off |
+| `identity.namespace` | — | Required remotely; stable administrator-chosen domain, 1–64 chars `[a-z0-9][a-z0-9_-]*` |
+| `identity.max_tenants` | `128` | Cached Tenants plus initializing reservations; positive, no automatic eviction; protocol disconnect does not release this capacity |
+| `identity.jwt.enabled` | `false` | Explicit Header mode when false. When true, every remote method requires valid HS256/exp plus tenant_id, agent_id and user_id or email; no missing-JWT fallback |
+| `identity.jwt.secret` | — | HS256 key used as-is (no base64); prefer `IDENTITY_JWT_SECRET` via managed environment injection |
+| `identity.jwt.secrets` | `[]` | Additional equivalent-authority signing keys in the same trusted domain only; env `IDENTITY_JWT_SECRETS` (comma-separated), not independent issuer routing |
 | `identity.jwt.header` | `x-aily-jwt` | Header carrying the bare token (no `Bearer ` prefix) |
 | `identity.session_name_claim` | `user_id` | Identity field used as the STS RoleSessionName segment: `user_id` \| `email` \| `enterprise_email` \| `employee_no` \| `tenant_id` \| `agent_id`. Applies to whichever path is active; the header path only carries `user_id`/`email`, so any other choice falls back to the user id there. Group matching always uses `user_id`/`email` regardless |
-| `identity.require_identity` | `false` | Reject requests without identity headers instead of using the server identity |
-| `identity.auth_token` | — | Caller authentication token; **required whenever `identity.enabled`** and checked first on every request (both the JWT and header paths), since without a JWT the request falls back to the forgeable headers. Legacy name `shared_secret` still accepted |
+| `identity.require_identity` | `false` (invalid remotely) | Must be explicitly `true` for all remote tools and protocol methods; old fallback deployments fail startup |
+| `identity.auth_token` | — | Platform authentication token; **required whenever `identity.enabled`**, checked first on both JWT and header paths. Legacy name `shared_secret` still accepted; not the removed outbound API Key mode |
 | `identity.session_name_prefix` | `aily` when the key is absent | STS RoleSessionName = `<prefix>-<session_name_claim value>`. Set it to an **empty string** to drop the prefix and use the bare value; omit the key to keep the historical `aily-` form. Env: `IDENTITY_SESSION_NAME_PREFIX` (empty = no prefix) |
 | `identity.headers.user/email/token` | `x-aily-user` / `x-aily-email` / `x-aily-token` | Identity header names (rename for non-Aily upstreams) |
-| `identity.default` | — | **Style 1 — global sharing**: one role (+ optional `workspace_id` / `custom_agent_id` / `mode` defaults) for every identified user |
-| `identity.groups.<name>` | — | **Style 2 — groups**: per-group `role_arn` + session defaults + `users` list (user id or email; one group per user; wins over default) |
+| `identity.default` | — | Optional shared role for authenticated, unmatched users in its exact tenant/agent scope only |
+| `identity.groups.<name>` | — | Scoped `role_arn` + session defaults + `users` list; exactly one named match takes precedence over default; conflicts reject even with identical roles |
+| `identity.groups.<name>.tenant_id/agent_id`, `identity.default.tenant_id/agent_id` | — | Required exact values in JWT mode; must be empty in Header mode; no wildcards or cross-scope defaults |
+
+All eleven `http.*` defaults, their units and lifecycle meanings are in the
+[HTTP limits table](references/INSTALLATION.md#remote-http-limits-and-protocol-lifecycle)
+and [full configuration example](../server/config.yaml.example). Omitted numeric
+limits use defaults; **explicit zero/negative values and overflow reject**, not
+unlimited mode. Per-principal/session caps cannot exceed their corresponding totals.
 
 ### .env / environment variables
 
@@ -121,77 +166,86 @@ The `.env` file (path: `$DATA_AGENT_ENV_FILE`, else `./.env`) is loaded into the
 
 | Variable | Purpose |
 |----------|---------|
-| `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | Long-term AK/SK. Falls back to the default credential chain (`~/.aliyun/config.json`, ECS instance role) when unset |
+| `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | Explicit AK/SK for the credentials-go default chain; otherwise configure a supported SDK provider, such as an instance/workload role. CLI profiles are not automatically imported |
 | `ALIBABA_CLOUD_SECURITY_TOKEN` | STS token, read together with the AK/SK pair when running on temporary credentials |
 | `DATA_AGENT_REGION` / `BUDDY_REGION` | Region override (`DATA_AGENT_REGION` wins) |
-| `DATA_AGENT_DMS_UNIT` / `DATA_AGENT_WORKSPACE_ID` / `DATA_AGENT_CUSTOM_AGENT_ID` / `DATA_AGENT_SESSIONS_DIR` / `DATA_AGENT_API_KEY` | Override the matching config keys |
+| `DATA_AGENT_DMS_UNIT` / `DATA_AGENT_WORKSPACE_ID` / `DATA_AGENT_CUSTOM_AGENT_ID` / `DATA_AGENT_SESSIONS_DIR` | Override the matching config keys |
 | `DATA_AGENT_DMS_ENTERPRISE_ENDPOINT` | dms-enterprise host for the metadata APIs; overrides `dms_enterprise_endpoint`. Default `dms-enterprise.{region}.aliyuncs.com` — set for VPC-only egress or non-public-cloud |
-| `DATA_AGENT_ENDPOINT` | Host of the AK/SK-signed Data Agent API (sessions + SSE); overrides `data_agent_endpoint`. Default `dms.{region}.aliyuncs.com` |
-| `DATA_AGENT_API_KEY_ENDPOINT` / `DATA_AGENT_API_KEY_STREAM_ENDPOINT` | API Key control/streaming hosts; override `api_key_endpoint` / `api_key_stream_endpoint` |
+| `DATA_AGENT_ENDPOINT` | Host of the AK/STS-signed Data Agent API (sessions + SSE); overrides `data_agent_endpoint`. Default `dms.{region}.aliyuncs.com`; not a gateway endpoint override |
 | `DATA_AGENT_CONFIG` / `DATA_AGENT_ENV_FILE` | Explicit config / .env file paths |
 | `AILY_SHARED_SECRET` / `IDENTITY_SHARED_SECRET` / `IDENTITY_AUTH_TOKEN` | Overrides `identity.auth_token` |
 | `IDENTITY_JWT_SECRET` | Overrides `identity.jwt.secret` (HS256 key for the upstream-signed identity token) |
-| `IDENTITY_JWT_SECRETS` | Comma-separated extra HS256 keys, merged with `identity.jwt.secret` for multiple upstream agents |
+| `IDENTITY_JWT_SECRETS` | Comma-separated extra HS256 keys, equivalent signing authority in one trusted domain; not for untrusted issuers |
 | `IDENTITY_SESSION_NAME_PREFIX` | Overrides `identity.session_name_prefix`; an **empty** value means no prefix (unset keeps the config/default) |
 | `MCP_TRANSPORT` / `MCP_PORT` | `stdio` (default) \| `streamable-http` \| `sse`; port is required for HTTP transports |
 | `DATA_AGENT_LOG_REQUESTS` | `basic` \| `full` \| `off`; overrides `log.requests`. Unset = `basic` on HTTP transports, `off` on stdio |
-| `DATA_AGENT_DEBUG_SSE` | `1` = log raw SSE traffic (debugging) |
+| `DATA_AGENT_DEBUG_SSE` | `1` = bounded SSE diagnostic metadata, not raw payloads or credentials |
 
 ## Identity & RAM Role Assumption (how 角色扮演 works)
 
-With `identity.enabled: true`, the server never serves data under its own identity for user requests. The upstream caller (Feishu Aily by default — any gateway/portal forwarding identity headers works) sends the end-user identity on every request, and each call executes under a RAM role assumed **on behalf of that user**:
-
-```mermaid
-graph LR
-    A[Request with identity headers<br/>user / email / token] --> B[auth_token check]
-    B --> C[Group resolution<br/>groups → default]
-    C --> D[STS AssumeRole<br/>RoleSessionName = prefix-user_id]
-    D --> E[Per-user tenant<br/>client + session store + group defaults]
-    E --> F[Data Agent / DMS APIs<br/>under the user's role]
-```
+Every remote request follows platform token → verified Principal → scoped role
+mapping → protocol ownership and bounded body → dispatch. Only business tools
+then initialize a Tenant/STS provider. Authentication/mapping rejection must not
+create a Tenant or call STS. This applies to **all** old/new tools and protocol
+methods, independently of gateway flags.
 
 ### Identity headers & caller authentication
 
-The server does no login of its own — it trusts the upstream platform to say **who the end user is**, and verifies that the request **really comes from that platform**. Two config knobs cover this:
+| Setting | Default header | Purpose |
+|---|---|---|
+| `identity.headers.token` | `x-aily-token` | Mandatory platform token, checked before mapping |
+| `identity.jwt.header` | `x-aily-jwt` | Bare HS256 JWT in JWT mode, required on every request |
+| `identity.headers.user` | `x-aily-user` | User ID in explicit trusted-Header mode |
+| `identity.headers.email` | `x-aily-email` | Email in explicit trusted-Header mode |
 
-**`identity.headers` — where the identity comes from.** On every MCP request the upstream attaches three HTTP headers, and this setting names them:
+JWT mode requires verified `exp`, nonempty `tenant_id`/`agent_id` and user ID or
+email. A platform must support those claims **and every protocol method**, not
+just tool calls. All groups and any default require exact tenant/agent scope;
+within that scope exactly one named group wins, otherwise a same-scope default
+may apply. Multiple groups matching user ID/email reject even if their roles
+are equal. No missing/invalid JWT may fall back to headers or a global identity.
 
-| Key | Default (Feishu Aily convention) | Carries |
-|-----|----------------------------------|---------|
-| `headers.user` | `x-aily-user` | End-user id — drives group matching, `RoleSessionName`, and the per-user session directory |
-| `headers.email` | `x-aily-email` | End-user email — secondary key for group matching |
-| `headers.token` | `x-aily-token` | Caller authentication token (compared against `auth_token`) |
+Header mode is a separate administrator choice: tenant/agent scopes must be
+empty and the trusted proxy must overwrite client-supplied identity headers,
+ensure domain-wide identifier uniqueness, and keep its token from ordinary
+callers. Namespace is administrator-chosen and stable, never a request value.
+Shared JWT keys are equivalent signers in one trusted domain; independent
+issuers require separate instances/configurations/storage roots.
 
-For Feishu Aily nothing needs to be configured — the defaults match. To integrate another upstream (an internal gateway sending `x-gateway-uid`, a portal, a bot platform), just rename the headers here; no code changes are needed.
+Retain the SDK source/AssumeRole provider chain. Source `sts:AssumeRole`, role
+trust, API permissions and data ACLs are separate prerequisites; do not change
+them without authorization or add FullAccess to hide missing evidence. Gateway
+credential failures reject stale/global fallback, without promising that the
+old analysis path has the same strict refresh semantics. RoleSessionName and
+workspace/custom-agent defaults are **not cloud row/column isolation**; same-role
+users normally share effective cloud scope. See [RAM requirements](references/ram-policies.md).
 
-**`identity.jwt` — the identity Aily signs for you.** Feishu Aily can sign the end-user identity into a JWT (HS256) and send it as `x-aily-jwt` on every request, using a secret shown in its MCP editor. Verification pins the algorithm to HS256 and requires `exp`. Claims consumed: `user_id`, `tenant_id`, `email`, `enterprise_email`, `employee_no`, `department_ids`, `agent_id`. Several upstream agents can share one server by each signing with their own key — set `identity.jwt.secrets` (or env `IDENTITY_JWT_SECRETS`, comma-separated) alongside `secret`, and a token is accepted if any key verifies it. **A JWT is used whenever the caller sends one and wins over any identity headers on the same request; a request with no JWT falls back to the header path.** A token that is present but invalid is always rejected and never retried against the headers, so a broken token cannot downgrade to the forgeable path. Because that fallback exists, `identity.auth_token` is required whenever identity mode is on and is checked first on **both** paths.
+### Breaking history and protocol migration
 
-**`identity.auth_token` — why the identity can be trusted.** Identity headers are plain HTTP headers: anyone who can reach the endpoint could forge `x-aily-user: <someone else>`. When `auth_token` is set, the token header must match it **before any group resolution happens**, so only the upstream platform that knows the token can act on behalf of users. Set the same value as a custom header in the upstream MCP registration (env override: `IDENTITY_AUTH_TOKEN`; legacy `shared_secret` yaml key and `AILY_SHARED_SECRET` env still work).
+Remote local history uses `sessions_dir/identity-v2/<principal_id>/`, with a
+SHA-256 identity key including namespace, auth mode, tenant/agent and typed
+user ID/email. `owner.json` must match; wrong-owner and nonempty unmarked
+folders are not claimed. No old `identity/<sanitized-key>` fallback or automatic
+migration/deletion exists. Offline migration requires **explicit administrator
+authorization**, backup, proof of unique ownership and file/ID/permission checks;
+ambiguous histories remain offline. stdio is a separate confined single-process
+root. Local ownership markers are not cloud session ACLs. Follow the
+[migration procedure](references/INSTALLATION.md#local-history-and-explicit-migration).
 
-1. **Identity intake** — a signed `x-aily-jwt` when `identity.jwt.enabled`, otherwise the plain user id / email headers (names configurable via `identity.headers`; defaults `x-aily-user` / `x-aily-email`). stdio transport has no headers, so identity mode applies to HTTP/SSE only.
-2. **Legitimacy check** — `auth_token` is verified first on every request (missing/mismatched → rejected). Then, if a JWT is present, its signature and `exp` are verified (invalid → rejected, never retried against the headers). All of this happens before any group resolution.
-3. **Group resolution (first match wins)** — membership in a named `identity.groups.<name>` (matched by user id or email) → `identity.default` (catch-all) → **reject** (fail-closed; never silently falls back to the server identity). Missing identity headers are rejected too when `require_identity: true`.
-4. **AssumeRole** — the base AK/SK calls STS AssumeRole on the group's role with `RoleSessionName = <session_name_prefix>-<value of identity.session_name_claim>` (default `aily-<user_id>`; sanitized, ≤64 chars). Temporary credentials are cached and **auto-refreshed before expiry** (credentials-go `ram_role_arn` provider); long-running SSE watchers pick up rotated tokens transparently.
-5. **Per-user tenant isolation** — every identified user gets a dedicated API client and session store at `sessions_dir/identity/<user>/`, even when many users share one role (default group). Session listing/status/results never leak across users. The group's `workspace_id` / `custom_agent_id` / `mode` become session defaults when `data_agent_create_session` omits them.
-6. **Authorization & audit** — what a user can query is decided entirely by the RAM policies and DMS data permissions attached to the group's role; the MCP server does no data-level authorization itself. In ActionTrail every call shows as `assumed-role/<role>/<prefix>-<session_name_claim value>`, so per-user attribution survives shared roles.
+Every initialize, tools/list/call, notification and GET/POST/DELETE authenticates.
+ID-bearing requests require a **server-issued, principal-owned, live** protocol
+session; same-role identities cannot share IDs. Unknown/expired/deleted/other-owner
+IDs receive safe 404s; no weak compatibility or rebinding. Active streams have
+leases (default 3600 seconds, shortened by JWT exp); clients renew credentials and
+reconnect/reinitialize. SSE disconnect revokes its ID; HTTP notification GET
+disconnect alone does not delete a session. DELETE, idle reclamation, lease expiry
+and shutdown revoke it. Local cancellation is not remote SQL cancellation and
+unknown sends must not be replayed. See [limits and lifecycle](references/INSTALLATION.md#remote-http-limits-and-protocol-lifecycle).
 
-RAM prerequisites:
-
-- Each group role trusts the base account and carries `AliyunDMSDataAgentFullAccess` (or a narrower DMS policy) plus the intended DMS data permissions
-- The base AK/SK RAM user needs `sts:AssumeRole` on **every** group/default role
-- `api_key` auth cannot be combined with identity mode (DMS Enterprise + STS require AK/SK)
-
-### What changed from the earlier identity config
-
-If you configured identity mode before, three things changed:
-
-| Behavior | Before | Now |
-|----------|--------|-----|
-| `identity.jwt.enabled: true` | JWT **mandatory** — the header path was closed, a request without a token was rejected | **JWT-first with header fallback** — a token is used when present (and wins over headers), otherwise the request falls back to the identity headers |
-| `identity.auth_token` | Optional; only guarded the header path, and was considered unnecessary once JWT was on | **Required whenever `identity.enabled`**, checked first on both paths — the server refuses to start without it |
-| JWT verification keys | Single `identity.jwt.secret` | `secret` **plus** `identity.jwt.secrets` / `IDENTITY_JWT_SECRETS`; a token passes if any key verifies it |
-
-**Migration — breaking:** an existing `identity.enabled: true` deployment with **no** `auth_token` now fails to start (`identity.enabled requires identity.auth_token`). Set `identity.auth_token` (or `IDENTITY_AUTH_TOKEN`) to the same value the upstream sends in its token header before upgrading. Existing single-`secret` and header-only setups keep working unchanged otherwise.
+`identity.max_tenants=128` limits cached plus initializing Tenants, not HTTP
+connections. Protocol close does not free Tenant capacity; no automatic eviction
+exists. All numeric safety limits reject explicit zero/negative values. There
+is no anonymous, legacy Header or global-AK fallback for any remote method.
 
 ## Deployment
 
@@ -219,18 +273,25 @@ Where to put it:
 - **Claude Code**: `~/.claude/settings.json` (or project `.claude/settings.json`), then restart / run `/mcp`
 - **Qoder**: `~/.qoder/mcp.json`
 
-`select-binary.sh` picks the platform binary, or builds it with Go on first launch.
+`select-binary.sh` locates a prebuilt binary; build it separately with the required
+toolchain. stdio is local-only and does not separate chat users.
 
 ### Option 2: Streamable HTTP (standalone long-running service)
 
-Best for shared/hosted deployments — one process, any MCP client connects over a URL. `MCP_PORT` must be set explicitly:
+For authorized shared/hosted deployments, first configure mandatory identity,
+scopes, secrets and limits above. This includes localhost and gateway-disabled
+servers. `MCP_PORT` must be set explicitly; these commands are not release approval:
 
 ```bash
 MCP_TRANSPORT=streamable-http MCP_PORT=8931 \
   bash scripts/select-binary.sh
 ```
 
-Register in the client (endpoint path `/mcp`):
+Register in the client (endpoint path `/mcp`). This routing-only fragment is not a
+complete authentication setup: provision platform token and JWT or trusted-proxy
+headers for **every** request, including notifications and DELETE. Keep secrets
+out of URLs, use protected transport outside loopback, and reject hosts that
+cannot carry authentication on all required methods:
 
 ```json
 {
@@ -242,7 +303,10 @@ Register in the client (endpoint path `/mcp`):
 
 For SSE-only clients, start with `MCP_TRANSPORT=sse` and connect to `http://<host>:8931/sse`.
 
-For production, run it under a supervisor (systemd / launchd / container). Deploy the binary directly — the skill launcher is not needed for standalone server deployments. Example systemd unit:
+Only after release gates and separate deployment authorization, run under a
+supervisor (systemd / launchd / container) using the validated binary directly.
+The skill launcher is not needed. This illustrative systemd fragment omits
+operator-provisioned identity/secrets and is not a production acceptance claim:
 
 ```ini
 [Service]
@@ -256,7 +320,10 @@ Restart=always
 When fronting the server with a reverse proxy (nginx etc.), the proxy read
 timeout must exceed the server wait cap (55s by default, see
 `DATA_AGENT_WAIT_CAP`), long-poll timeouts must not count as upstream
-failures, and response buffering must be off for SSE:
+failures, and response buffering must be off for SSE. This timeout-only snippet
+is not an authentication proxy: separately configure trusted identity-header
+overwrite, token injection and access restriction. Proxy limits supplement, not
+replace, the application's header/body/capacity limits and connection leases:
 
 ```nginx
 upstream data-agent-mcp {
@@ -275,27 +342,39 @@ location / {
 
 ### Option 3: Multi-tenant deployment (e.g. Feishu Aily)
 
-Enable the `identity` section in `config.yaml` (mechanism: see [Identity & RAM Role Assumption](#identity--ram-role-assumption-how-角色扮演-works) above):
+All remote deployments are identity-enabled. For JWT mode, use the scoped JWT
+example above and validate real platform claim delivery and renewal. If an
+administrator explicitly selects a **trusted Header proxy** instead, use empty
+scopes, not missing-JWT fallback:
 
 ```yaml
 identity:
   enabled: true
-  require_identity: true            # fail-closed: reject requests without identity headers
-  auth_token: "<random-token>"      # must match the token header set in the upstream registration
-  default:                          # style 1: global sharing (catch-all)
-    role_arn: acs:ram::<account-id>:role/da-default
-    mode: lite
-  groups:                           # style 2: per-group role + session defaults
+  require_identity: true
+  namespace: example-domain
+  max_tenants: 128
+  auth_token: ""                    # inject IDENTITY_AUTH_TOKEN
+  jwt:
+    enabled: false                  # explicit trusted-Header mode
+  groups:
     analysts:
-      role_arn: acs:ram::<account-id>:role/da-analysts
-      workspace_id: ws-analysts
+      tenant_id: ""                 # MUST be empty in Header mode
+      agent_id: ""
+      role_arn: "acs:ram::<account-id>:role/<analyst-role>"
+      workspace_id: "<workspace-id>"
       mode: pro
-      users: [ou_alice, bob@example.com]
+      users: ["<user-id>", "<user-email>"]
 ```
 
-Deploy as Option 2 (Streamable HTTP) where the upstream egress can reach it, and register the URL plus the custom token header (default `x-aily-token`) in the upstream MCP tool settings. For Feishu Aily no header renaming is needed — the defaults match the `x-aily-*` convention.
+An optional Header-mode default also requires empty tenant/agent scopes and
+explicit acceptance of its shared role scope. Register the protected endpoint
+and provision the platform token (`x-aily-token` by default), plus identity on
+all methods. Header names matching a platform convention are not proof that
+real JWT/notification/DELETE integration passes acceptance.
 
-> **Security**: identity headers are spoofable by anyone who can reach the endpoint. Keep it off the public internet (private network / gateway allowlist) and always set `auth_token`.
+> **Security**: keep the token with the trusted proxy, not end users. Require
+> network access restriction and overwrite of self-reported headers. Do not
+> switch modes to bypass an authentication failure.
 
 ## Verify the Deployment
 
@@ -303,22 +382,26 @@ Deploy as Option 2 (Streamable HTTP) where the upstream egress can reach it, and
 # stdio handshake
 printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}\n' \
   | bash scripts/select-binary.sh
-# → serverInfo "data-agent-mcp-server"; the client should list 19 data_agent_* tools
+# → serverInfo "data-agent-mcp-server"; tools/list: 19 off / 28 base / 30 with P2b
 ```
 
 ### dacli — manual verification client
 
-`cmd/dacli` is a bundled CLI that calls the HTTP endpoint exactly like Aily does (identity headers on every request). Ideal for verifying an Option 2/3 deployment by hand:
+`cmd/dacli` is the **Streamable HTTP** manual verification client, not an SSE
+transport client or proof of real Aily platform behavior. It now supports
+`--jwt` / `AILY_JWT`, authenticates notifications and DELETE as well as tool
+requests, and closes its protocol session on exit. Use a compatible host for
+separate SSE transport/renewal acceptance.
 
 ```bash
 cd server && make dacli          # -> bin/dacli (or: go build -o bin/dacli ./cmd/dacli)
 
-# identity via flags (or env: AILY_MCP_URL / AILY_USER / AILY_EMAIL / AILY_TOKEN)
-./bin/dacli --url http://localhost:8931/mcp \
-  --user ou_xxxxxxxx --token <shared-secret> <command>
+# Prefer trusted env injection: AILY_MCP_URL / AILY_TOKEN / AILY_JWT (JWT mode)
+# Header mode: AILY_USER / AILY_EMAIL plus AILY_TOKEN from a trusted proxy/test context
+./bin/dacli --url http://localhost:8931/mcp <command>
 
 # commands
-./bin/dacli ... tools                     # list the 19 MCP tools
+./bin/dacli ... tools                     # 19 off / 28 base / 30 with P2b
 ./bin/dacli ... workspaces                # visible workspaces under the assumed role
 ./bin/dacli ... dbs                       # workspace Data Center databases
 ./bin/dacli ... ask chinook "album,artist,track" "哪个艺术家的专辑数量最多？"
@@ -329,13 +412,26 @@ cd server && make dacli          # -> bin/dacli (or: go build -o bin/dacli ./cmd
 ./bin/dacli ... repl                      # interactive loop
 ```
 
-A wrong `--token` or a user matching no group (without `identity.default`) must be rejected (fail-closed) — that is the multi-tenant access control working as intended. Chart images returned by `result` are saved to `./dacli-out/`.
+`--token` / `--jwt` flags are available, but environment injection avoids secrets
+in command history/process arguments. Wrong tokens, missing required claims,
+ambiguous mappings or out-of-scope users must reject. `--user`/`--token` alone do
+not satisfy JWT mode: supply `AILY_JWT` (or `--jwt`) for every remote method.
+Chart images returned by `result` are saved to `./dacli-out/`. With an authorized
+identity, use `call data_gateway_list_catalogs '{"page_size":50}'`, then the
+[discovery chain](SKILL.md#compact-discovery-chain). Successful tool listing or a
+local JWT fixture does not satisfy real JWT-platform/STS/data-ACL release gates.
 
-Then from the AI client: `data_agent_list_workspaces` → `data_agent_list_workspace_databases` should return real data. Full tool reference, workflows, and troubleshooting: [SKILL.md](SKILL.md).
+Then from the AI client: `data_agent_list_workspaces` → `data_agent_list_workspace_databases` should return real data for an authorized test identity. Full tool reference, workflows, and troubleshooting: [SKILL.md](SKILL.md).
 
 ## Build & Development
 
-The Go server lives in the repository's top-level [`server/`](../server) project; builds output to `server/bin/` (gitignored — binaries are never committed). Go 1.23+ required.
+The Go server lives in the repository's top-level [`server/`](../server) project;
+builds output to `server/bin/` (gitignored — binaries are never committed).
+**Go 1.26.10 minimum**, or a newer supported, rescanned toolchain, is required.
+Verify actual `go version`, rebuild Server/dacli/all platform artifacts, inspect
+`go version -m` and scan source plus binaries. Follow the
+[post-remediation release checks](references/INSTALLATION.md#post-remediation-release-gate--not-yet-verified);
+build completion or old cloud evidence is not production acceptance.
 
 ```bash
 cd server
@@ -353,7 +449,7 @@ go build -trimpath -ldflags "-s -w" -o bin/dacli ./cmd/dacli
 
 # tests & debugging
 make test             # go test ./... (config / tenant / mcp / session / dataagent / event)
-DATA_AGENT_DEBUG_SSE=1 ...   # log raw SSE traffic when debugging event parsing
+DATA_AGENT_DEBUG_SSE=1 ...   # bounded diagnostic metadata, never raw SSE payloads
 ```
 
 ## Layout
@@ -376,4 +472,4 @@ DATA_AGENT_DEBUG_SSE=1 ...   # log raw SSE traffic when debugging event parsing
 
 ## License
 
-Apache License 2.0 — see [../assets/LICENSE](../assets/LICENSE).
+Apache License 2.0 — see [LICENSE](../alibabacloud-data-agent-skill/assets/LICENSE).

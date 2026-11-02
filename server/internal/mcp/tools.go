@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -207,6 +206,9 @@ func (s *Server) handleStatus(ctx context.Context, req mcp.CallToolRequest) (*mc
 	if sid == "" {
 		return mcp.NewToolResultError("session_id is required"), nil
 	}
+	if err := session.ValidateSessionID(sid); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	waitTimeout := 0
 	if wt, ok := req.GetArguments()["wait_timeout"]; ok && wt != nil {
@@ -220,8 +222,8 @@ func (s *Server) handleStatus(ctx context.Context, req mcp.CallToolRequest) (*mc
 
 	var dupWarning string
 	if longPoll {
-		if s.waits.enter(sid) {
-			defer s.waits.exit(sid)
+		if s.waits.enter(ctx, sid) {
+			defer s.waits.exit(ctx, sid)
 		} else {
 			// Duplicate parallel wait — degrade to an immediate snapshot.
 			dupWarning = duplicateWaitWarning
@@ -285,6 +287,9 @@ func (s *Server) handleWaitResult(ctx context.Context, req mcp.CallToolRequest) 
 	if sid == "" {
 		return mcp.NewToolResultError("session_id is required"), nil
 	}
+	if err := session.ValidateSessionID(sid); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	// Cap the block so the response beats the MCP transport timeout
 	// (~120s in common clients): a graceful reason=timeout with progress is
@@ -296,7 +301,7 @@ func (s *Server) handleWaitResult(ctx context.Context, req mcp.CallToolRequest) 
 		}
 	}
 
-	if !s.waits.enter(sid) {
+	if !s.waits.enter(ctx, sid) {
 		// Duplicate parallel wait — degrade to an immediate snapshot.
 		snap, err := s.mgr.GetStatus(sid)
 		if err != nil {
@@ -306,7 +311,7 @@ func (s *Server) handleWaitResult(ctx context.Context, req mcp.CallToolRequest) 
 		result["warning"] = duplicateWaitWarning
 		return jsonResult(result)
 	}
-	defer s.waits.exit(sid)
+	defer s.waits.exit(ctx, sid)
 
 	// Baseline for the progress delta reported on timeout.
 	baseCheckpoint, baseConclusions := 0, 0
@@ -360,6 +365,9 @@ func (s *Server) handleWatchSession(ctx context.Context, req mcp.CallToolRequest
 	if sid == "" {
 		return mcp.NewToolResultError("session_id is required"), nil
 	}
+	if err := session.ValidateSessionID(sid); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	snap, err := s.mgr.WatchSession(ctx, session.WatchOpts{
 		SessionID:   sid,
@@ -395,6 +403,9 @@ func (s *Server) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if sid == "" || msg == "" {
 		return mcp.NewToolResultError("session_id and message are required"), nil
 	}
+	if err := session.ValidateSessionID(sid); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	if err := s.mgr.SendMessage(ctx, sid, msg); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to send message: %v", err)), nil
@@ -417,14 +428,23 @@ func (s *Server) handleResult(_ context.Context, req mcp.CallToolRequest) (*mcp.
 	if sid == "" {
 		return mcp.NewToolResultError("session_id is required"), nil
 	}
+	if err := session.ValidateSessionID(sid); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	state, err := s.mgr.GetResult(sid)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get result: %v", err)), nil
 	}
 
-	sessDir := s.mgr.SessionDir(sid)
-	imageFilenames := getImageFilenames(sessDir)
+	images, err := s.mgr.ReadImages(sid)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get result images: %v", err)), nil
+	}
+	var imageFilenames []string
+	for _, image := range images {
+		imageFilenames = append(imageFilenames, image.Name)
+	}
 
 	// Build multi-content result
 	var contents []mcp.Content
@@ -442,23 +462,10 @@ func (s *Server) handleResult(_ context.Context, req mcp.CallToolRequest) (*mcp.
 	})
 	contents = append(contents, mcp.NewTextContent(string(jsonData)))
 
-	// 2. Append images as ImageContent
-	imgDir := filepath.Join(sessDir, "images")
-	entries, err := os.ReadDir(imgDir)
-	if err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue
-			}
-			filePath := filepath.Join(imgDir, entry.Name())
-			data, err := os.ReadFile(filePath)
-			if err != nil {
-				continue
-			}
-			b64Data := base64.StdEncoding.EncodeToString(data)
-			mimeType := inferImageMIMEType(entry.Name())
-			contents = append(contents, mcp.NewImageContent(b64Data, mimeType))
-		}
+	// 2. Append the same rooted image snapshot as ImageContent.
+	for _, image := range images {
+		b64Data := base64.StdEncoding.EncodeToString(image.Data)
+		contents = append(contents, mcp.NewImageContent(b64Data, inferImageMIMEType(image.Name)))
 	}
 
 	return &mcp.CallToolResult{
@@ -514,7 +521,7 @@ func (s *Server) handleListSessions(ctx context.Context, req mcp.CallToolRequest
 		wsID := argStr(req, "workspace_id")
 		remote, err := s.client.ListRemoteSessions(ctx, wsID)
 		if err != nil {
-			log.Printf("[list_sessions] remote fetch failed (degrading to local only): %v", err)
+			log.Print("[list_sessions] remote fetch failed (degrading to local only)")
 		} else {
 			for _, r := range remote {
 				if _, ok := seen[r.SessionID]; ok {
@@ -558,6 +565,9 @@ func (s *Server) handleStopSession(_ context.Context, req mcp.CallToolRequest) (
 	if sid == "" {
 		return mcp.NewToolResultError("session_id is required"), nil
 	}
+	if err := session.ValidateSessionID(sid); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	if err := s.mgr.StopSession(sid); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to stop session: %v", err)), nil
@@ -570,6 +580,9 @@ func (s *Server) handleListFiles(ctx context.Context, req mcp.CallToolRequest) (
 	sid := argStr(req, "session_id")
 	if sid == "" {
 		return mcp.NewToolResultError("session_id is required"), nil
+	}
+	if err := session.ValidateSessionID(sid); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	var agentID, workspaceID string
@@ -809,20 +822,4 @@ func inferImageMIMEType(filename string) string {
 	default:
 		return "image/png"
 	}
-}
-
-// getImageFilenames returns the list of image filenames in the session's images directory.
-func getImageFilenames(sessDir string) []string {
-	imgDir := filepath.Join(sessDir, "images")
-	entries, err := os.ReadDir(imgDir)
-	if err != nil {
-		return nil
-	}
-	var names []string
-	for _, e := range entries {
-		if !e.IsDir() {
-			names = append(names, e.Name())
-		}
-	}
-	return names
 }

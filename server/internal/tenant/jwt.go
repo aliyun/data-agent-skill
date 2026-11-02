@@ -3,18 +3,25 @@ package tenant
 // JWT verification for upstream-signed end-user identity.
 //
 // Feishu Aily signs the caller's identity into a JWT and sends it on every MCP
-// request. Because the signature proves the request came from the platform, a
-// verified JWT authenticates the caller on its own — unlike the plain identity
-// headers, which anyone reaching the endpoint could forge.
+// request. Remote authentication requires both this signature and the platform
+// token. Header identity is supported only as an explicitly selected trusted
+// proxy deployment, never as a missing-JWT fallback.
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
+	"unicode/utf8"
 
+	"github.com/alibabacloud/data-agent-mcp-server/internal/config"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -36,6 +43,7 @@ type Claims struct {
 	EmployeeNo      string
 	DepartmentIDs   []string
 	AgentID         string
+	ExpiresAt       time.Time
 }
 
 // Field returns the claim selected by name, for choosing which value becomes
@@ -56,7 +64,7 @@ func (c *Claims) Field(name string) (string, error) {
 	case "agent_id":
 		return c.AgentID, nil
 	default:
-		return "", fmt.Errorf("unknown identity claim %q (valid: user_id, email, enterprise_email, employee_no, tenant_id, agent_id)", name)
+		return "", errors.New("unknown identity claim (valid: user_id, email, enterprise_email, employee_no, tenant_id, agent_id)")
 	}
 }
 
@@ -83,6 +91,16 @@ func VerifyJWT(token string, secrets ...string) (*Claims, error) {
 		return nil, fmt.Errorf("identity.jwt secret is not configured")
 	}
 
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || len(token) > 64*1024 {
+		return nil, errors.New("identity token rejected")
+	}
+	for _, part := range parts[:2] {
+		data, err := base64.RawURLEncoding.DecodeString(part)
+		if err != nil || !strictJWTJSON(data) {
+			return nil, errors.New("identity token rejected")
+		}
+	}
 	parser := jwt.NewParser(
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
 		jwt.WithExpirationRequired(),
@@ -114,8 +132,10 @@ func VerifyJWT(token string, secrets ...string) (*Claims, error) {
 		}
 	}
 	if parsed == nil {
-		// The error text describes the failure without echoing the token.
-		return nil, fmt.Errorf("identity token rejected: %w", lastErr)
+		if errors.Is(lastErr, jwt.ErrTokenExpired) {
+			return nil, errors.New("identity token expired")
+		}
+		return nil, errors.New("identity token rejected")
 	}
 
 	mc, ok := parsed.Claims.(jwt.MapClaims)
@@ -123,70 +143,164 @@ func VerifyJWT(token string, secrets ...string) (*Claims, error) {
 		return nil, fmt.Errorf("identity token rejected: unexpected claims type %T", parsed.Claims)
 	}
 
-	claims := &Claims{
-		UserID:          claimString(mc, "user_id"),
-		TenantID:        claimString(mc, "tenant_id"),
-		Email:           claimString(mc, "email"),
-		EnterpriseEmail: claimString(mc, "enterprise_email"),
-		EmployeeNo:      claimString(mc, "employee_no"),
-		AgentID:         claimString(mc, "agent_id"),
-		DepartmentIDs:   claimStrings(mc, "department_ids"),
+	claims := &Claims{}
+	fields := map[string]*string{"user_id": &claims.UserID, "tenant_id": &claims.TenantID, "agent_id": &claims.AgentID, "email": &claims.Email, "enterprise_email": &claims.EnterpriseEmail, "employee_no": &claims.EmployeeNo}
+	for key, dest := range fields {
+		value, present := mc[key]
+		if !present {
+			continue
+		}
+		s, err := identityScalar(value, key != "email" && key != "enterprise_email")
+		if err != nil {
+			return nil, err
+		}
+		*dest = s
 	}
-	if claims.UserID == "" && claims.Email == "" {
-		return nil, fmt.Errorf("identity token rejected: neither user_id nor email is present")
+	if value, present := mc["department_ids"]; present {
+		items, ok := value.([]any)
+		if !ok {
+			return nil, errors.New("invalid identity field")
+		}
+		for _, item := range items {
+			s, err := identityScalar(item, true)
+			if err != nil {
+				return nil, err
+			}
+			claims.DepartmentIDs = append(claims.DepartmentIDs, s)
+		}
 	}
+	if (claims.UserID == "" && claims.Email == "") || claims.TenantID == "" || claims.AgentID == "" {
+		return nil, errors.New("identity token missing required identity or scope")
+	}
+	// Do not let numeric date parsing round an overflowing/fractional expiry.
+	exp, ok := mc["exp"].(json.Number)
+	if !ok || !integerLiteral.MatchString(string(exp)) {
+		return nil, errors.New("invalid identity expiry")
+	}
+	seconds, err := strconv.ParseInt(string(exp), 10, 64)
+	if err != nil || seconds <= time.Now().Unix() || seconds > 253402300799 {
+		return nil, errors.New("invalid identity expiry")
+	}
+	claims.ExpiresAt = time.Unix(seconds, 0)
 	return claims, nil
 }
 
-// claimString reads a claim as text, preserving full precision for the numeric
-// ids that arrive as json.Number.
-func claimString(mc jwt.MapClaims, key string) string {
-	switch v := mc[key].(type) {
-	case nil:
-		return ""
-	case string:
-		return strings.TrimSpace(v)
-	case json.Number:
-		return v.String()
-	case bool:
-		return fmt.Sprintf("%t", v)
-	case float64:
-		// Only reachable if the parser was built without WithJSONNumber; format
-		// without an exponent so the value stays recognisable.
-		return strconv.FormatFloat(v, 'f', -1, 64)
-	default:
-		return strings.TrimSpace(fmt.Sprintf("%v", v))
-	}
-}
+var integerLiteral = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
 
-func claimStrings(mc jwt.MapClaims, key string) []string {
-	raw, ok := mc[key].([]interface{})
-	if !ok {
-		return nil
-	}
-	out := make([]string, 0, len(raw))
-	for _, item := range raw {
-		switch v := item.(type) {
-		case string:
-			out = append(out, v)
-		case json.Number:
-			out = append(out, v.String())
-		default:
-			out = append(out, fmt.Sprintf("%v", v))
+func identityScalar(value any, numeric bool) (string, error) {
+	switch v := value.(type) {
+	case string:
+		return config.NormalizeIdentity(v)
+	case json.Number:
+		if numeric && integerLiteral.MatchString(string(v)) {
+			return string(v), nil
 		}
 	}
-	return out
+	return "", errors.New("invalid identity field")
+}
+
+// Reject duplicate decoded keys, invalid UTF-8 and unpaired Unicode escapes
+// before jwt's map decoder can silently replace or overwrite them.
+func strictJWTJSON(data []byte) bool {
+	if !utf8.Valid(data) {
+		return false
+	}
+	for i := 0; i < len(data); i++ {
+		if data[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(data) {
+			return false
+		}
+		if data[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(data) {
+			return false
+		}
+		n, err := strconv.ParseUint(string(data[i+1:i+5]), 16, 16)
+		if err != nil {
+			return false
+		}
+		i += 4
+		if n >= 0xdc00 && n <= 0xdfff {
+			return false
+		}
+		if n >= 0xd800 && n <= 0xdbff {
+			if i+6 >= len(data) || data[i+1] != '\\' || data[i+2] != 'u' {
+				return false
+			}
+			low, err := strconv.ParseUint(string(data[i+3:i+7]), 16, 16)
+			if err != nil || low < 0xdc00 || low > 0xdfff {
+				return false
+			}
+			i += 6
+		}
+	}
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.UseNumber()
+	var value func(int) bool
+	value = func(depth int) bool {
+		if depth > 64 {
+			return false
+		}
+		tok, err := d.Token()
+		if err != nil {
+			return false
+		}
+		delim, ok := tok.(json.Delim)
+		if !ok {
+			return true
+		}
+		switch delim {
+		case '{':
+			seen := map[string]bool{}
+			for d.More() {
+				key, err := d.Token()
+				if err != nil {
+					return false
+				}
+				s, ok := key.(string)
+				if !ok || seen[s] {
+					return false
+				}
+				seen[s] = true
+				if !value(depth + 1) {
+					return false
+				}
+			}
+			end, err := d.Token()
+			return err == nil && end == json.Delim('}')
+		case '[':
+			for d.More() {
+				if !value(depth + 1) {
+					return false
+				}
+			}
+			end, err := d.Token()
+			return err == nil && end == json.Delim(']')
+		default:
+			return false
+		}
+	}
+	if !value(0) {
+		return false
+	}
+	_, err := d.Token()
+	return err == io.EOF
 }
 
 type claimsCtxKey struct{}
 
-// WithClaims stores verified claims for the rest of the request.
+// WithClaims carries claim annotations only; it grants no authentication
+// authority. Use Authenticate and PrincipalFromContext for trusted identity.
 func WithClaims(ctx context.Context, c *Claims) context.Context {
 	return context.WithValue(ctx, claimsCtxKey{}, c)
 }
 
-// ClaimsFromContext returns the claims stored by WithClaims, or nil when the
-// request carried no verified identity.
+// ClaimsFromContext returns annotations stored by WithClaims, not proof of
+// authentication. Resolve never consumes them.
 func ClaimsFromContext(ctx context.Context) *Claims {
 	c, _ := ctx.Value(claimsCtxKey{}).(*Claims)
 	return c

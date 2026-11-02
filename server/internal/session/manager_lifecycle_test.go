@@ -2,10 +2,12 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,7 +54,7 @@ func newLifecycleManager(t *testing.T, handle managerRoundTripper, streamHandle 
 		AccessKeyID: "test-id", AccessKeySecret: "test-secret",
 	}, "test", dataagent.WithDataAgentEndpoint("manager.test.invalid"),
 		dataagent.WithDMSUnit("test"), dataagent.WithWorkspaceID("workspace"))
-	m := NewManager(client, t.TempDir())
+	m := testManager(t, client, t.TempDir())
 	t.Cleanup(func() {
 		for _, snap := range m.ListSessions() {
 			if err := m.StopSession(snap.SessionID); err != nil {
@@ -82,6 +84,116 @@ func managerAssertBlocked[T any](t *testing.T, ch <-chan T) {
 		t.Fatalf("operation completed before release: %v", value)
 	case <-time.After(30 * time.Millisecond):
 	}
+}
+
+func assertNoSessionOperations(t *testing.T, m *Manager) {
+	t.Helper()
+	m.operationsMu.Lock()
+	defer m.operationsMu.Unlock()
+	if len(m.operations) != 0 {
+		t.Fatalf("retained %d session operation locks", len(m.operations))
+	}
+}
+
+func waitSessionOperationRefs(t *testing.T, m *Manager, id string, refs int) *sessionOperation {
+	t.Helper()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for {
+		m.operationsMu.Lock()
+		operation := m.operations[id]
+		matched := operation != nil && operation.refs == refs
+		m.operationsMu.Unlock()
+		if matched {
+			return operation
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("session operation did not reach %d references", refs)
+		default:
+			runtime.Gosched()
+		}
+	}
+}
+
+func TestManagerNonexistentSessionIDsDoNotRetainOperationLocks(t *testing.T) {
+	m := testManager(t, nil, t.TempDir())
+	for i := range 1024 {
+		if err := m.StopSession(fmt.Sprintf("nonexistent-%d", i)); !errors.Is(err, ErrSessionUnavailable) {
+			t.Fatal(err)
+		}
+		assertNoSessionOperations(t, m)
+	}
+	if len(m.ListSessions()) != 0 {
+		t.Fatal("nonexistent stops created watchers")
+	}
+}
+
+func TestManagerSessionOperationRetainsQueuedWaiters(t *testing.T) {
+	m := testManager(t, nil, t.TempDir())
+	unlock := sync.OnceFunc(m.lockSessionOperation("s1"))
+	defer unlock()
+	original := waitSessionOperationRefs(t, m, "s1", 1)
+	acquired := make(chan struct{}, 2)
+	done := make(chan struct{}, 2)
+	startWaiter := func() func() {
+		release := make(chan struct{})
+		go func() {
+			unlock := m.lockSessionOperation("s1")
+			acquired <- struct{}{}
+			<-release
+			unlock()
+			done <- struct{}{}
+		}()
+		return sync.OnceFunc(func() { close(release) })
+	}
+	finishSecond := startWaiter()
+	defer finishSecond()
+	if waitSessionOperationRefs(t, m, "s1", 2) != original {
+		t.Fatal("waiter did not pin the holder's lock")
+	}
+	managerAssertBlocked(t, acquired)
+	unlock()
+	managerReceive(t, acquired)
+	if waitSessionOperationRefs(t, m, "s1", 1) != original {
+		t.Fatal("holder release discarded the waiter's lock")
+	}
+	finishThird := startWaiter()
+	defer finishThird()
+	if waitSessionOperationRefs(t, m, "s1", 2) != original {
+		t.Fatal("new arrival bypassed an existing waiter")
+	}
+	managerAssertBlocked(t, acquired)
+	finishSecond()
+	managerReceive(t, done)
+	managerReceive(t, acquired)
+	if waitSessionOperationRefs(t, m, "s1", 1) != original {
+		t.Fatal("lock changed while an operation still held it")
+	}
+	finishThird()
+	managerReceive(t, done)
+	assertNoSessionOperations(t, m)
+}
+
+func TestManagerSessionOperationConcurrentReacquisition(t *testing.T) {
+	m := testManager(t, nil, t.TempDir())
+	var active atomic.Int32
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() {
+			for range 128 {
+				unlock := m.lockSessionOperation("s1")
+				if active.Add(1) != 1 {
+					t.Error("same-ID operations overlapped")
+				}
+				runtime.Gosched()
+				active.Add(-1)
+				unlock()
+			}
+		})
+	}
+	wg.Wait()
+	assertNoSessionOperations(t, m)
 }
 
 func TestManagerRequestIDsStayWithToolCallsAndWatcherOutlivesCreate(t *testing.T) {
@@ -178,7 +290,7 @@ func TestManagerConcurrentReviveRequestIDsAreIsolated(t *testing.T) {
 	results := make(chan error, 2)
 	for i, sessionID := range []string{"s1", "s2"} {
 		state := &State{SessionID: sessionID, AgentID: "a1", Status: StatusCompleted}
-		if err := state.Persist(m.sessDir); err != nil {
+		if err := state.persist(m.store); err != nil {
 			t.Fatal(err)
 		}
 		ctx, ids := dataagent.WithRequestIDs(context.Background())
@@ -228,7 +340,7 @@ func TestManagerConcurrentTerminalRevivesDoNotShareFailedEntry(t *testing.T) {
 	})
 	defer unblock()
 	state := &State{SessionID: "s1", AgentID: "old-agent", Status: StatusCompleted}
-	state.Persist(m.sessDir)
+	state.persist(m.store)
 	// Legacy/test entries with no Run have nil done and must not block.
 	m.watchers["s1"] = &watcherEntry{state: state, cancel: func() {}}
 
@@ -272,7 +384,7 @@ func TestManagerConcurrentTerminalRevivesDoNotShareFailedEntry(t *testing.T) {
 // watcher's final state writes before Run returns.
 type managerFinishingClient struct {
 	state    *State
-	dir      string
+	store    *sessionStore
 	started  chan struct{}
 	canceled chan struct{}
 	release  chan struct{}
@@ -285,7 +397,7 @@ func (c *managerFinishingClient) StreamSSE(ctx context.Context, _, _ string, _ i
 	<-c.release
 	c.state.SetCheckpoint(42)
 	c.state.AddConclusion("final persisted conclusion")
-	c.state.Persist(c.dir)
+	c.state.persist(c.store)
 	return nil, ctx.Err()
 }
 
@@ -300,25 +412,37 @@ func TestManagerReviveWaitsForCancellationAndCompletionBeforeReload(t *testing.T
 		return managerResponse(http.StatusOK, `{}`)
 	})
 	state := &State{SessionID: "s1", AgentID: "a1", Status: StatusCompleted, Checkpoint: 1}
-	state.Persist(m.sessDir)
+	state.persist(m.store)
 	finishing := &managerFinishingClient{
-		state: state, dir: m.sessDir, started: make(chan struct{}),
+		state: state, store: m.store, started: make(chan struct{}),
 		canceled: make(chan struct{}), release: make(chan struct{}),
 	}
 	var releaseOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(finishing.release) }) }
 	defer unblock()
-	watcher := NewWatcher(state, m.client, m.sessDir)
+	watcher := newWatcher(state, m.client, m.store)
 	watcher.client = finishing
-	operation := m.sessionOperation("s1")
-	operation.Lock()
+	unlock := m.lockSessionOperation("s1")
 	m.startWatcher(watcher)
-	operation.Unlock()
+	unlock()
 	managerReceive(t, finishing.started)
 
 	result := make(chan error, 1)
 	go func() { result <- m.SendMessage(context.Background(), "s1", "follow-up") }()
 	managerReceive(t, finishing.canceled)
+	operation := waitSessionOperationRefs(t, m, "s1", 1)
+	watched := make(chan *StateSnapshot, 1)
+	go func() {
+		snap, err := m.WatchSession(context.Background(), WatchOpts{SessionID: "s1"})
+		if err != nil {
+			t.Errorf("watch during replacement: %v", err)
+		}
+		watched <- snap
+	}()
+	if waitSessionOperationRefs(t, m, "s1", 2) != operation {
+		t.Fatal("watcher replacement split the session lock")
+	}
+	managerAssertBlocked(t, watched)
 	managerAssertBlocked(t, result)
 	select {
 	case id := <-sent:
@@ -328,7 +452,7 @@ func TestManagerReviveWaitsForCancellationAndCompletionBeforeReload(t *testing.T
 
 	// Waiting for s1 must hold neither m.mu nor an operation lock for s2.
 	other := &State{SessionID: "s2", AgentID: "a2", Status: StatusCompleted}
-	other.Persist(m.sessDir)
+	other.persist(m.store)
 	otherResult := make(chan error, 1)
 	go func() { otherResult <- m.SendMessage(context.Background(), "s2", "independent") }()
 	if err := managerReceive(t, otherResult); err != nil {
@@ -346,6 +470,16 @@ func TestManagerReviveWaitsForCancellationAndCompletionBeforeReload(t *testing.T
 	if err != nil || snap.Checkpoint != 42 || len(snap.Conclusions) != 1 || snap.Conclusions[0] != "final persisted conclusion" {
 		t.Fatalf("revive did not reload final state: %+v, %v", snap, err)
 	}
+	if observed := managerReceive(t, watched); observed == nil || observed.Status != StatusRunning || observed.Checkpoint != 42 {
+		t.Fatalf("queued watch did not observe replacement: %+v", observed)
+	}
+	m.mu.RLock()
+	replacement := m.watchers["s1"]
+	m.mu.RUnlock()
+	if replacement == nil || replacement.watcher == watcher {
+		t.Fatal("old watcher was not replaced")
+	}
+	assertNoSessionOperations(t, m)
 }
 
 func TestManagerRevivesWatcherThatExitedBeforeSendLock(t *testing.T) {
@@ -355,7 +489,7 @@ func TestManagerRevivesWatcherThatExitedBeforeSendLock(t *testing.T) {
 		return managerResponse(http.StatusOK, `{}`)
 	})
 	persisted := &State{SessionID: "s1", AgentID: "a1", Status: StatusCompleted}
-	if err := persisted.Persist(m.sessDir); err != nil {
+	if err := persisted.persist(m.store); err != nil {
 		t.Fatal(err)
 	}
 	state := &State{SessionID: "s1", AgentID: "a1", Status: StatusRunning}
@@ -376,7 +510,7 @@ func TestManagerFailedReviveRetainsPersistedWaitingState(t *testing.T) {
 		SessionID: "s1", AgentID: "a1", Status: StatusWaitingInput,
 		WaitingFor: "ask_human", WaitingDetail: "Choose a date range", Checkpoint: 9,
 	}
-	state.Persist(m.sessDir)
+	state.persist(m.store)
 	if err := m.SendMessage(context.Background(), "s1", "last month"); err == nil {
 		t.Fatal("send should fail")
 	}
@@ -411,7 +545,7 @@ func TestManagerWatchSessionSerializesWithRevive(t *testing.T) {
 			})
 			defer unblock()
 			state := &State{SessionID: "s1", AgentID: "a1", Status: StatusCompleted}
-			state.Persist(m.sessDir)
+			state.persist(m.store)
 			sendResult := make(chan error, 1)
 			go func() { sendResult <- m.SendMessage(context.Background(), "s1", "follow-up") }()
 			managerReceive(t, entered)
@@ -452,7 +586,7 @@ func TestManagerWatchAndRestorePreservePendingWaitingOnIdle(t *testing.T) {
 				SessionID: "s1", AgentID: "a1", Status: StatusWaitingInput,
 				WaitingFor: "ask_human", WaitingDetail: "Choose a date range", Checkpoint: 9,
 			}
-			state.Persist(m.sessDir)
+			state.persist(m.store)
 			if restore {
 				m.RestoreSessions(context.Background())
 			} else if _, err := m.WatchSession(context.Background(), WatchOpts{SessionID: "s1"}); err != nil {
@@ -481,7 +615,7 @@ func TestManagerRestoresInFlightFollowUpFromTerminalSnapshot(t *testing.T) {
 				return managerResponse(http.StatusOK, `{"Data":{"AgentId":"a1","SessionStatus":"RUNNING"}}`)
 			})
 			state := &State{SessionID: "s1", AgentID: "a1", Status: StatusCompleted, MessageStatus: SendSending, AwaitingTurn: true}
-			if err := state.Persist(m.sessDir); err != nil {
+			if err := state.persist(m.store); err != nil {
 				t.Fatal(err)
 			}
 			if restore {
@@ -504,7 +638,7 @@ func TestManagerSendOnPersistedSendingRestartsObservationWithoutSending(t *testi
 		return managerResponse(http.StatusOK, `{}`)
 	})
 	state := &State{SessionID: "s1", AgentID: "a1", Status: StatusCompleted, MessageStatus: SendSending, AwaitingTurn: true}
-	if err := state.Persist(m.sessDir); err != nil {
+	if err := state.persist(m.store); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.SendMessage(context.Background(), "s1", "follow-up"); err == nil {
@@ -525,7 +659,7 @@ func TestManagerReconciliationPreservesIdleAndConcurrentProgress(t *testing.T) {
 				}
 				return managerResponse(http.StatusOK, fmt.Sprintf(`{"Data":{"SessionStatus":%q}}`, serverStatus))
 			})
-			entry := &watcherEntry{state: state, watcher: NewWatcher(state, m.client, m.sessDir), cancel: func() {}}
+			entry := &watcherEntry{state: state, watcher: newWatcher(state, m.client, m.store), cancel: func() {}}
 			m.watchers["s1"] = entry
 			m.reconcileWithServer("s1", entry)
 			if state.GetStatus() != StatusWaitingInput || state.GetWaitingFor() != "ask_human" {
@@ -551,7 +685,7 @@ func TestManagerReconciliationPreservesReportTransition(t *testing.T) {
 					return managerResponse(http.StatusOK, fmt.Sprintf(`{"Data":{"SessionStatus":%q}}`, serverStatus))
 				})
 				canceled := false
-				entry := &watcherEntry{state: state, watcher: NewWatcher(state, m.client, m.sessDir), cancel: func() { canceled = true }}
+				entry := &watcherEntry{state: state, watcher: newWatcher(state, m.client, m.store), cancel: func() { canceled = true }}
 				m.watchers["s1"] = entry
 				m.reconcileWithServer("s1", entry)
 				after := state.Snapshot()
@@ -564,11 +698,12 @@ func TestManagerReconciliationPreservesReportTransition(t *testing.T) {
 }
 
 func TestManagerHousekeepingDoesNotRemoveRevivedSession(t *testing.T) {
-	m := NewManager(nil, t.TempDir())
+	m := testManager(t, nil, t.TempDir())
 	state := &State{SessionID: "s1", Status: StatusRunning, UpdatedAt: time.Now()}
-	m.watchers["s1"] = &watcherEntry{state: state, cancel: func() { t.Error("canceled revived watcher") }}
+	canceled := false
+	m.watchers["s1"] = &watcherEntry{state: state, cancel: func() { canceled = true }}
 	m.removeEntry("s1")
-	if len(m.ListSessions()) != 1 {
+	if canceled || len(m.ListSessions()) != 1 {
 		t.Fatal("stale housekeeping decision removed a revived session")
 	}
 }
@@ -576,14 +711,14 @@ func TestManagerHousekeepingDoesNotRemoveRevivedSession(t *testing.T) {
 func TestManagerRemovalWaitsWithoutHoldingMapLock(t *testing.T) {
 	for _, stop := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stop=%t", stop), func(t *testing.T) {
-			m := NewManager(nil, t.TempDir())
+			m := testManager(t, nil, t.TempDir())
 			state := &State{SessionID: "s1", Status: StatusCompleted, UpdatedAt: time.Now().Add(-2 * staleTimeout)}
 			canceled, done := make(chan struct{}), make(chan struct{})
 			var once sync.Once
 			finish := func() { once.Do(func() { close(done) }) }
 			defer finish()
 			m.watchers["s1"] = &watcherEntry{
-				state: state, watcher: NewWatcher(state, nil, m.sessDir),
+				state: state, watcher: newWatcher(state, nil, m.store),
 				cancel: func() { close(canceled) }, done: done,
 			}
 			removed := make(chan error, 1)
