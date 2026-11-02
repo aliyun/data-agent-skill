@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Music-Retail Monthly Sales Report</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Helvetica Neue", "Segoe UI", Arial, sans-serif;
+    background: #f4f6f9; color: #2c3345; line-height: 1.6; padding: 24px 16px 48px;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  .card { background: #fff; border-radius: 10px; padding: 20px 24px; box-shadow: 0 1px 3px rgba(44,51,69,.08); margin-bottom: 16px; }
+  .report-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .report-head h1 { font-size: 22px; }
+  .month-badge { background: #eef2ff; color: #4356c4; border-radius: 6px; padding: 2px 10px; font-size: 13px; font-weight: 600; }
+  .gen-time { color: #8a93a6; font-size: 12px; margin-left: auto; }
+  .headline { margin-top: 10px; font-size: 15px; color: #3d4557; }
+  .kpi-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
+  .kpi { flex: 1 1 150px; background: #fafbfd; border: 1px solid #eceff5; border-radius: 8px; padding: 12px 14px; }
+  .kpi .label { font-size: 12px; color: #8a93a6; }
+  .kpi .value { font-size: 22px; font-weight: 700; margin-top: 2px; }
+  .kpi .sub { font-size: 12px; color: #8a93a6; }
+  .kpi .value.good { color: #1f8a5d; }
+  .kpi .value.bad { color: #c2453a; }
+  .hl-list { margin-top: 6px; padding-left: 18px; }
+  .hl-list li { margin: 4px 0; font-size: 14px; }
+  h2 { font-size: 16px; margin-bottom: 12px; color: #2c3345; }
+  .bar-row { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
+  .bar-name { flex: 0 0 180px; font-size: 13px; text-align: right; color: #4a5266; }
+  .bar-track { flex: 1; background: #eef0f5; border-radius: 5px; height: 22px; position: relative; }
+  .bar-fill { height: 100%; border-radius: 5px; background: #4356c4; min-width: 2px; }
+  .bar-val { flex: 0 0 260px; font-size: 12px; color: #4a5266; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 7px 10px; text-align: left; border-bottom: 1px solid #eceff5; white-space: nowrap; }
+  th { background: #fafbfd; color: #5a6377; font-weight: 600; }
+  .ach-cell { min-width: 180px; }
+  .ach-bar { display: inline-block; vertical-align: middle; width: 90px; height: 8px; background: #eef0f5; border-radius: 4px; margin-right: 8px; overflow: hidden; }
+  .ach-fill { height: 100%; background: #4356c4; }
+  .badge { display: inline-block; border-radius: 4px; padding: 1px 8px; font-size: 12px; font-weight: 600; }
+  .badge.pass { background: #e5f4ec; color: #1f8a5d; }
+  .badge.fail { background: #fbe9e7; color: #c2453a; }
+  .badge.na { background: #eef0f5; color: #8a93a6; }
+  .placeholder { background: #fafbfd; border: 1px dashed #cdd4e0; border-radius: 8px; padding: 18px; text-align: center; color: #8a93a6; font-size: 14px; }
+  .footnote { text-align: center; color: #a6adbd; font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="report-head">
+      <h1>Music-Retail Monthly Sales Report</h1>
+      <span class="month-badge" id="month-badge">--</span>
+      <span class="gen-time">Generated at: {{current_time}}</span>
+    </div>
+    <p class="headline" id="headline">--</p>
+    <div class="kpi-row" id="kpi-row"></div>
+    <div id="kpi-fallback" style="display:none"><div class="placeholder">Data temporarily unavailable</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Monthly Highlights</h2>
+    <ul class="hl-list" id="hl-list"></ul>
+    <div id="hl-fallback" style="display:none"><div class="placeholder">Data temporarily unavailable</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Channel Sales Distribution</h2>
+    <div id="channel-bars"></div>
+    <div id="channel-fallback" style="display:none"><div class="placeholder">Data temporarily unavailable</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Key-Track Target Diagnosis (achievement rate ascending)</h2>
+    <div id="track-table-wrap"></div>
+    <div id="track-fallback" style="display:none"><div class="placeholder">Data temporarily unavailable</div></div>
+    <p class="footnote">Detail data direct-read from track_achievement_detail.csv (target table's full track set for the month, achievement rate ascending)</p>
+  </div>
+</div>
+
+<script>
+window.__RT_DATA__ = __REPORT_DATA__;
+</script>
+<script>
+(function () {
+  "use strict";
+  var D = window.__RT_DATA__ || {};
+
+  function fmtInt(n) { return Number(n).toLocaleString("en-US"); }
+  function pct(v) { return (Number(v) * 100).toFixed(2) + "%"; }
+  function setBadge(v) {
+    var b = document.createElement("span");
+    if (v === "Met") { b.className = "badge pass"; }
+    else if (v === "Missed") { b.className = "badge fail"; }
+    else { b.className = "badge na"; }
+    b.textContent = v;
+    return b;
+  }
+  function showFallback(id) {
+    var fb = document.getElementById(id);
+    if (fb) { fb.style.display = "block"; }
+  }
+
+  function renderHeader() {
+    var badge = document.getElementById("month-badge");
+    if (D.report_month) { badge.textContent = D.report_month; }
+    var h = document.getElementById("headline");
+    if (D.headline) { h.textContent = D.headline; }
+  }
+
+  function renderKpis() {
+    var row = document.getElementById("kpi-row");
+    var rows = Array.isArray(D.track_rows) ? D.track_rows : [];
+    if (!rows.length) {
+      row.innerHTML = "";
+      showFallback("kpi-fallback");
+      return;
+    }
+    var totalSales = 0, totalTarget = 0, failCount = 0;
+    rows.forEach(function (r) {
+      totalSales += Number(r.sales_qty) || 0;
+      totalTarget += Number(r.target_qty) || 0;
+      if (r.verdict === "Missed") { failCount += 1; }
+    });
+    var overall = totalTarget > 0 ? totalSales / totalTarget : null;
+    var cells = [
+      { label: "Monthly Total Sales (copies)", value: fmtInt(totalSales), sub: "sum over the full track set", cls: "" },
+      { label: "Monthly Total Target (copies)", value: fmtInt(totalTarget), sub: "target table monthly sum", cls: "" },
+      { label: "Overall Achievement Rate", value: overall === null ? "—" : pct(overall), sub: "total sales ÷ total target", cls: overall !== null && overall >= 1 ? "good" : (overall !== null ? "bad" : "") },
+      { label: "Unmet Tracks", value: String(failCount), sub: "of " + rows.length + " tracks under verdict", cls: failCount > 0 ? "bad" : "good" }
+    ];
+    cells.forEach(function (c) {
+      var box = document.createElement("div");
+      box.className = "kpi";
+      var l = document.createElement("div"); l.className = "label"; l.textContent = c.label;
+      var v = document.createElement("div"); v.className = "value" + (c.cls ? " " + c.cls : ""); v.textContent = c.value;
+      var s = document.createElement("div"); s.className = "sub"; s.textContent = c.sub;
+      box.appendChild(l); box.appendChild(v); box.appendChild(s);
+      row.appendChild(box);
+    });
+  }
+
+  function renderHighlights() {
+    var list = document.getElementById("hl-list");
+    var items = Array.isArray(D.highlights) ? D.highlights : [];
+    if (!items.length) { showFallback("hl-fallback"); return; }
+    items.forEach(function (it) {
+      var li = document.createElement("li");
+      li.textContent = it && it.text ? it.text : "";
+      list.appendChild(li);
+    });
+  }
+
+  function renderChannels() {
+    var box = document.getElementById("channel-bars");
+    var rows = Array.isArray(D.channel_rows) ? D.channel_rows : [];
+    if (!rows.length) { showFallback("channel-fallback"); return; }
+    var maxQty = 0;
+    rows.forEach(function (r) { maxQty = Math.max(maxQty, Number(r.sales_qty) || 0); });
+    rows.forEach(function (r) {
+      var qty = Number(r.sales_qty) || 0;
+      var rowEl = document.createElement("div"); rowEl.className = "bar-row";
+      var name = document.createElement("div"); name.className = "bar-name"; name.textContent = r.channel;
+      var track = document.createElement("div"); track.className = "bar-track";
+      var fill = document.createElement("div"); fill.className = "bar-fill";
+      fill.style.width = maxQty > 0 ? (qty / maxQty * 100).toFixed(1) + "%" : "0%";
+      track.appendChild(fill);
+      var val = document.createElement("div"); val.className = "bar-val";
+      val.textContent = fmtInt(qty) + " copies · revenue " + fmtInt(r.sales_amount) + " CNY · share " + pct(r.share_pct);
+      rowEl.appendChild(name); rowEl.appendChild(track); rowEl.appendChild(val);
+      box.appendChild(rowEl);
+    });
+  }
+
+  function renderTracks() {
+    var wrap = document.getElementById("track-table-wrap");
+    var rows = Array.isArray(D.track_rows) ? D.track_rows : [];
+    if (!rows.length) { showFallback("track-fallback"); return; }
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    thead.innerHTML = "<tr><th>Track ID</th><th>Track Name</th><th>Monthly Sales</th><th>Monthly Target</th><th class=\"ach-cell\">Achievement Rate</th><th>Verdict</th></tr>";
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    rows.forEach(function (r) {
+      var tr = document.createElement("tr");
+      function td(text) { var c = document.createElement("td"); c.textContent = text; return c; }
+      tr.appendChild(td(r.track_id));
+      tr.appendChild(td(r.track_name));
+      tr.appendChild(td(fmtInt(r.sales_qty)));
+      tr.appendChild(td(fmtInt(r.target_qty)));
+      var achCell = document.createElement("td"); achCell.className = "ach-cell";
+      if (typeof r.achievement === "number" && isFinite(r.achievement)) {
+        var bar = document.createElement("span"); bar.className = "ach-bar";
+        var fill = document.createElement("span"); fill.className = "ach-fill";
+        fill.style.width = Math.min(Math.max(r.achievement / 1.2, 0), 1) * 100 + "%";
+        bar.appendChild(fill);
+        achCell.appendChild(bar);
+        achCell.appendChild(document.createTextNode(pct(r.achievement)));
+      } else {
+        achCell.textContent = "—";
+      }
+      tr.appendChild(achCell);
+      var vCell = document.createElement("td");
+      vCell.appendChild(setBadge(r.verdict));
+      tr.appendChild(vCell);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+  }
+
+  function safeRender(fn, fallbackId) {
+    try { fn(); } catch (e) { showFallback(fallbackId); }
+  }
+
+  window.addEventListener("load", function () {
+    safeRender(renderHeader, "kpi-fallback");
+    safeRender(renderKpis, "kpi-fallback");
+    safeRender(renderHighlights, "hl-fallback");
+    safeRender(renderChannels, "channel-fallback");
+    safeRender(renderTracks, "track-fallback");
+  });
+})();
+</script>
+</body>
+</html>

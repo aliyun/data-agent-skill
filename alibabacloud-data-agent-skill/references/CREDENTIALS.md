@@ -91,7 +91,7 @@ When both selector variables are left unset (`default`), a file offering exactly
 | API_KEY | `dataagent-<region>.aliyuncs.com/apikey` (control plane) / `dataagent-stream-<region>.aliyuncs.com/apikey` (data plane) |
 | Credentials file (AK/SK) or default chain | `dms.<region>.aliyuncs.com` |
 
-`DATA_AGENT_ENDPOINT` overrides the derived value in all modes.
+`DATA_AGENT_ENDPOINT` overrides the derived control-plane value in all modes; `DATA_AGENT_STREAM_ENDPOINT` overrides the API_KEY data-plane (stream) value. Point both at the non-public gateway hosts when targeting such deployments (e.g. pre-release `pre-dataagent.aliyuncs.com/apikey` / `pre-dataagent-stream.aliyuncs.com/apikey`).
 
 ## Verifying which mode is active
 

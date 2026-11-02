@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 from cli.streaming import _stream_response, StreamState, _print_event
 from cli.cmd_db import _db_attach
@@ -26,6 +27,41 @@ from data_agent import (
     FileManager,
     SSEClient,
 )
+
+
+def _post_query_state(client, sse_client, file_manager, session, output_mode) -> tuple[bool, Optional[str]]:
+    """Re-derive the worker result flags from the live server state.
+
+    In attach mode the stream suppresses need_user_confirm for plan /
+    report-render asks, and the reply stream can end while steps are still
+    executing — the server status is the honest source for the final result.
+    A still-running session is monitored to its next settle point first.
+
+    Returns (waiting_input, task_failed_message).
+    """
+    status = client.describe_session(
+        agent_id=session.agent_id, session_id=session.session_id
+    ).status.value
+    if status == "WAIT_INPUT":
+        return True, None
+    if status == "RUNNING":
+        print(f"\n[Worker] Session still running, continuing to monitor...", flush=True)
+        task_failed = _db_attach(
+            sse_client, file_manager, session,
+            from_start=False, checkpoint=None, output_mode=output_mode,
+        )
+        if task_failed:
+            return False, task_failed
+        status = client.describe_session(
+            agent_id=session.agent_id, session_id=session.session_id
+        ).status.value
+        if status == "WAIT_INPUT":
+            return True, None
+        if status in ("FAILED", "ERROR"):
+            return False, f"session status: {status}"
+    elif status in ("FAILED", "ERROR"):
+        return False, f"session status: {status}"
+    return False, None
 
 
 def cmd_attach(args: argparse.Namespace) -> None:
@@ -76,49 +112,61 @@ def cmd_attach(args: argparse.Namespace) -> None:
 
             if query:
                 print(f"\n> User Query: {query}\n", flush=True)
-                got_content, need_confirm, output_text = _stream_response(
+                got_content, need_confirm, task_failed, output_text = _stream_response(
                     message_handler, session, query,
                     output_mode=output_mode, output_dir=session_dir,
                     process_log_handler=None,  # In worker process, no process log handler needed for this path
                     is_attach=True  # Indicate this is an attach operation
                 )
 
-                # Check if the query was for confirmation and if there are more steps to process
-                is_confirmation_query = query.strip() in ["确认执行", "confirm", "execute", "同意后续所有SQL执行"]
-
-                # If the query was a confirmation, there might be more steps to execute
-                if is_confirmation_query:
-                    # After confirmation, the process has handled the confirmation
-                    # The subsequent steps will be tracked by the server and can be viewed
-                    # by attaching to the session again
-                    print(f"\n[Worker] Confirmation processed. Subsequent steps will continue in the background.", flush=True)
+                # Attach mode suppresses need_user_confirm for plan /
+                # report-render asks, so a session waiting for the next
+                # confirmation would otherwise be reported as completed.
+                # Re-derive the flags from the live server state; a
+                # still-running session (e.g. steps continuing after a
+                # confirmation) is monitored to its next settle point.
+                if not task_failed:
+                    try:
+                        waiting, failure = _post_query_state(
+                            client, sse_client, file_manager, session, output_mode
+                        )
+                        need_confirm = need_confirm or waiting
+                        task_failed = task_failed or failure
+                    except Exception as e:
+                        print(f"[Worker] Post-query status check failed: {e}", flush=True)
 
                 # Determine final status
-                final_status = "waiting_input" if need_confirm else "completed"
+                if task_failed:
+                    final_status = "failed"
+                elif need_confirm:
+                    final_status = "waiting_input"
+                else:
+                    final_status = "completed"
+
+                result_payload = {
+                    "status": final_status,
+                    "session_id": session.session_id,
+                }
+                if task_failed:
+                    result_payload["error"] = task_failed
 
                 with open(session_dir / "status.txt", "w", encoding="utf-8") as f:
                     f.write(final_status)
                 with open(session_dir / "result.json", "w", encoding="utf-8") as f:
-                    json.dump({
-                        "status": final_status,
-                        "session_id": session.session_id,
-                    }, f, ensure_ascii=False, indent=2)
+                    json.dump(result_payload, f, ensure_ascii=False, indent=2)
 
-                return got_content, need_confirm
+                return got_content, need_confirm, task_failed
             else:
                 # For attach without query, just monitor or replay
                 from_start = getattr(args, "from_start", False)
                 checkpoint = getattr(args, "checkpoint", None)
 
-                # In worker process, we need to initialize components locally
-                _config = DataAgentConfig.from_env()
-                _client = DataAgentClient(_config)
-                _sse_client = SSEClient(_config)
-                _file_manager = FileManager(_client)
+                task_failed = _db_attach(
+                    sse_client, file_manager, session,
+                    from_start=from_start, checkpoint=checkpoint, output_mode=output_mode,
+                )
 
-                _db_attach(_sse_client, _file_manager, session, from_start=from_start, checkpoint=checkpoint, output_mode=output_mode)
-
-                return True, False  # got_content=True, need_confirm=False
+                return True, False, task_failed  # got_content=True, need_confirm=False
 
         # Since the attach worker has complex setup logic that differs significantly from the other commands,
         # we'll just call the run_worker_with_handler without a data_source
@@ -249,22 +297,25 @@ def cmd_attach(args: argparse.Namespace) -> None:
                 log_handler.write_both(query_log)
 
                 try:
-                    got_content, need_confirm, _ = _stream_response(
+                    got_content, need_confirm, task_failed, _ = _stream_response(
                         message_handler, session, query,
                         output_mode=output_mode, output_dir=session_dir,
                         process_log_handler=log_handler,  # Pass the process log handler
-                    is_attach=True  # Indicate this is an attach operation
+                        is_attach=True  # Indicate this is an attach operation
                     )
 
                     # Check if the query was for confirmation and if there are more steps to process
                     is_confirmation_query = query.strip() in ["确认执行", "confirm", "execute", "同意后续所有SQL执行"]
 
                     # Log the response completion
-                    response_log = f"Query processed, got_content: {got_content}, need_confirm: {need_confirm}, is_confirmation: {is_confirmation_query}\n"
+                    response_log = f"Query processed, got_content: {got_content}, need_confirm: {need_confirm}, task_failed: {task_failed}, is_confirmation: {is_confirmation_query}\n"
                     log_handler.write_both(response_log)
 
                     if not got_content:
                         print("(No response received, please retry)")
+                    elif task_failed:
+                        # The ❌ failure notice was already printed by the stream handler
+                        sys.exit(1)
                     elif need_confirm:
                         print("\n⚠️  Agent has created an execution plan. User confirmation required.")
                         print(f"   To continue: python3 scripts/data_agent_cli.py attach --session-id {session.session_id} -q 'your input'")
@@ -283,7 +334,9 @@ def cmd_attach(args: argparse.Namespace) -> None:
                             print(f"\nContinuing to monitor session progress...")
 
                             # Use already imported _db_attach and initialized clients
-                            _db_attach(sse_client, file_manager, updated_session, from_start=False, checkpoint=None, output_mode=output_mode)
+                            monitor_failed = _db_attach(sse_client, file_manager, updated_session, from_start=False, checkpoint=None, output_mode=output_mode)
+                            if monitor_failed:
+                                sys.exit(1)
                     else:
                         try:
                             updated_session = client.describe_session(agent_id=session.agent_id, session_id=session.session_id)

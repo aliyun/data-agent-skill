@@ -1,0 +1,27 @@
+metric_id: METRIC-003
+metric_name: 销量环比增长率
+type: 衍生
+format: 百分比
+definition: 本月销量相对上月销量的增长率；(本月 − 上月) ÷ 上月，> 0 即增长
+when_to_use: |
+  - 月度趋势判断：报告月销量较上月是升是降、幅度多少
+  - 支持按渠道 / 曲目粒度套用同一公式
+  - 不适用：跨多月累计口径的复合增长率
+numerator: {metric: METRIC-001, period: 本月}
+denominator: {metric: METRIC-001, period: 上月}
+derived_formula: (本月 [METRIC-001] − 上月 [METRIC-001]) ÷ 上月 [METRIC-001]；上月 = 报告月的前一自然月（如报告月 202512 → 上月 202511）
+exceptions:
+  - 上月销量为 0 或 NULL → 结果记 "—"，不参与排名（避免除零与失真基数）
+  - 上月该维度无任何记录（如新上架渠道 / 曲目）→ 结果记 "—"，结论注明"无环比基数"
+  - 本月为 NULL（未开票）→ 沿用 [METRIC-001] 口径按 0 处理
+notes: 率类非可加——禁止对多个月份的环比增长率求平均得到"平均环比"；跨期汇总请回到 [METRIC-001] 原始值重算
+authority: 真理
+sql_template: |
+  SELECT
+    (cur.qty - prev.qty) / NULLIF(prev.qty, 0) AS 销量环比增长率
+  FROM
+    (SELECT SUM(sales_qty) AS qty FROM track_sales_month WHERE biz_month = '{月份}') cur,
+    (SELECT SUM(sales_qty) AS qty FROM track_sales_month WHERE biz_month = '{上月}') prev
+parameters:
+  - {name: 月份, example: "202512"}
+  - {name: 上月, example: "202511", description: "报告月前一自然月，由执行者从月份推导后传入"}

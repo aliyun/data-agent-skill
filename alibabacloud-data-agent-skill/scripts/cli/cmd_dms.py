@@ -13,7 +13,11 @@ from data_agent import DataAgentConfig, DmsMcpTools
 def cmd_dms(args: argparse.Namespace) -> None:
     """Handle dms subcommand for DMS tools."""
     config = DataAgentConfig.from_env()
-    mcp_tools = DmsMcpTools(config)
+    try:
+        mcp_tools = DmsMcpTools(config)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     tool = getattr(args, "tool", None)
 

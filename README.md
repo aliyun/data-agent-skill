@@ -4,9 +4,11 @@ AI Agent Skills that let AI assistants (Claude Code, Qoder, Codex, and other age
 
 Ask questions like *"Which department has the highest average salary?"* or *"Analyze the sales trend of the last quarter and generate a report"*, and the agent handles requirement analysis, data understanding, SQL execution, insight generation, and report rendering.
 
-## Two Independent Skills
+Besides invoking the service, the repository also ships **data-agent-arcvis-skill** — a meta-skill that teaches an AI agent how to author its own skill packages for Data Agent (see [Authoring Skill Packages](#authoring-skill-packages--data-agent-arcvis-skill)).
 
-This repository contains **two standalone skills** for the same backend service. Choose the one that fits your agent runtime — they are independent and must not be mixed on the same session.
+## Invocation Skills: CLI vs MCP
+
+Two standalone skills provide access to the same backend service. Choose the one that fits your agent runtime — they are independent and must not be mixed on the same session.
 
 | | [alibabacloud-data-agent-skill](alibabacloud-data-agent-skill/SKILL.md) (CLI) | [alibabacloud-data-agent-mcp-skill](alibabacloud-data-agent-mcp-skill/SKILL.md) (MCP Server) |
 |---|---|---|
@@ -26,7 +28,7 @@ This repository contains **two standalone skills** for the same backend service.
 - **Session reuse** — multi-turn conversations with full context preservation
 - **Workspaces & custom agents** — team collaboration spaces and user-defined specialized agents
 
-## Prerequisites (Both Skills)
+## Prerequisites (Both Invocation Skills)
 
 1. An Alibaba Cloud account with data sources managed in [DMS](https://dms.aliyun.com/) (or use the built-in demo database `internal_data_employees`).
 2. **MCP Server:** AK/STS via the credentials-go default chain (SDK-supported environment credentials or instance/workload-role provider). Providers are retained for dynamic credential retrieval and RAM AssumeRole source chaining; static STS environment values do not self-renew. The server does not hand-read `~/.aliyun/config.json` or promise CLI-profile compatibility. API Key runtime mode is removed across the Go Server, including SSE. Old YAML keys or nonempty old environment variables cause a sanitized migration error even when the gateway is disabled; see [migration instructions](server/README.md#api-key-migration-all-go-server-deployments). Inbound identity tokens/JWT, dacli `--token`, STS and OSS signatures remain supported.
@@ -101,6 +103,21 @@ Full documentation: [alibabacloud-data-agent-mcp-skill/README.md](alibabacloud-d
 
 > **Note**: server binaries are not committed to this repository. Build the server once (`cd server && make build`) or point `DATA_AGENT_SERVER_BIN` at a deployed binary — `scripts/select-binary.sh` locates it (see the MCP skill's INSTALLATION.md).
 
+## Authoring Skill Packages — data-agent-arcvis-skill
+
+[data-agent-arcvis-skill](data-agent-arcvis-skill/SKILL.md) (English, with Chinese counterparts `SKILL_zh.md` / `references/*_zh.md`) is a **meta-skill** that teaches an AI agent how to author skill packages Data Agent can reliably load and follow:
+
+- **Quest packages** — turn a recurring multi-step analysis workflow (attribution, comparison, trend, target attainment) into a skill package: table facts (`tables/`), metric definitions as the single source of truth (`metrics/`), objective playbooks with machine-checkable gates (`objectives/`), and report requirements (`report/`);
+- **Standalone web report templates** — turn a finished HTML report into a self-contained template package (`manifest.toml` + `schema.json` + `template.html`), with `$read` direct injection for numbers and tables, metrics SQL passthrough as an exception channel, and merged skill+template delivery.
+
+Use it when the user wants to "make a report template", "turn this HTML into a template", or "distill this recurring analysis into a reusable skill". Bundled validators (standalone template validation requires `pip install pyyaml`; the rest is stdlib-only):
+
+```bash
+python3 data-agent-arcvis-skill/scripts/validate_skill.py <skill-package-dir>   # quest skill package
+python3 data-agent-arcvis-skill/scripts/validate_template.py <template-dir>     # web report template package
+python3 data-agent-arcvis-skill/scripts/preview_template.py <template-dir>      # local preview of the template
+```
+
 ## Repository Layout
 
 ```
@@ -118,6 +135,11 @@ Full documentation: [alibabacloud-data-agent-mcp-skill/README.md](alibabacloud-d
 │   ├── scripts/select-binary.sh          # Server binary locator
 │   ├── assets/                           # Static assets (+ optional assets/bin/ for binaries)
 │   └── references/                       # INSTALLATION.md, ram-policies.md
+├── data-agent-arcvis-skill/              # Skill-authoring meta-skill (English, with Chinese counterparts)
+│   ├── SKILL.md / SKILL_zh.md            # Quest packages + standalone web report templates
+│   ├── references/                       # Authoring specs (structure, contracts, checklists; *_zh.md counterparts)
+│   ├── examples/                         # Example skill packages (example-zh + example-en, pass all validators)
+│   └── scripts/                          # validate_skill.py / validate_template.py / preview_template.py
 └── server/                               # Go MCP Server (standalone project)
     ├── main.go / go.mod / Makefile
     ├── cmd/dacli/                        # Manual verification CLI

@@ -1,0 +1,24 @@
+{
+  "report_month": "202512",
+  "headline": "Digital Singles contributed nearly sixty percent of sales; overall achievement is under pressure, with unmet tracks concentrated among newly released tracks with aggressive targets.",
+  "highlights": [
+    {"text": "The Digital Singles channel contributed more than half of sales, forming this month's structural base"},
+    {"text": "Overall sales achievement fell short of the line; unmet tracks account for the majority of tracks under verdict"},
+    {"text": "The lowest-achievement tracks are mostly newly released tracks with aggressive targets; reviewing the target baseline is recommended"}
+  ],
+  "channel_rows": [
+    {"channel": "Digital Singles", "sales_qty": 58000, "sales_amount": 116000.00, "share_pct": 0.58},
+    {"channel": "Digital Albums", "sales_qty": 30000, "sales_amount": 450000.00, "share_pct": 0.30},
+    {"channel": "Membership Single Bundle", "sales_qty": 12000, "sales_amount": 12000.00, "share_pct": 0.12}
+  ],
+  "track_rows": [
+    {"track_id": "T0107", "track_name": "Beyond the Gaze", "sales_qty": 4800, "target_qty": 12000, "achievement": 0.4000, "verdict": "Missed"},
+    {"track_id": "T0058", "track_name": "Tidal Letters", "sales_qty": 6150, "target_qty": 12000, "achievement": 0.5125, "verdict": "Missed"},
+    {"track_id": "T0012", "track_name": "Starlight Drift", "sales_qty": 8400, "target_qty": 14000, "achievement": 0.6000, "verdict": "Missed"},
+    {"track_id": "T0031", "track_name": "Evening Breeze Radio", "sales_qty": 9900, "target_qty": 15000, "achievement": 0.6600, "verdict": "Missed"},
+    {"track_id": "T0044", "track_name": "Galaxy Repairman", "sales_qty": 13550, "target_qty": 16500, "achievement": 0.8212, "verdict": "Missed"},
+    {"track_id": "T0072", "track_name": "Unmanned Storefront", "sales_qty": 15300, "target_qty": 18000, "achievement": 0.8500, "verdict": "Missed"},
+    {"track_id": "T0009", "track_name": "Urban Migratory Bird", "sales_qty": 18900, "target_qty": 21000, "achievement": 0.9000, "verdict": "Missed"},
+    {"track_id": "T0001", "track_name": "Summer Night Frequency", "sales_qty": 23000, "target_qty": 21000, "achievement": 1.0952, "verdict": "Met"}
+  ]
+}

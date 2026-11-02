@@ -1,0 +1,23 @@
+metric_id: METRIC-001
+metric_name: Monthly Sales Volume
+type: direct
+format: quantity
+definition: Total sales copies across all channels (or a specified channel/track) within the reporting month; 0 means confirmed zero sales, NULL means no invoiced activity
+when_to_use: |
+  - Volume fact: the data-retrieval definition for reporting-month overall / per-channel / per-track sales
+  - The numerator of [METRIC-002] and the calculation base of [METRIC-003]
+  - Not applicable: revenue semantics (sales_amount is an independent measure; never mix it with sales volume)
+numerator: {table: track_sales_month, measure: Sales}
+denominator: "none"
+exceptions:
+  - sales_qty is NULL (channel had no invoiced activity that month) → ignored by SUM, not counted as 0
+  - sales_qty is 0 (confirmed zero sales) → participates in the sum normally
+  - channel / track filter yields an empty set → return 0 instead of NULL, and the conclusion must note that the filter scope is empty
+notes: fully additive measure; can be SUMmed directly across channels / tracks / months; revenue is an independent measure and must never be mixed with sales volume
+authority: truth
+sql_template: |
+  SELECT SUM(sales_qty) AS monthly_sales
+  FROM track_sales_month
+  WHERE biz_month = '{month}'
+parameters:
+  - {name: month, example: "202512"}

@@ -1,0 +1,3 @@
+report_schema = "standalone"
+schema_version = "1"
+description = "音乐零售月度销售报告模板：整体 KPI、渠道结构条形、曲目达成明细表；两张明细经 $read 直读 objective 落盘产物（渠道销量分布.csv / 曲目达成明细.csv），未启用 metrics.jsonl 例外通道"

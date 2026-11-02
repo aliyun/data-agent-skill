@@ -22,6 +22,41 @@ class SessionStatus(str, Enum):
     FAILED = "FAILED"
 
 
+# Wire variants of sessionStatus that have no SessionStatus member. Keys are
+# upper-cased raw values. Sources: values observed on the wire via
+# DescribeDataAgentSession ("init", "INITIALIZING") and the backend enum
+# (dms-jarvis app/enums.py SessionStatus: RUNNING / IDLE / INITIALIZING /
+# UNAVAILABLE / RECOVERABLE). "init" is the gateway's cold-session value:
+# finished sessions whose agent has been reclaimed describe as "init" — the
+# session accepts a new message (backend RECOVERABLE semantics), hence IDLE.
+_SESSION_STATUS_ALIASES = {
+    "INIT": "IDLE",
+    "INITIALIZING": "CREATING",
+    "RECOVERABLE": "IDLE",      # ended but resumable — accepts a new message
+    "UNAVAILABLE": "STOPPED",   # ended, unrecoverable
+    "FINISHED": "STOPPED",
+    "CANCELED": "STOPPED",
+    "CANCELLED": "STOPPED",
+    "ERROR": "FAILED",
+}
+
+
+def normalize_session_status(status_str: str) -> SessionStatus:
+    """Map a raw sessionStatus string to SessionStatus.
+
+    Case-insensitive; unknown values fall back to CREATING (historical
+    behavior). The raw string is kept on SessionInfo.raw_status so callers
+    can display the server's own value.
+    """
+    upper = (status_str or "").strip().upper()
+    if upper in SessionStatus.__members__:
+        return SessionStatus(upper)
+    alias = _SESSION_STATUS_ALIASES.get(upper)
+    if alias:
+        return SessionStatus(alias)
+    return SessionStatus.CREATING
+
+
 class ContentType(str, Enum):
     """Content block type enumeration."""
 
@@ -44,6 +79,13 @@ class SessionInfo:
     created_at: datetime = field(default_factory=datetime.now)
     last_used_at: datetime = field(default_factory=datetime.now)
     request_id: Optional[str] = None
+    # Display fields captured from DescribeDataAgentSession (absent on other
+    # construction paths, e.g. SendChatMessage implicit creation).
+    title: Optional[str] = None
+    mode: Optional[str] = None
+    # The server's literal sessionStatus string, before enum normalization
+    # (differs from status.value when an alias mapping was applied).
+    raw_status: Optional[str] = None
 
     def is_running(self) -> bool:
         """Check if session is in an active/usable state (RUNNING, IDLE or WAIT_INPUT)."""

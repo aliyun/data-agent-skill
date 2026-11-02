@@ -1,0 +1,34 @@
+table_name: track_target_month
+business_description: 曲目月度目标表，按月×曲目下达销量目标（覆盖全部上架曲目）
+granularity: 一行 = 某月(biz_month) 的 某曲目(track_id) 的销量目标
+columns:
+  - column_name: biz_month
+    type: string
+    meaning: 业务月份
+    time_format: "yyyyMM，如 202512（字符串存储，非 date 类型）"
+    null_representation: 无空值
+    data_distribution: "202501 ~ 202512，共 12 个月"
+    authority: 真理
+  - column_name: track_id
+    type: string
+    meaning: 曲目编号
+    null_representation: 无空值
+    data_distribution: "T0001 ~ T0120，共 120 个曲目（覆盖全部上架曲目）"
+    authority: 真理
+  - column_name: track_name
+    type: string
+    meaning: 曲目名称
+    null_representation: 无空值
+    data_distribution: "与 track_id 一一对应"
+    authority: 真理
+  - column_name: target_qty
+    type: bigint
+    meaning: 当月销量目标份数
+    null_representation: 无空值（目标未下达的曲目不落行，判定时记 "—"）
+    data_distribution: "min=3000, p50=9000, p95=18000, max=22000"
+    authority: 真理
+dimensions:
+  - {name: 月份, column: biz_month, type: 时间, granularity: 月, nullable: false, authority: 真理}
+  - {name: 曲目, column: track_id, type: 分类, nullable: false, authority: 真理}
+measures:
+  - {name: 目标, aggregation: SUM, column: target_qty, additivity: 完全可加, authority: 真理}

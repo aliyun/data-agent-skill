@@ -109,18 +109,33 @@ class DmsMcpTools:
         self._init_dms_client()
 
     def _init_dms_client(self) -> None:
-        """Initialize DMS Enterprise client using default credential chain."""
-        from alibabacloud_credentials.client import Client as CredentialClient
-        
-        credential_client = CredentialClient()
-        
+        """Initialize DMS Enterprise client.
+
+        Static AK from the credentials file when configured, otherwise the
+        Alibaba Cloud default credential chain.
+        """
+        from data_agent.exceptions import AuthenticationError
+
+        try:
+            credential_client = self._config.build_credential_client()
+            # Force credential resolution early so misconfiguration fails
+            # here rather than at the first API call.
+            credential_client.get_credential()
+        except Exception as e:
+            raise AuthenticationError(
+                f"Failed to get credentials: {e}. "
+                "Please configure credentials via the credentials file "
+                "(DATA_AGENT_CREDENTIALS_FILE), ~/.aliyun/config.json, "
+                "environment variables, or instance role."
+            )
+
         sdk_config = open_api_models.Config()
         sdk_config.credential = credential_client
-        
+
         # Use DMS Enterprise endpoint
         sdk_config.endpoint = self._config.resolve_dms_enterprise_endpoint()
         sdk_config.user_agent = "AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill"
-        
+
         self._dms_client = DmsClient(sdk_config)
 
     def list_instances(
@@ -383,17 +398,19 @@ class AsyncDmsMcpTools:
         self._dms_client: Optional[DmsClient] = None
 
     async def _init_dms_client(self) -> None:
-        """Initialize async DMS Enterprise client using default credential chain."""
-        from alibabacloud_credentials.client import Client as CredentialClient
-        
-        credential_client = CredentialClient()
-        
+        """Initialize async DMS Enterprise client.
+
+        Static AK from the credentials file when configured, otherwise the
+        Alibaba Cloud default credential chain.
+        """
+        credential_client = self._config.build_credential_client()
+
         sdk_config = open_api_models.Config()
         sdk_config.credential = credential_client
-        
+
         sdk_config.endpoint = self._config.resolve_dms_enterprise_endpoint()
         sdk_config.user_agent = "AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill"
-        
+
         self._dms_client = DmsClient(sdk_config)
 
     async def list_instances(

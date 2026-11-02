@@ -14,13 +14,20 @@ domain: AIOps
 ---
 metadata:
   author: DataAgent Team
-  version: "2.6.0"
+  version: "2.7.3"
 ---
 
 # Changelog
 
-- **v2.6.0**: `send` binds custom agents directly via the SendChatMessage `SessionConfig` under AK/SK auth (no CreateDataAgentSession round-trip); `--title` moved to the new `legacy-send` subcommand — avoid unless a session title is really needed. Fixed an invalid `--no-async-run` flag in the `send` quick-start example. For detailed changes and earlier versions, see [CHANGELOG.md](references/CHANGELOG.md).
-- **v2.5.0**: Sync with the maintained master. Added new capabilities including data permissions, plain credentials-file authentication, enhanced `send` subcommand, `cancel` and `upload` subcommands, report generation options, custom agent lifecycle management, workspace-scoped file uploads, and endpoint overrides. Updated SDK contract and fixed bugs related to credential value redaction and response handling. Enhanced dependency on `alibabacloud-dms20250414>=2.0.0`. Removed deprecated `--dms-unit` CLI flag. For detailed changes and earlier versions, see [CHANGELOG.md](references/CHANGELOG.md).
+One line per version — the detail lives in [CHANGELOG.md](references/CHANGELOG.md).
+
+- **v2.7.3**: `runtime release --yes` explicitly releases the caller's runtime for a resource refresh; running sessions become unavailable.
+- **v2.7.2**: API_KEY data-plane (stream gateway) endpoint override — `--stream-endpoint` / `DATA_AGENT_STREAM_ENDPOINT`.
+- **v2.7.1**: Regression-matrix hardening: six fixes — analysis failures no longer fake success, `attach -q` keeps monitoring after a confirmation, API_KEY business failures render their real code/message, credentials-file AK works for every consumer, API_KEY endpoint routing fixed, API_KEY SSE wire repaired.
+- **v2.7.0**: `db` / `file` create the session implicitly via the first SendChatMessage on a shared send path; data sources unify on `DataSources`; `send --session-mode`; new read-only `status` subcommand; session-status normalization.
+- **v2.6.1**: `DataSources` database entries always carry `DmsDatabaseId` (`--dms-db-id` required, fail-fast); `--dms-db-id` flag on `send` / `legacy-send`.
+- **v2.6.0**: `send` binds custom agents directly via `SessionConfig` under AK/SK; `--title` moved to `legacy-send`.
+- **v2.5.0**: Sync with the maintained master — permissions, credentials-file auth, endpoint overrides, custom agents, `cancel` / `upload`, SDK contract update.
 
 ---
 
@@ -85,7 +92,8 @@ This Skill supports three authentication modes: Alibaba Cloud default credential
 | `DATA_AGENT_DMS_UNIT` | DMSUnit override (alias `DATA_AGENT_DMSUNIT`) | auto-resolved |
 | `DATA_AGENT_WORKSPACE_ID` | Default workspace ID | auto personal workspace |
 | `DATA_AGENT_CUSTOM_AGENT_ID` | Default custom agent ID | — |
-| `DATA_AGENT_ENDPOINT` | Custom endpoint | auto-generated |
+| `DATA_AGENT_ENDPOINT` | Custom endpoint (control plane) | auto-generated |
+| `DATA_AGENT_STREAM_ENDPOINT` | API_KEY data-plane (stream) endpoint override | `dataagent-stream-{region}.aliyuncs.com/apikey` |
 | `DATA_AGENT_DMS_ENTERPRISE_ENDPOINT` | dms-enterprise host for discovery APIs (not covered by `DATA_AGENT_ENDPOINT`); set for VPC-only egress | `dms-enterprise.{region}.aliyuncs.com` |
 | `DATA_AGENT_TIMEOUT` | Request timeout (seconds) | `300` |
 | `DATA_AGENT_MAX_RETRY` | Max retry attempts | `3` |
@@ -154,18 +162,20 @@ python3 scripts/data_agent_cli.py <command> [options]
 | `ls` | List Data Center databases / tables with the IDs the `db` command needs |
 | `dms` | DMS instance / database / table lookup (`list-instances`, `search-database`, `list-tables`) |
 | `import` | Import DMS database tables into Data Agent Data Center |
-| `db` | Start a database analysis session (auto / lite / pro / ultra) |
-| `file` | Upload a local file (or use `--file-id`) and analyze it |
+| `db` | Start a database analysis session (auto / lite / pro / ultra); prints the session ID for `status` / `attach` follow-ups |
+| `file` | Upload a local file (or use `--file-id`) and analyze it; prints the session ID for `status` / `attach` follow-ups |
 | `upload` | Upload a local file and print its file ID (no session created) |
-| `send` | Send a single message — direct send (backend creates the session, response carries the new SessionId; custom agent binding carried in `SessionConfig` under AK/SK auth) or reuse an existing one; connectivity checks, report requests and permission-controlled requests |
-| `legacy-send` | Legacy `send` that pre-creates the session via CreateDataAgentSession — only for `--title` or custom-agent binding under API_KEY auth; avoid unless a title is really needed |
+| `send` | Send a single message — create a session (ID printed for follow-ups) or reuse one with `--session-id`; supports `--session-mode`, report requests and permission-controlled queries |
+| `legacy-send` | Variant of `send` that can set `--title`; avoid unless a session title is really needed |
 | `attach` | Re-enter an existing session: follow-ups, plan confirmation, live progress, checkpoint resume |
+| `status` | Read-only session status query — status / title / mode; WAIT_INPUT sessions get the attach confirmation guidance |
 | `reports` | List and download session-generated reports / charts |
 | `cancel` | Cancel a running session |
+| `runtime release` | Release only the authenticated caller's runtime; requires `--yes`, makes running sessions unavailable |
 | `workspace` | List available workspaces |
 | `agent` | List / describe / create / update / publish custom agents |
 
-Common options: `--region` (default `DATA_AGENT_REGION` or `cn-hangzhou`), `--endpoint` (explicit gateway override, defaults derived from region), `--workspace-id`, `--custom-agent-id`, `--session-mode`, `--plan-mode`, `--output summary|detail|raw`, `--async-run`.
+Common options: `--region` (default `DATA_AGENT_REGION` or `cn-hangzhou`), `--endpoint` (explicit gateway override, defaults derived from region), `--stream-endpoint` (API_KEY stream-gateway override, ignored under AK/SK), `--workspace-id`, `--custom-agent-id`, `--session-mode`, `--plan-mode`, `--output summary|detail|raw`, `--async-run`.
 
 ### Core Concepts
 
@@ -179,6 +189,8 @@ Common options: `--region` (default `DATA_AGENT_REGION` or `cn-hangzhou`), `--en
 > 1. First use `ls` to check if the target database exists in Data Center
 > 2. If **not found**, use `dms` subcommand to search for database info, then use `import` subcommand to import it
 > 3. After successful import, you can use `db` subcommand for analysis
+
+> **Data source semantics**: data sources are **session-level** — pass them once with the command that starts the session (database via `--dms-*`, Data Center files via `--data-source` or the `file` upload). Follow-up messages — including `attach` — inherit the session's data scope; passing them again is unnecessary (repeated passes are merged server-side).
 
 ---
 
@@ -253,11 +265,11 @@ Custom Agents are user-defined AI agents with specialized instructions, knowledg
 - **Publish an agent**: Use `agent publish --custom-agent-id <ID> --workspace-id <WS>` to promote a draft to RELEASED
 - **Bind session to custom agent**: Pass `--custom-agent-id <ID>` when using `db`, `file` or `send` to create a session powered by a specific custom agent (or set `DATA_AGENT_CUSTOM_AGENT_ID` as the default)
 
-> **Note**: When `--custom-agent-id` is specified, data source parameters (`--dms-instance-id`, `--dms-db-id`, `--db-name`, `--tables`) are **not required** and should **not** be passed. The custom agent already has its own data scope configuration. Only `--workspace-id` and session options (e.g. `--session-mode`, `--plan-mode`) are needed.
+> **Note**: When `--custom-agent-id` is specified, data source parameters (`--dms-instance-id`, `--dms-db-id`, `--db-name`, `--tables`) are **not required**. The custom agent already carries its own data scope; if you pass extra data sources anyway, the backend merges them into the analysis scope (and rejects out-of-scope ones when the agent forbids appending), so the best practice is to **not pass them** — only `--workspace-id` and session options (e.g. `--session-mode`, `--plan-mode`) are needed. When you do pass a database data source (with or without a custom agent), `--dms-db-id` is mandatory.
 
 > **Note**: Custom Agent sessions automatically use the `prod` stage. The custom agent's instructions, knowledge, and data scope will be applied to the analysis session.
 
-> **Note**: With `send`, the binding rides the SendChatMessage `SessionConfig` directly under AK/SK auth — no separate CreateDataAgentSession call. Under API_KEY auth the backend does not fully support implicit creation with a custom agent yet, so `send` still pre-creates there. `legacy-send` (which always pre-creates) exists only for `--title` and the API_KEY custom-agent path; prefer leaving the title at its server-side default.
+> **Note**: Custom-agent binding works with plain `send` (`--custom-agent-id`). Use `legacy-send` only when a session `--title` is really required; prefer the server-side default title.
 
 ---
 
@@ -284,7 +296,7 @@ python3 scripts/data_agent_cli.py send -s <SESSION_ID> \
 `send` can restrict the agent's SQL access on a database data source:
 
 ```bash
-python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> \
+python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> \
     --db-name <DB> --tables "orders,customers" \
     --permission-file permission.json --permission-default-action deny \
     -m "Analyze last month's orders" --poll
@@ -304,6 +316,20 @@ python3 scripts/data_agent_cli.py cancel --session-id <SESSION_ID>
 ```
 
 Cancels a running analysis session (agent ID is resolved automatically). Use it to clean up test sessions or stop long-running tasks that are no longer needed.
+
+---
+
+## Refresh Runtime Resources (Destructive)
+
+`runtime release` releases only the runtime instance belonging to the currently authenticated sub-account, not a custom-agent definition. **Running sessions become unavailable.** Use it cautiously when a runtime refresh is necessary to pick up the latest resources.
+
+**Never invoke it as an automatic troubleshooting step or as part of a routine custom-agent update. Explain the disruption and obtain explicit user approval before passing `--yes`.** Check the active credentials and region first; there is no target instance or session ID to narrow the impact.
+
+```bash
+python3 scripts/data_agent_cli.py runtime release --yes
+```
+
+Without `--yes`, no request is sent. After release, start a **new** analysis with `db`, `file` or `send` to provision the latest runtime resources. Release alone does not restart the runtime, verify readiness or resume interrupted sessions; read-only progress monitoring does not provision a replacement.
 
 ---
 
@@ -412,9 +438,8 @@ python3 scripts/data_agent_cli.py db \
     --db-name <schemaName> \
     --tables <table1,table2> -q "Which department has the highest average salary"
 
-# 5b. Quick connectivity check / session-less send (backend creates the session)
+# 5b. Quick connectivity check (creates a session; its ID is printed for follow-up attach)
 python3 scripts/data_agent_cli.py send -m "ping"
-# -> response carries the new Session ID for follow-up attach
 
 # 6. Upload a file without starting a session (prints the file ID)
 python3 scripts/data_agent_cli.py upload assets/example_game_data.csv

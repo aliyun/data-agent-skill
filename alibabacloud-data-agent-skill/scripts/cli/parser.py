@@ -13,6 +13,8 @@ from cli.cmd_ls import cmd_ls
 from cli.cmd_file import cmd_file
 from cli.cmd_attach import cmd_attach
 from cli.cmd_cancel import cmd_cancel
+from cli.cmd_runtime import cmd_runtime_release
+from cli.cmd_status import cmd_status
 from cli.cmd_upload import cmd_upload
 from cli.cmd_send import cmd_send, cmd_send_legacy
 from cli.cmd_dms import cmd_dms
@@ -23,12 +25,18 @@ from cli.cmd_agent import cmd_agent
 
 
 def _add_common_endpoint(parent: argparse.ArgumentParser) -> None:
-    """Register the shared --endpoint override on a subparser parent."""
+    """Register the shared --endpoint overrides on a subparser parent."""
     parent.add_argument(
         "--endpoint",
         default=None,
         metavar="HOST",
         help="Explicit API gateway endpoint override (defaults derived from region; also settable via DATA_AGENT_ENDPOINT)",
+    )
+    parent.add_argument(
+        "--stream-endpoint",
+        default=None,
+        metavar="HOST",
+        help="API_KEY data-plane (stream) endpoint override, e.g. pre gateways; ignored under AK/SK (also settable via DATA_AGENT_STREAM_ENDPOINT)",
     )
 
 
@@ -103,6 +111,13 @@ def _add_send_message_params(parser: argparse.ArgumentParser) -> None:
         help="Workspace ID for newly created sessions (or workspace-bound reuse)",
     )
     parser.add_argument(
+        "--session-mode",
+        default=None,
+        choices=["auto", "lite", "pro", "ultra"],
+        metavar="MODE",
+        help="Session mode for the created session: auto | lite | pro | ultra (default: backend intelligent decision)",
+    )
+    parser.add_argument(
         "--custom-agent-id",
         metavar="AGENT_ID",
         help="Custom Agent ID bound to the session created by this message",
@@ -120,6 +135,12 @@ def _add_send_message_params(parser: argparse.ArgumentParser) -> None:
         type=int,
         metavar="INT",
         help="DMS Instance ID for a database data source attached to the message",
+    )
+    db_source_group.add_argument(
+        "--dms-db-id",
+        type=int,
+        metavar="INT",
+        help="DMS Database ID (required when any database data source parameter is passed; the backend resolves table schemas and executes SQL by database ID)",
     )
     db_source_group.add_argument(
         "--db-name",
@@ -441,12 +462,12 @@ Mode Description:
             "Examples:\n"
             "  python3 scripts/data_agent_cli.py send -m \"Analyze sales trends\"\n"
             "  python3 scripts/data_agent_cli.py send --data-source <FILE_ID> -m \"Analyze store sales\"\n"
-            "  python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --db-name <DB> --tables \"t1,t2\" -m \"Analyze the database\"\n"
+            "  python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> --db-name <DB> --tables \"t1,t2\" -m \"Analyze the database\"\n"
             "  python3 scripts/data_agent_cli.py send --workspace-id <WORKSPACE_ID> --custom-agent-id <AGENT_ID> -m \"Generate a report\" --poll --timeout 600\n"
             "  python3 scripts/data_agent_cli.py send -s <SID> --message-type report --report-theme default -m \"Generate a web report\"\n"
             "  python3 scripts/data_agent_cli.py send -s <SID> --message-type report --report-prompt @report_prompt.md -m \"Generate report\"\n"
             "  python3 scripts/data_agent_cli.py send -s <SID> --message-type diag -m \"Why does the web report show no data for metric X\"\n"
-            "  python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --db-name <DB> --tables \"t1,t2\" \\\n"
+            "  python3 scripts/data_agent_cli.py send --dms-instance-id <DMS_INSTANCE_ID> --dms-db-id <DMS_DB_ID> --db-name <DB> --tables \"t1,t2\" \\\n"
             "      --permission-file permission.json --permission-default-action deny -m \"Analyze orders\" --poll"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -562,6 +583,72 @@ Mode Description:
         help="Workspace ID if the session is workspace-bound",
     )
     cancel_parser.set_defaults(func=cmd_cancel)
+
+    # Runtime resources are separate from custom-agent definitions (agent).
+    runtime_parser = subparsers.add_parser(
+        "runtime",
+        help="Manage the current caller's runtime resources (destructive)",
+    )
+    runtime_actions = runtime_parser.add_subparsers(dest="runtime_action", required=True)
+    release_parser = runtime_actions.add_parser(
+        "release",
+        help="Release your runtime; running sessions become unavailable",
+        description=(
+            "Release only the runtime instance belonging to the authenticated sub-account.\n"
+            "WARNING: Running sessions will become unavailable. Use cautiously.\n"
+            "No instance, session, workspace or custom-agent ID is accepted.\n"
+            "After release, start a new analysis to provision the latest resources;\n"
+            "this command does not restart the runtime or resume interrupted sessions.\n\n"
+            "No request is sent unless --yes is explicitly supplied.\n"
+            "Example:\n"
+            "  python3 scripts/data_agent_cli.py runtime release --yes"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    release_parser.add_argument(
+        "--endpoint",
+        default=None,
+        metavar="HOST",
+        help="Control-plane endpoint override (or DATA_AGENT_ENDPOINT)",
+    )
+    release_parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Confirm that running sessions will become unavailable",
+    )
+    release_parser.set_defaults(func=cmd_runtime_release)
+
+    # -- status subcommand --
+    status_parser = subparsers.add_parser(
+        "status",
+        help="Show the current status of a session",
+        description=(
+            "Show the current status of a Data Agent session via a single\n"
+            "DescribeDataAgentSession call. Read-only: no streaming, no worker.\n"
+            "For WAIT_INPUT sessions, prints how to confirm via attach.\n\n"
+            "Examples:\n"
+            "  python3 scripts/data_agent_cli.py status --session-id <ID>"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_common_endpoint(status_parser)
+    status_parser.add_argument(
+        "--session-id",
+        required=True,
+        metavar="SESSION_ID",
+        help="Session ID to query",
+    )
+    status_parser.add_argument(
+        "--agent-id", "-a",
+        metavar="AGENT_ID",
+        help="Agent ID (optional; the backend resolves it from the session)",
+    )
+    status_parser.add_argument(
+        "--workspace-id",
+        metavar="WORKSPACE_ID",
+        help="Workspace ID if the session is workspace-bound",
+    )
+    status_parser.set_defaults(func=cmd_status)
 
     # -- ls subcommand --
     ls_parser = subparsers.add_parser(
@@ -899,10 +986,12 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # Propagate an explicit --endpoint before any component reads the
-    # environment; worker subprocesses inherit it automatically.
+    # Propagate explicit overrides before any component reads the
+    # environment; worker subprocesses inherit them automatically.
     if getattr(args, "endpoint", None):
         os.environ["DATA_AGENT_ENDPOINT"] = args.endpoint
+    if getattr(args, "stream_endpoint", None):
+        os.environ["DATA_AGENT_STREAM_ENDPOINT"] = args.stream_endpoint
 
     try:
         args.func(args)

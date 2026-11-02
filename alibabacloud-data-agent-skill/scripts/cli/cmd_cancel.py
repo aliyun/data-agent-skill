@@ -52,8 +52,10 @@ def cmd_cancel(args: argparse.Namespace) -> None:
         request_id = resp.get("RequestId") or resp.get("requestId")
         success = resp.get("Success", resp.get("success"))
         if str(success).lower() != "true":
-            error_code = resp.get("ErrorCode") or resp.get("errorCode")
-            error_message = resp.get("ErrorMessage") or resp.get("errorMessage")
+            # AK/SK RPC failures carry ErrorCode/ErrorMessage; the API_KEY
+            # gateway (HTTP 200 + error body) carries code/message instead.
+            error_code = resp.get("ErrorCode") or resp.get("errorCode") or resp.get("code")
+            error_message = resp.get("ErrorMessage") or resp.get("errorMessage") or resp.get("message")
             print(f"  Business failure: {error_code} {error_message}")
             if request_id:
                 print(f"  RequestId: {request_id}")

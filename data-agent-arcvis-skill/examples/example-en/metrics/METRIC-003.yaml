@@ -1,0 +1,27 @@
+metric_id: METRIC-003
+metric_name: Sales MoM Growth Rate
+type: derived
+format: percentage
+definition: Growth rate of current-month sales relative to prior-month sales; (current − prior) ÷ prior, > 0 means growth
+when_to_use: |
+  - Monthly trend judgment: whether reporting-month sales rose or fell versus the prior month, and by how much
+  - The same formula applies at channel / track granularity
+  - Not applicable: compound growth over multi-month cumulative semantics
+numerator: {metric: METRIC-001, period: current month}
+denominator: {metric: METRIC-001, period: prior month}
+derived_formula: (current-month [METRIC-001] − prior-month [METRIC-001]) ÷ prior-month [METRIC-001]; prior month = the calendar month before the reporting month (e.g. reporting month 202512 → prior month 202511)
+exceptions:
+  - prior-month sales are 0 or NULL → record the result as "—", excluded from ranking (avoids division by zero and a distorted base)
+  - the dimension has no records at all in the prior month (e.g. a newly launched channel / track) → record "—" and note "no MoM base" in the conclusion
+  - current month is NULL (no invoiced activity) → treated as 0 per the [METRIC-001] semantics
+notes: ratios are non-additive — never average monthly growth rates into an "average MoM"; for cross-period aggregation, go back to the raw [METRIC-001] values and recompute
+authority: truth
+sql_template: |
+  SELECT
+    (cur.qty - prev.qty) / NULLIF(prev.qty, 0) AS mom_growth_rate
+  FROM
+    (SELECT SUM(sales_qty) AS qty FROM track_sales_month WHERE biz_month = '{month}') cur,
+    (SELECT SUM(sales_qty) AS qty FROM track_sales_month WHERE biz_month = '{prior_month}') prev
+parameters:
+  - {name: month, example: "202512"}
+  - {name: prior_month, example: "202511", description: "the calendar month before the reporting month, derived by the executor from month"}

@@ -1,0 +1,23 @@
+metric_id: METRIC-001
+metric_name: 当月销量
+type: 直接量
+format: 数量
+definition: 报告月内全渠道（或指定渠道/曲目）的销量份数合计；0 表示确认零销量，NULL 表示未开票
+when_to_use: |
+  - 总量事实：报告月整体 / 分渠道 / 分曲目销量的取数口径
+  - 作为 [METRIC-002] 的分子与 [METRIC-003] 的计算基数
+  - 不适用：收入口径（sales_amount 是独立度量，禁止与销量混用）
+numerator: {table: track_sales_month, measure: 销量}
+denominator: "none"
+exceptions:
+  - sales_qty 为 NULL（渠道当月未开票）→ SUM 自动忽略，不按 0 计入
+  - sales_qty 为 0（确认零销量）→ 正常参与求和
+  - 渠道 / 曲目筛选结果为空集 → 返回 0 而非 NULL，结论中须注明筛选范围为空
+notes: 完全可加度量，可跨渠道 / 曲目 / 月份直接 SUM；收入是独立度量，禁止与销量混用
+authority: 真理
+sql_template: |
+  SELECT SUM(sales_qty) AS 当月销量
+  FROM track_sales_month
+  WHERE biz_month = '{月份}'
+parameters:
+  - {name: 月份, example: "202512"}
