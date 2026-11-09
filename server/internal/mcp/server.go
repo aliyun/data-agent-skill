@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -48,6 +49,11 @@ type Server struct {
 	// waits tracks in-flight blocking waits per session; shared across
 	// tenant-scoped copies (pointer field).
 	waits *waitRegistry
+	// stats counts tool calls for the perf log; shared like waits.
+	stats *toolStats
+	// transport is the live remote transport, published by runHTTP so the
+	// perf log can read protocol-session counts (pointer: Server is copied).
+	transport *atomic.Pointer[remoteTransport]
 
 	// Remote entrypoints remain disabled until ConfigureHTTP installs pure authentication.
 	httpLimits   config.HTTP
@@ -121,10 +127,12 @@ func New(mgr *session.Manager, client *dataagent.Client, version string) *Server
 	s := &Server{
 		mgr: mgr, client: client, version: version,
 		hdrUser: "x-aily-user", hdrEmail: "x-aily-email", hdrToken: "x-aily-token",
-		hdrJWT:  tenant.DefaultJWTHeader,
-		reqLog:  defaultRequestLogLevel(standalone),
-		waitCap: waitCapFromEnv(),
-		waits:   newWaitRegistry(),
+		hdrJWT:    tenant.DefaultJWTHeader,
+		reqLog:    defaultRequestLogLevel(standalone),
+		waitCap:   waitCapFromEnv(),
+		waits:     newWaitRegistry(),
+		stats:     newToolStats(),
+		transport: new(atomic.Pointer[remoteTransport]),
 	}
 	if client != nil {
 		s.gatewayClient = client
@@ -165,6 +173,23 @@ func New(mgr *session.Manager, client *dataagent.Client, version string) *Server
 // SetResolver enables per-request tenant resolution (identity multi-tenant mode).
 func (s *Server) SetResolver(r Resolver) { s.resolve = r }
 
+// PerfStats returns the server-level counters for the perf log: tool calls,
+// in-flight blocking waits, and (remote transports) protocol sessions.
+func (s *Server) PerfStats() map[string]any {
+	out := map[string]any{
+		"tool_calls":     s.stats.snapshot(),
+		"blocking_waits": s.waits.inflightCount(),
+		"wait_cap_s":     s.effectiveWaitCap().Seconds(),
+	}
+	if s.transport != nil {
+		if t := s.transport.Load(); t != nil {
+			out["transport"] = t.kind
+			out["protocol_sessions"] = t.sessions.stats()
+		}
+	}
+	return out
+}
+
 // SetIdentityHeaders overrides the HTTP header names carrying the end-user
 // identity (defaults: x-aily-user / x-aily-email / x-aily-token).
 func (s *Server) SetIdentityHeaders(user, email, token string) {
@@ -196,10 +221,13 @@ func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest
 	return func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, err error) {
 		ctx, requestIDs := dataagent.WithRequestIDs(ctx)
 		rec := s.startToolCall(ctx, req)
+		started := time.Now()
+		s.stats.begin(req.Params.Name)
 		defer func() {
 			if err == nil {
 				addUpstreamRequests(res, requestIDs.Snapshot())
 			}
+			s.stats.end(req.Params.Name, time.Since(started), err != nil, err == nil && res != nil && res.IsError)
 			rec.finish(res, err)
 			// After logging: stamp tool errors with the request id so the
 			// caller-visible message links back to the server log.

@@ -100,6 +100,15 @@ func (w *waitRegistry) exit(ctx context.Context, sessionID string) {
 	delete(w.inflight, key)
 }
 
+func (w *waitRegistry) inflightCount() int {
+	if w == nil {
+		return 0
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.inflight)
+}
+
 // duplicateWaitWarning is returned to callers whose blocking wait was degraded
 // because another wait for the same session is already in flight.
 const duplicateWaitWarning = "another blocking wait for this session is already in flight; returned an immediate snapshot instead. Never call data_agent_wait_result or data_agent_status(wait_timeout>0) in parallel for the same session — issue ONE wait call and wait for it to return."

@@ -138,6 +138,10 @@ func (s *Server) runHTTP(ctx context.Context, kind string) error {
 		return err
 	}
 	defer t.close()
+	if s.transport != nil {
+		s.transport.Store(t)
+		defer s.transport.Store(nil)
+	}
 	addr, err := mcpAddr()
 	if err != nil {
 		return err

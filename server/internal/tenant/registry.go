@@ -427,6 +427,37 @@ func closeTenant(t *Tenant) error {
 	return errors.Join(errs...)
 }
 
+// PerfStats reports tenant cache occupancy and the aggregate watcher counts
+// across all tenant session managers for the perf log.
+func (r *Registry) PerfStats() map[string]any {
+	r.mu.Lock()
+	tenants := make([]*Tenant, 0, len(r.tenants))
+	for _, t := range r.tenants {
+		tenants = append(tenants, t)
+	}
+	initializing := len(r.inflight)
+	closed := r.closed
+	r.mu.Unlock()
+
+	watchers := map[string]int{}
+	for _, t := range tenants {
+		if t.Manager == nil {
+			continue
+		}
+		for k, v := range t.Manager.WatcherStats() {
+			watchers[k] += v
+		}
+	}
+	return map[string]any{
+		"tenants":       len(tenants),
+		"max_tenants":   r.cfg.Identity.MaxTenants,
+		"initializing":  initializing,
+		"restore_queue": len(r.restores),
+		"closed":        closed,
+		"watchers":      watchers,
+	}
+}
+
 // Close waits for actual SDK work, restoration and housekeeping before closing
 // managers/roots. credentials-go cannot be interrupted; Close may wait for its
 // configured network timeouts or for an external provider to return.

@@ -20,6 +20,7 @@ func clearEnv(t *testing.T) {
 		"DATA_AGENT_ENDPOINT", "DATA_AGENT_DMS_ENTERPRISE_ENDPOINT", "DATA_AGENT_CUSTOM_AGENT_ID",
 		"IDENTITY_SHARED_SECRET", "IDENTITY_AUTH_TOKEN", "IDENTITY_JWT_SECRET", "IDENTITY_JWT_SECRETS",
 		"IDENTITY_SESSION_NAME_PREFIX", "DATA_AGENT_LOG_REQUESTS", "MCP_TRANSPORT",
+		"DATA_AGENT_PERF_LOG", "DATA_AGENT_PERF_LOG_FILE", "DATA_AGENT_PERF_LOG_INTERVAL",
 	} {
 		t.Setenv(k, "")
 	}
@@ -37,6 +38,47 @@ func TestLoadUsesBuddyRegion(t *testing.T) {
 	}
 	if cfg.Region != "cn-shanghai" {
 		t.Fatalf("Region = %q, want cn-shanghai", cfg.Region)
+	}
+}
+
+func TestPerfLogConfig(t *testing.T) {
+	clearEnv(t)
+	cfg, _, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Log.Perf.Enabled || !strings.HasSuffix(cfg.Log.Perf.File, filepath.Join(".data-agent", "perf.log")) {
+		t.Fatalf("perf log should be off with a default path: %+v", cfg.Log.Perf)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("log:\n  perf:\n    enabled: true\n    file: ~/perf-from-yaml.log\n    interval_seconds: 5\n    max_bytes: 1024\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DATA_AGENT_CONFIG", path)
+	cfg, _, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Log.Perf.Enabled || cfg.Log.Perf.IntervalSeconds != 5 || cfg.Log.Perf.MaxBytes != 1024 || strings.HasPrefix(cfg.Log.Perf.File, "~") {
+		t.Fatalf("yaml perf section not applied: %+v", cfg.Log.Perf)
+	}
+
+	t.Setenv("DATA_AGENT_PERF_LOG", "false")
+	t.Setenv("DATA_AGENT_PERF_LOG_FILE", filepath.Join(dir, "env.log"))
+	t.Setenv("DATA_AGENT_PERF_LOG_INTERVAL", "7")
+	cfg, _, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Log.Perf.Enabled || cfg.Log.Perf.File != filepath.Join(dir, "env.log") || cfg.Log.Perf.IntervalSeconds != 7 {
+		t.Fatalf("env override not applied: %+v", cfg.Log.Perf)
+	}
+
+	t.Setenv("DATA_AGENT_PERF_LOG_INTERVAL", "0")
+	if _, _, err := Load(); err == nil {
+		t.Fatal("non-positive interval must be rejected")
 	}
 }
 

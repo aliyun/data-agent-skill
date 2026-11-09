@@ -800,6 +800,20 @@ func (m *Manager) ListSessions() []*StateSnapshot {
 	return result
 }
 
+// WatcherStats counts active watchers by session status for the perf log.
+func (m *Manager) WatcherStats() map[string]int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := map[string]int{"total": len(m.watchers)}
+	for _, entry := range m.watchers {
+		out[string(entry.state.GetStatus())]++
+	}
+	m.operationsMu.Lock()
+	out["locked_operations"] = len(m.operations)
+	m.operationsMu.Unlock()
+	return out
+}
+
 // ListAllSessions returns snapshots of all sessions: active watchers merged
 // with persisted sessions on disk. Active sessions override disk entries with
 // the same session ID. Disk sessions are sorted by updated_at descending.

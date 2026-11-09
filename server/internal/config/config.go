@@ -15,6 +15,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -175,6 +176,17 @@ type Log struct {
 	//                     troubleshooting rather than steady-state operation
 	//   off             — no per-call logging
 	Requests string `yaml:"requests"`
+	// Perf periodically samples host/process/runtime/server metrics into a
+	// dedicated JSON-lines file (not stderr) for post-incident analysis.
+	Perf Perf `yaml:"perf"`
+}
+
+// Perf configures the periodic performance sampler.
+type Perf struct {
+	Enabled         bool   `yaml:"enabled"`
+	File            string `yaml:"file"`             // default ~/.data-agent/perf.log
+	IntervalSeconds int    `yaml:"interval_seconds"` // default 30, minimum 1
+	MaxBytes        int64  `yaml:"max_bytes"`        // default 64 MiB, then rotate to <file>.1
 }
 
 // AgentGateway configures the fixed Agentic OpenAPI metadata tools.
@@ -434,8 +446,28 @@ func Load() (Config, string, error) {
 	if v := os.Getenv("DATA_AGENT_LOG_REQUESTS"); v != "" {
 		cfg.Log.Requests = v
 	}
+	if v := os.Getenv("DATA_AGENT_PERF_LOG"); v != "" {
+		cfg.Log.Perf.Enabled = v != "0" && !strings.EqualFold(v, "false") && !strings.EqualFold(v, "off")
+	}
+	if v := os.Getenv("DATA_AGENT_PERF_LOG_FILE"); v != "" {
+		cfg.Log.Perf.File = v
+	}
+	if v := os.Getenv("DATA_AGENT_PERF_LOG_INTERVAL"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return cfg, path, errors.New("DATA_AGENT_PERF_LOG_INTERVAL must be a positive integer")
+		}
+		cfg.Log.Perf.IntervalSeconds = n
+	}
 
 	cfg.SessionsDir = expandHome(cfg.SessionsDir)
+	if cfg.Log.Perf.File == "" {
+		cfg.Log.Perf.File = filepath.Join(homeDir(), ".data-agent", "perf.log")
+	}
+	cfg.Log.Perf.File = expandHome(cfg.Log.Perf.File)
+	if cfg.Log.Perf.IntervalSeconds < 0 || cfg.Log.Perf.MaxBytes < 0 {
+		return cfg, path, errors.New("log.perf interval_seconds and max_bytes must not be negative")
+	}
 	cfg.ApplyDefaults()
 	// Load starts with defaults, so zero here is an explicitly invalid limit,
 	// not an absent setting. Do not silently replace it, even while disabled.

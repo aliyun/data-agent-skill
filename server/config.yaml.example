@@ -71,6 +71,16 @@ log:
   # still excludes parameters, returned data and raw errors; never log credentials.
   # Env: DATA_AGENT_LOG_REQUESTS.
   requests: ""
+  # Periodic performance sampler: host (Linux /proc), process, Go runtime
+  # (goroutines, heap, GC, scheduler latency), tool-call counters, protocol
+  # sessions and tenant/watcher counts, one JSON object per line. Contains no
+  # arguments, identities or credentials. Rotates once to <file>.1.
+  # Env: DATA_AGENT_PERF_LOG, DATA_AGENT_PERF_LOG_FILE, DATA_AGENT_PERF_LOG_INTERVAL.
+  perf:
+    enabled: false
+    file: ~/.data-agent/perf.log
+    interval_seconds: 30
+    max_bytes: 67108864
 
 # This template defaults to LOCAL STDIO ONLY. All HTTP/SSE deployments, gateway
 # on OR off, must explicitly set enabled=true, require_identity=true, a nonempty

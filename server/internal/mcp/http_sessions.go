@@ -218,6 +218,38 @@ func (p *protocolSessions) close() {
 	}
 }
 
+// stats reports occupancy against the configured limits for the perf log.
+func (p *protocolSessions) stats() map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var ready, initializing, closing, streams int
+	for b := range p.all {
+		switch {
+		case b.closing:
+			closing++
+		case b.ready:
+			ready++
+		case b.initializing:
+			initializing++
+		}
+		if b.stream {
+			streams++
+		}
+	}
+	return map[string]any{
+		"total":        len(p.all),
+		"ready":        ready,
+		"initializing": initializing,
+		"closing":      closing,
+		"streams":      streams,
+		"principals":   len(p.owners),
+		"inflight":     p.inflight,
+		"max_sessions": p.limits.MaxSessions,
+		"max_inflight": p.limits.MaxInflightRequests,
+		"closed":       p.closed,
+	}
+}
+
 // Generate has no request context. Only the HTTP context callback can associate
 // this unpredictable ID with an already reserved owner, before dispatch/publication.
 func (p *protocolSessions) Generate() string { return "mcp-session-" + uuid.NewString() }

@@ -312,6 +312,71 @@ Key environment variables:
 | `DATA_AGENT_WORKSPACE_ID` | Default workspace (empty = auto-discovery) |
 | `DATA_AGENT_WAIT_CAP` | Blocking-wait ceiling in seconds (default 55, chosen to stay under nginx's default 60s `proxy_read_timeout`) |
 | `DATA_AGENT_LOG_REQUESTS` | Per-call logging: `basic` / `full` / `off` |
+| `DATA_AGENT_PERF_LOG` | `1`/`true` enables the periodic performance sampler (see below) |
+| `DATA_AGENT_PERF_LOG_FILE` | Perf log path (default `~/.data-agent/perf.log`) |
+| `DATA_AGENT_PERF_LOG_INTERVAL` | Sampling period in seconds (default 30) |
+
+### Performance log
+
+Performance sampling is **disabled by default**. Enable it using either the
+configuration file or environment variables, then restart the server.
+
+**Option 1 — configuration file:** merge `perf` into the existing `log` section
+of your config.yaml (do not add a second `log` key):
+
+```yaml
+log:
+  perf:
+    enabled: true
+    file: ~/.data-agent/perf.log
+    interval_seconds: 10
+    max_bytes: 67108864
+```
+
+**Option 2 — environment variables:** these override the configuration file:
+
+```bash
+DATA_AGENT_PERF_LOG=1 \
+DATA_AGENT_PERF_LOG_FILE="$HOME/.data-agent/perf.log" \
+DATA_AGENT_PERF_LOG_INTERVAL=10 \
+./bin/data-agent-mcp-server
+```
+
+Keep your existing transport, credentials and identity configuration. For remote
+deployments, `MCP_TRANSPORT` and `MCP_PORT` must still be set as described above;
+enabling perf does not enable HTTP or change authentication. With systemd or a
+container, set these variables in the service environment and restart it.
+
+**Confirm collection:** startup stderr contains `perf log enabled`, and the
+configured file receives JSON lines starting with an `"event":"start"` record:
+
+```bash
+tail -n 1 "$HOME/.data-agent/perf.log"
+```
+
+Use your custom path if `file` was overridden. A new line should appear every
+configured interval (default 30 seconds); 10–30 seconds is suitable for routine
+collection, while 1 second is useful for short diagnostic runs. Ensure the server
+account can write to the log directory. To disable, set `enabled: false` or
+`DATA_AGENT_PERF_LOG=0` and restart; an environment override takes precedence.
+
+The sampler appends one JSON object per line to a dedicated file, separate from
+stderr, so a production stall can be reconstructed afterwards. Each record carries:
+
+| Section | Contents |
+|---|---|
+| `runtime` | goroutines, GOMAXPROCS, heap/stack bytes, GC count/pauses (`gc_pause_p99_ms`, `gc_last_pause_ms`), scheduler latency (`sched_latency_p50/p99/max_ms`), cumulative mutex wait |
+| `process` | pid, user/sys CPU, `cpu_percent` since the previous sample; on Linux also RSS, swap, threads, open/max fds, context switches |
+| `host` | Linux only: load averages, runnable tasks, host CPU %/iowait/steal, memory used %, swap, PSI (`psi_cpu/mem/io_some_avg10`); all platforms: free/total bytes of the sessions-dir filesystem |
+| `mcp` | tool-call counters per tool (calls, errors, tool_errors, inflight, avg/max/window-max ms), in-flight blocking waits, wait cap; on HTTP transports also protocol-session occupancy (total/ready/initializing/closing/streams/principals/inflight vs limits) |
+| `tenants` | remote only: cached tenants vs `max_tenants`, in-progress initializations, restore queue depth, SSE watcher counts by session status |
+| `sessions` | stdio only: SSE watcher counts by session status |
+
+The first record is tagged `"event":"start"`, the last `"event":"shutdown"`. The
+file rotates once to `<file>.1` when it exceeds `log.perf.max_bytes` (default
+64 MiB); it is created `0600`. Counters are cumulative — diff consecutive lines
+(e.g. with `jq`) to obtain rates. The sampler never logs arguments, identities or
+credentials.
 
 ## Verify
 

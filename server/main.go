@@ -12,6 +12,7 @@ import (
 	"github.com/alibabacloud/data-agent-mcp-server/internal/config"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/dataagent"
 	mcpserver "github.com/alibabacloud/data-agent-mcp-server/internal/mcp"
+	"github.com/alibabacloud/data-agent-mcp-server/internal/perf"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/session"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/tenant"
 )
@@ -89,9 +90,33 @@ func run() error {
 	srv.SetCustomAgentID(cfg.CustomAgentID)
 	srv.ApplyRequestLogConfig(cfg.Log.Requests)
 	srv.EnableGateway(cfg.AgentGateway.Enabled, cfg.AgentGateway.DataSourcesEnabled, remote)
+
+	var collector *perf.Collector
+	if cfg.Log.Perf.Enabled {
+		collector, err = perf.New(perf.Options{
+			Path:     cfg.Log.Perf.File,
+			Interval: time.Duration(cfg.Log.Perf.IntervalSeconds) * time.Second,
+			MaxBytes: cfg.Log.Perf.MaxBytes,
+			DiskPath: cfg.SessionsDir,
+		})
+		if err != nil {
+			return fmt.Errorf("perf log: %w", err)
+		}
+		collector.AddSource("mcp", srv.PerfStats)
+		if mgr != nil {
+			collector.AddSource("sessions", func() map[string]any {
+				return map[string]any{"watchers": mgr.WatcherStats()}
+			})
+		}
+		log.Printf("perf log enabled file=%q interval=%ds", cfg.Log.Perf.File, cfg.Log.Perf.IntervalSeconds)
+	}
+
 	if remote {
 		registry := tenant.NewRegistry(ctx, cfg, provider)
 		defer registry.Close()
+		if collector != nil {
+			collector.AddSource("tenants", registry.PerfStats)
+		}
 		srv.SetIdentityHeaders(cfg.Identity.Headers.User, cfg.Identity.Headers.Email, cfg.Identity.Headers.Token)
 		if cfg.Identity.JWT.Enabled {
 			srv.EnableJWTIdentity(cfg.Identity.JWT.Header)
@@ -113,6 +138,12 @@ func run() error {
 			}, nil
 		})
 		log.Printf("remote identity enabled namespace=%q jwt=%t groups=%d", cfg.Identity.Namespace, cfg.Identity.JWT.Enabled, len(cfg.Identity.Groups))
+	}
+	if collector != nil {
+		perfCtx, stopPerf := context.WithCancel(context.Background())
+		perfDone := make(chan struct{})
+		go func() { defer close(perfDone); collector.Run(perfCtx) }()
+		defer func() { stopPerf(); <-perfDone }()
 	}
 	return srv.Run(ctx)
 }
