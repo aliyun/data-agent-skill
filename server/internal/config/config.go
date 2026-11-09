@@ -165,16 +165,20 @@ type STS struct {
 	SessionExpiration int    `yaml:"session_expiration"` // seconds, default 3600
 }
 
-// Log configures server logging. Everything goes to stderr, so on stdio the
-// host agent captures it and on the HTTP transports the process supervisor
-// (systemd, container runtime) does.
+// DefaultLogMaxBytes is the default server log rotation size.
+const DefaultLogMaxBytes = 64 << 20
+
+// Log configures server logging to stderr or a rotating file.
 type Log struct {
+	Enabled  bool   `yaml:"enabled"`
+	File     string `yaml:"file"`      // default ~/.data-agent/server.log
+	MaxBytes int64  `yaml:"max_bytes"` // positive bytes, then rotate to <file>.1
 	// Requests selects how much of every tool call is logged:
-	//   basic (default) — tool name, caller, outcome, duration
-	//   full            — adds arguments with sensitive values redacted;
-	//                     arguments carry user questions, so prefer it for
-	//                     troubleshooting rather than steady-state operation
-	//   off             — no per-call logging
+	//   basic — tool name, caller, outcome, duration (default remotely)
+	//   full  — adds arguments with sensitive values redacted;
+	//           arguments carry user questions, so prefer it for
+	//           troubleshooting rather than steady-state operation
+	//   off   — no per-call logging (default under stdio)
 	Requests string `yaml:"requests"`
 	// Perf periodically samples host/process/runtime/server metrics into a
 	// dedicated JSON-lines file (not stderr) for post-incident analysis.
@@ -356,6 +360,7 @@ func Load() (Config, string, error) {
 		Region:       "cn-hangzhou",
 		SessionsDir:  filepath.Join(homeDir(), ".data-agent", "sessions"),
 		STS:          STS{SessionExpiration: 3600},
+		Log:          Log{MaxBytes: DefaultLogMaxBytes},
 		AgentGateway: AgentGateway{RequestTimeoutSeconds: 30, MaxResponseBytes: 4194304},
 		HTTP:         DefaultHTTP(),
 		Identity:     Identity{MaxTenants: 128},
@@ -443,6 +448,26 @@ func Load() (Config, string, error) {
 			}
 		}
 	}
+	if v := os.Getenv("DATA_AGENT_LOG"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "on":
+			cfg.Log.Enabled = true
+		case "0", "false", "off":
+			cfg.Log.Enabled = false
+		default:
+			return cfg, path, errors.New("DATA_AGENT_LOG must be 1/true/on or 0/false/off")
+		}
+	}
+	if v, ok := os.LookupEnv("DATA_AGENT_LOG_FILE"); ok {
+		cfg.Log.File = v
+	}
+	if v := os.Getenv("DATA_AGENT_LOG_MAX_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return cfg, path, errors.New("DATA_AGENT_LOG_MAX_BYTES must be a positive integer")
+		}
+		cfg.Log.MaxBytes = n
+	}
 	if v := os.Getenv("DATA_AGENT_LOG_REQUESTS"); v != "" {
 		cfg.Log.Requests = v
 	}
@@ -461,12 +486,24 @@ func Load() (Config, string, error) {
 	}
 
 	cfg.SessionsDir = expandHome(cfg.SessionsDir)
+	if cfg.Log.File == "" {
+		cfg.Log.File = filepath.Join(homeDir(), ".data-agent", "server.log")
+	}
+	cfg.Log.File = expandHome(cfg.Log.File)
+	if cfg.Log.MaxBytes <= 0 {
+		return cfg, path, errors.New("log.max_bytes must be a positive integer")
+	}
 	if cfg.Log.Perf.File == "" {
 		cfg.Log.Perf.File = filepath.Join(homeDir(), ".data-agent", "perf.log")
 	}
 	cfg.Log.Perf.File = expandHome(cfg.Log.Perf.File)
 	if cfg.Log.Perf.IntervalSeconds < 0 || cfg.Log.Perf.MaxBytes < 0 {
 		return cfg, path, errors.New("log.perf interval_seconds and max_bytes must not be negative")
+	}
+	if cfg.Log.Enabled && cfg.Log.Perf.Enabled {
+		if err := validateLogFiles(cfg.Log.File, cfg.Log.Perf.File); err != nil {
+			return cfg, path, err
+		}
 	}
 	cfg.ApplyDefaults()
 	// Load starts with defaults, so zero here is an explicitly invalid limit,
@@ -485,6 +522,55 @@ func Load() (Config, string, error) {
 		return cfg, path, err
 	}
 	return cfg, path, nil
+}
+
+func validateLogFiles(serverFile, perfFile string) error {
+	paths := [4]string{serverFile, serverFile + ".1", perfFile, perfFile + ".1"}
+	var resolved [4]string
+	var info [4]os.FileInfo
+	for i, path := range paths {
+		var err error
+		resolved[i], err = resolveLogPath(path)
+		if err != nil {
+			return errors.New("invalid log file path")
+		}
+		info[i], err = os.Stat(path)
+		if err != nil && !os.IsNotExist(err) {
+			return errors.New("invalid log file path")
+		}
+	}
+	for i := 0; i < 2; i++ {
+		for j := 2; j < 4; j++ {
+			if resolved[i] == resolved[j] || (info[i] != nil && info[j] != nil && os.SameFile(info[i], info[j])) {
+				return errors.New("log.file and log.perf.file must not overlap, including rotation backups")
+			}
+		}
+	}
+	return nil
+}
+
+func resolveLogPath(path string) (string, error) {
+	var suffix string
+	for {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err == nil {
+			return filepath.Abs(filepath.Join(resolved, suffix))
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		// A dangling symlink could target a log created later during startup.
+		if _, statErr := os.Lstat(path); statErr == nil {
+			return "", err
+		}
+		// Resolve the existing ancestor even when the log directory is not created yet.
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", err
+		}
+		suffix = filepath.Join(filepath.Base(path), suffix)
+		path = parent
+	}
 }
 
 // ApplyDefaults merges the legacy "aily" alias section and fills

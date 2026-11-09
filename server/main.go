@@ -11,6 +11,7 @@ import (
 
 	"github.com/alibabacloud/data-agent-mcp-server/internal/config"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/dataagent"
+	"github.com/alibabacloud/data-agent-mcp-server/internal/logging"
 	mcpserver "github.com/alibabacloud/data-agent-mcp-server/internal/mcp"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/perf"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/session"
@@ -27,7 +28,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (err error) {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -41,6 +42,24 @@ func run() error {
 	transport := os.Getenv("MCP_TRANSPORT")
 	if err := cfg.ValidateTransport(transport); err != nil {
 		return fmt.Errorf("configuration error: %w", err)
+	}
+	if cfg.Log.Enabled {
+		output, openErr := logging.Open(cfg.Log.File, cfg.Log.MaxBytes)
+		if openErr != nil {
+			return fmt.Errorf("log file initialization failed: %w", openErr)
+		}
+		previous := log.Writer()
+		log.SetOutput(output)
+		defer func() {
+			if err != nil {
+				log.Printf("MCP server stopped: %v", err)
+			}
+			log.SetOutput(previous)
+			if output.Close() != nil {
+				log.Print("MCP log file close failed")
+			}
+		}()
+		log.Printf("MCP log enabled file=%q max_bytes=%d", cfg.Log.File, cfg.Log.MaxBytes)
 	}
 	remote := transport == "sse" || transport == "streamable-http"
 	provider, err := dataagent.NewCredentialProvider()

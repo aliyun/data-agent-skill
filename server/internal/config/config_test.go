@@ -20,11 +20,13 @@ func clearEnv(t *testing.T) {
 		"DATA_AGENT_ENDPOINT", "DATA_AGENT_DMS_ENTERPRISE_ENDPOINT", "DATA_AGENT_CUSTOM_AGENT_ID",
 		"IDENTITY_SHARED_SECRET", "IDENTITY_AUTH_TOKEN", "IDENTITY_JWT_SECRET", "IDENTITY_JWT_SECRETS",
 		"IDENTITY_SESSION_NAME_PREFIX", "DATA_AGENT_LOG_REQUESTS", "MCP_TRANSPORT",
+		"DATA_AGENT_LOG", "DATA_AGENT_LOG_FILE", "DATA_AGENT_LOG_MAX_BYTES",
 		"DATA_AGENT_PERF_LOG", "DATA_AGENT_PERF_LOG_FILE", "DATA_AGENT_PERF_LOG_INTERVAL",
 	} {
 		t.Setenv(k, "")
 	}
 	os.Unsetenv("IDENTITY_SESSION_NAME_PREFIX")
+	os.Unsetenv("DATA_AGENT_LOG_FILE")
 	t.Setenv("DATA_AGENT_CONFIG", filepath.Join(t.TempDir(), "missing-config.yaml"))
 }
 
@@ -38,6 +40,268 @@ func TestLoadUsesBuddyRegion(t *testing.T) {
 	}
 	if cfg.Region != "cn-shanghai" {
 		t.Fatalf("Region = %q, want cn-shanghai", cfg.Region)
+	}
+}
+
+func TestLogConfig(t *testing.T) {
+	clearEnv(t)
+	defaultFile := filepath.Join(homeDir(), ".data-agent", "server.log")
+	cfg, _, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Log.Enabled || cfg.Log.File != defaultFile || cfg.Log.MaxBytes != 64<<20 {
+		t.Fatalf("unexpected log defaults: %+v", cfg.Log)
+	}
+
+	t.Setenv("DATA_AGENT_LOG", "1")
+	cfg, _, err = Load()
+	if err != nil || !cfg.Log.Enabled || cfg.Log.File != defaultFile || cfg.Log.MaxBytes != 64<<20 {
+		t.Fatalf("flag alone must enable default file logging: %+v, %v", cfg.Log, err)
+	}
+	t.Setenv("DATA_AGENT_LOG", "")
+	writeConfig(t, "log:\n  enabled: true\n  file: ~/server-from-yaml.log\n  max_bytes: 1024\n")
+	cfg, _, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Log.Enabled || cfg.Log.File != filepath.Join(homeDir(), "server-from-yaml.log") || cfg.Log.MaxBytes != 1024 {
+		t.Fatalf("yaml log section not applied: %+v", cfg.Log)
+	}
+
+	t.Setenv("DATA_AGENT_LOG", "0")
+	t.Setenv("DATA_AGENT_LOG_FILE", "~/server-from-env.log")
+	t.Setenv("DATA_AGENT_LOG_MAX_BYTES", "2048")
+	cfg, _, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Log.Enabled || cfg.Log.File != filepath.Join(homeDir(), "server-from-env.log") || cfg.Log.MaxBytes != 2048 {
+		t.Fatalf("env override not applied: %+v", cfg.Log)
+	}
+
+	t.Setenv("DATA_AGENT_LOG", "1")
+	t.Setenv("DATA_AGENT_LOG_FILE", "")
+	cfg, _, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Log.Enabled || cfg.Log.File != defaultFile || cfg.Log.MaxBytes != 2048 {
+		t.Fatalf("empty file must use the default path without disabling logging: %+v", cfg.Log)
+	}
+}
+
+func TestLogEnabledEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		enabled bool
+	}{
+		{"1", true}, {"true", true}, {"ON", true}, {" True ", true},
+		{"0", false}, {"false", false}, {"OFF", false}, {" False ", false},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			clearEnv(t)
+			writeConfig(t, fmt.Sprintf("log:\n  enabled: %t\n", !tc.enabled))
+			t.Setenv("DATA_AGENT_LOG", tc.value)
+			cfg, _, err := Load()
+			if err != nil || cfg.Log.Enabled != tc.enabled {
+				t.Fatalf("flag override: enabled=%t error=%v", cfg.Log.Enabled, err)
+			}
+		})
+	}
+	for _, value := range []string{"2", "invalid-sensitive-flag", "   "} {
+		t.Run("invalid/"+value, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("DATA_AGENT_LOG", value)
+			if _, _, err := Load(); err == nil || strings.Contains(err.Error(), value) {
+				t.Fatalf("expected sanitized flag error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestLogFileDoesNotEnableLogging(t *testing.T) {
+	clearEnv(t)
+	writeConfig(t, "log:\n  file: ~/custom.log\n")
+	cfg, _, err := Load()
+	if err != nil || cfg.Log.Enabled {
+		t.Fatalf("path alone must not enable file logging: %+v, %v", cfg.Log, err)
+	}
+	t.Setenv("DATA_AGENT_LOG_FILE", "~/custom-env.log")
+	cfg, _, err = Load()
+	if err != nil || cfg.Log.Enabled {
+		t.Fatalf("environment path alone must not enable file logging: %+v, %v", cfg.Log, err)
+	}
+}
+
+func TestLogMaxBytesValidation(t *testing.T) {
+	for _, source := range []string{"yaml", "env"} {
+		for _, tc := range []struct {
+			name, value string
+			want        int64
+		}{
+			{"zero", "0", 0},
+			{"negative", "-1", 0},
+			{"string", "sensitive-invalid-limit", 0},
+			{"quoted integer", "\"1024\"", 0},
+			{"overflow", "9223372036854775808", 0},
+			{"underflow", "-9223372036854775809", 0},
+			{"minimum", "1", 1},
+			{"maximum", "9223372036854775807", 1<<63 - 1},
+		} {
+			t.Run(source+"/"+tc.name, func(t *testing.T) {
+				clearEnv(t)
+				if source == "yaml" {
+					writeConfig(t, "log:\n  max_bytes: "+tc.value+"\n")
+				} else {
+					writeConfig(t, "log:\n  max_bytes: 1024\n")
+					t.Setenv("DATA_AGENT_LOG_MAX_BYTES", tc.value)
+				}
+				cfg, _, err := Load()
+				if tc.want == 0 {
+					if err == nil || strings.Contains(err.Error(), strings.Trim(tc.value, "\"")) {
+						t.Fatalf("expected sanitized invalid limit error, got %v", err)
+					}
+				} else if err != nil || cfg.Log.MaxBytes != tc.want {
+					t.Fatalf("max_bytes = %d, want %d; error: %v", cfg.Log.MaxBytes, tc.want, err)
+				}
+			})
+		}
+	}
+}
+
+func TestLogPerfPathConflicts(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "sensitive-log-path.log")
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(dir, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, file, perfFile string
+		enabled, conflict    bool
+	}{
+		{"same file", file, file, true, true},
+		{"normalized file", file + "/../sensitive-log-path.log", file, true, true},
+		{"relative file", relative, file, true, true},
+		{"server backup", file, file + ".1", true, true},
+		{"perf backup", file + ".1", file, true, true},
+		{"normalized server backup", relative, file + "/../sensitive-log-path.log.1", true, true},
+		{"normalized perf backup", file + "/../sensitive-log-path.log.1", relative, true, true},
+		{"expanded home", "~/sensitive-log-path.log", filepath.Join(homeDir(), "sensitive-log-path.log"), true, true},
+		{"default perf file", "~/.data-agent/perf.log", "", true, true},
+		{"different files", file, file + ".perf", true, false},
+		{"same file disabled", file, file, false, false},
+		{"backup disabled", file + ".1", file, false, false},
+		{"default server file", "", file, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			writeConfig(t, fmt.Sprintf("log:\n  enabled: true\n  file: %q\n  perf:\n    enabled: %v\n    file: %q\n", tc.file, tc.enabled, tc.perfFile))
+			cfg, _, err := Load()
+			if tc.conflict {
+				if err == nil || err.Error() != "log.file and log.perf.file must not overlap, including rotation backups" {
+					t.Fatalf("expected sanitized path conflict error, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			} else {
+				wantFile := expandHome(tc.file)
+				if wantFile == "" {
+					wantFile = filepath.Join(homeDir(), ".data-agent", "server.log")
+				}
+				if !cfg.Log.Enabled || cfg.Log.File != wantFile || cfg.Log.Perf.Enabled != tc.enabled || cfg.Log.MaxBytes != DefaultLogMaxBytes {
+					t.Fatalf("unexpected log configuration: %+v", cfg.Log)
+				}
+			}
+		})
+	}
+}
+
+func TestLogAndPerfSwitchesAreIndependent(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		for _, perfEnabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("log=%t/perf=%t", enabled, perfEnabled), func(t *testing.T) {
+				clearEnv(t)
+				writeConfig(t, fmt.Sprintf("log:\n  enabled: %t\n  perf:\n    enabled: %t\n    file: ~/.data-agent/server.log\n", enabled, perfEnabled))
+				cfg, _, err := Load()
+				if enabled && perfEnabled {
+					if err == nil || !strings.Contains(err.Error(), "must not overlap") {
+						t.Fatalf("enabled default log path must be protected: %v", err)
+					}
+				} else if err != nil || cfg.Log.Enabled != enabled || cfg.Log.Perf.Enabled != perfEnabled {
+					t.Fatalf("disabled output must not conflict: %+v, %v", cfg.Log, err)
+				}
+			})
+		}
+	}
+}
+
+func TestLogPerfHardLinkConflicts(t *testing.T) {
+	for _, tc := range []struct{ serverSuffix, perfSuffix string }{{"", ""}, {".1", ""}, {"", ".1"}, {".1", ".1"}} {
+		t.Run(tc.serverSuffix+"/"+tc.perfSuffix, func(t *testing.T) {
+			clearEnv(t)
+			dir := t.TempDir()
+			serverFile, perfFile := filepath.Join(dir, "server.log"), filepath.Join(dir, "perf.log")
+			if err := os.WriteFile(serverFile+tc.serverSuffix, []byte("unchanged"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Link(serverFile+tc.serverSuffix, perfFile+tc.perfSuffix); err != nil {
+				t.Fatal(err)
+			}
+			writeConfig(t, fmt.Sprintf("log:\n  enabled: true\n  file: %q\n  perf:\n    enabled: true\n    file: %q\n", serverFile, perfFile))
+			if _, _, err := Load(); err == nil || err.Error() != "log.file and log.perf.file must not overlap, including rotation backups" {
+				t.Fatalf("hard-linked logs must be rejected: %v", err)
+			}
+			data, err := os.ReadFile(serverFile + tc.serverSuffix)
+			if err != nil || string(data) != "unchanged" {
+				t.Fatal("validation modified the existing log")
+			}
+		})
+	}
+}
+
+func TestLogPerfDirectoryAliasConflicts(t *testing.T) {
+	for _, tc := range []struct{ subdir, suffix string }{{"", ""}, {"future/nested", ""}, {"future/nested", ".1"}} {
+		t.Run(tc.subdir+tc.suffix, func(t *testing.T) {
+			clearEnv(t)
+			dir := t.TempDir()
+			real, alias := filepath.Join(dir, "real"), filepath.Join(dir, "alias")
+			if err := os.Mkdir(real, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, alias); err != nil {
+				if os.IsPermission(err) {
+					t.Skip("symlink creation not permitted")
+				}
+				t.Fatal(err)
+			}
+			serverFile := filepath.Join(real, tc.subdir, "server.log")
+			perfFile := filepath.Join(alias, tc.subdir, "server.log") + tc.suffix
+			writeConfig(t, fmt.Sprintf("log:\n  enabled: true\n  file: %q\n  perf:\n    enabled: true\n    file: %q\n", serverFile, perfFile))
+			if _, _, err := Load(); err == nil || err.Error() != "log.file and log.perf.file must not overlap, including rotation backups" {
+				t.Fatalf("aliased log paths must be rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestLogPerfDanglingAliasRejected(t *testing.T) {
+	clearEnv(t)
+	dir := t.TempDir()
+	serverFile, perfFile := filepath.Join(dir, "server.log"), filepath.Join(dir, "perf.log")
+	if err := os.Symlink(serverFile, perfFile); err != nil {
+		if os.IsPermission(err) {
+			t.Skip("symlink creation not permitted")
+		}
+		t.Fatal(err)
+	}
+	writeConfig(t, fmt.Sprintf("log:\n  enabled: true\n  file: %q\n  perf:\n    enabled: true\n    file: %q\n", serverFile, perfFile))
+	if _, _, err := Load(); err == nil || err.Error() != "invalid log file path" {
+		t.Fatalf("dangling log alias must be rejected: %v", err)
 	}
 }
 

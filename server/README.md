@@ -311,10 +311,71 @@ Key environment variables:
 | `DATA_AGENT_CONFIG` | Explicit config.yaml path |
 | `DATA_AGENT_WORKSPACE_ID` | Default workspace (empty = auto-discovery) |
 | `DATA_AGENT_WAIT_CAP` | Blocking-wait ceiling in seconds (default 55, chosen to stay under nginx's default 60s `proxy_read_timeout`) |
+| `DATA_AGENT_LOG` | `1`/`true`/`on` enables ordinary file logging; default disabled (stderr) |
+| `DATA_AGENT_LOG_FILE` | Optional server/request log path (default `~/.data-agent/server.log`; `~/` supported) |
+| `DATA_AGENT_LOG_MAX_BYTES` | Positive byte limit before rotation (default 67108864 = 64 MiB) |
 | `DATA_AGENT_LOG_REQUESTS` | Per-call logging: `basic` / `full` / `off` |
 | `DATA_AGENT_PERF_LOG` | `1`/`true` enables the periodic performance sampler (see below) |
 | `DATA_AGENT_PERF_LOG_FILE` | Perf log path (default `~/.data-agent/perf.log`) |
 | `DATA_AGENT_PERF_LOG_INTERVAL` | Sampling period in seconds (default 30) |
+
+### Server and request logs
+
+Ordinary server/runtime and request logs go to **stderr by default**, never
+stdout. Enable rotating file output with just one environment variable:
+
+```bash
+export DATA_AGENT_LOG=1
+# Restart using your existing server command and transport/port configuration.
+```
+
+No path or size setting is required: the defaults are `~/.data-agent/server.log`
+and **64 MiB** with one `.1` backup. `DATA_AGENT_LOG_FILE` and
+`DATA_AGENT_LOG_MAX_BYTES` are optional overrides; setting a path alone does not
+enable file logging. Ordinary file logging and performance sampling have separate
+switches: set both `DATA_AGENT_LOG=1` and `DATA_AGENT_PERF_LOG=1` to enable both.
+
+Or merge these settings into the existing `log` section of your config.yaml
+(do not add a second `log` key; only `enabled: true` is needed):
+
+```yaml
+log:
+  enabled: true
+  file: ~/.data-agent/server.log
+  max_bytes: 67108864
+```
+
+Environment variables override YAML. Set `DATA_AGENT_LOG=0` (`false`/`off` also
+work) or `log.enabled: false` and restart to restore stderr. An empty
+`DATA_AGENT_LOG_FILE` resets the path to its default, not the switch. Keep all
+existing transport, port, credentials and identity settings: logging does not
+enable HTTP or change authentication. For systemd or containers, set the
+variables in the service environment and restart it.
+
+The server appends to an existing regular file. At the default **64 MiB** limit,
+it moves the log to `<file>.1`, retaining one backup. Set `log.max_bytes` or
+`DATA_AGENT_LOG_MAX_BYTES` to a positive byte count to adjust the limit. On POSIX,
+new files use `0600` and new directories use `0700`; existing permissions are not changed.
+Symlink log files and, on POSIX, group/world-accessible existing logs are rejected.
+Use a trusted directory writable by the service account, with one server process
+per log file; do not combine this with external file rotation. A single oversized
+record is kept intact and can exceed the size limit.
+
+If the configured file cannot be opened at startup, the server reports the error
+to stderr and exits. If later writes or rotation fail, ordinary logging falls
+back to stderr, never stdout, and retries file output on subsequent writes.
+Configuration errors before logging is initialized still go to stderr.
+
+Request detail remains controlled by `log.requests` / `DATA_AGENT_LOG_REQUESTS`:
+`basic` by default remotely, `off` by default under stdio. `full` includes redacted
+arguments for existing tools but may contain business questions; use it for
+short troubleshooting, not routine operation. Existing credential-redaction,
+identity-safety and gateway logging restrictions still apply.
+
+Ordinary logs and the performance sampler below are independent. When both use
+files, their current paths and `<file>.1` backup paths must not overlap. Startup
+checks normalized paths, existing directory symlinks and hard-linked files to
+prevent mixed output or one writer rotating the other's data.
 
 ### Performance log
 
@@ -347,8 +408,9 @@ deployments, `MCP_TRANSPORT` and `MCP_PORT` must still be set as described above
 enabling perf does not enable HTTP or change authentication. With systemd or a
 container, set these variables in the service environment and restart it.
 
-**Confirm collection:** startup stderr contains `perf log enabled`, and the
-configured file receives JSON lines starting with an `"event":"start"` record:
+**Confirm collection:** the server log (stderr or the configured log file)
+contains `perf log enabled` at startup, and the performance file receives JSON
+lines starting with an `"event":"start"` record:
 
 ```bash
 tail -n 1 "$HOME/.data-agent/perf.log"
@@ -361,7 +423,8 @@ account can write to the log directory. To disable, set `enabled: false` or
 `DATA_AGENT_PERF_LOG=0` and restart; an environment override takes precedence.
 
 The sampler appends one JSON object per line to a dedicated file, separate from
-stderr, so a production stall can be reconstructed afterwards. Each record carries:
+ordinary server/request logs, so a production stall can be reconstructed
+afterwards. Each record carries:
 
 | Section | Contents |
 |---|---|

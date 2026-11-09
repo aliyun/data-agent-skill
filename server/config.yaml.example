@@ -64,11 +64,17 @@ http:
 # Blocking waits retain DATA_AGENT_WAIT_CAP (default 55 seconds). Configure proxy
 # and client timeouts above it; do not apply a short timeout to the whole stream.
 log:
+  # DATA_AGENT_LOG=1 alone enables file output; disabled = stderr, never stdout.
+  # Rotate to <file>.1 (one backup); must not overlap perf's file or backup.
+  # Optional overrides: DATA_AGENT_LOG_FILE, DATA_AGENT_LOG_MAX_BYTES.
+  enabled: false
+  file: ~/.data-agent/server.log
+  max_bytes: 67108864            # 64 MiB; must be positive
   # basic: tool, verified caller, outcome, duration; full adds redacted arguments
   # for OLD tools (may include business questions); use only for diagnostics.
   # off: no per-call logging. Empty: basic remotely, off under stdio.
-  # Logs go to stderr, with single-line escaping and output budgets. Gateway full
-  # still excludes parameters, returned data and raw errors; never log credentials.
+  # Request logs use single-line escaping and output budgets. Gateway full still
+  # excludes parameters, returned data and raw errors; never log credentials.
   # Env: DATA_AGENT_LOG_REQUESTS.
   requests: ""
   # Periodic performance sampler: host (Linux /proc), process, Go runtime

@@ -1,11 +1,181 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestLoggingSubprocess(t *testing.T) {
+	if os.Getenv("MCP_LOG_TEST_HELPER") != "1" {
+		return
+	}
+	main()
+	os.Exit(0)
+}
+
+func loggingCommand(t *testing.T, dir string) *exec.Cmd {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
+	cmd := exec.CommandContext(ctx, executable, "-test.run=^TestLoggingSubprocess$")
+	cmd.Dir = dir
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + dir,
+		"MCP_LOG_TEST_HELPER=1",
+		"MCP_TRANSPORT=stdio",
+		"DATA_AGENT_CONFIG=" + filepath.Join(dir, "missing.yaml"),
+		"DATA_AGENT_ENV_FILE=" + filepath.Join(dir, "missing.env"),
+		"DATA_AGENT_SESSIONS_DIR=" + filepath.Join(dir, "sessions"),
+		"DATA_AGENT_LOG_REQUESTS=basic",
+		"ALIBABA_CLOUD_ACCESS_KEY_ID=synthetic-log-test-ak",
+		"ALIBABA_CLOUD_ACCESS_KEY_SECRET=synthetic-log-test-sk",
+	}
+	return cmd
+}
+
+func TestStdioLoggingDestinationAndRotation(t *testing.T) {
+	for _, tc := range []struct {
+		name, flag             string
+		customPath, fileOutput bool
+	}{
+		{"stderr default", "", false, false},
+		{"custom path alone", "", true, false},
+		{"disabled custom path", "0", true, false},
+		{"enabled default path", "1", false, true},
+		{"enabled custom path", "true", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			logPath := filepath.Join(dir, ".data-agent", "server.log")
+			perfPath := filepath.Join(dir, "perf.log")
+			cmd := loggingCommand(t, dir)
+			cmd.Env = append(cmd.Env, "DATA_AGENT_LOG="+tc.flag)
+			if tc.customPath {
+				logPath = filepath.Join(dir, "server.log")
+				cmd.Env = append(cmd.Env, "DATA_AGENT_LOG_FILE="+logPath)
+			}
+			if tc.fileOutput {
+				cmd.Env = append(cmd.Env, "DATA_AGENT_LOG_MAX_BYTES=1024",
+					"DATA_AGENT_PERF_LOG=1", "DATA_AGENT_PERF_LOG_FILE="+perfPath)
+			}
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = stdin.Close(); _ = cmd.Wait() }()
+			decoder := json.NewDecoder(stdout)
+			request := func(body string) {
+				t.Helper()
+				if _, err := io.WriteString(stdin, body+"\n"); err != nil {
+					t.Fatal(err)
+				}
+				var response struct {
+					JSONRPC string          `json:"jsonrpc"`
+					Error   json.RawMessage `json:"error"`
+					Result  struct {
+						IsError bool `json:"isError"`
+					} `json:"result"`
+				}
+				if err := decoder.Decode(&response); err != nil {
+					t.Fatalf("MCP stdout is not a JSON response: %v", err)
+				}
+				if response.JSONRPC != "2.0" || len(response.Error) != 0 || response.Result.IsError {
+					t.Fatal("MCP request failed")
+				}
+			}
+			request(`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"log-test","version":"1"}}}`)
+			for i := 1; i <= 16; i++ {
+				request(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"data_agent_list_sessions","arguments":{}}}`, i))
+			}
+			_ = stdin.Close()
+			if err := cmd.Wait(); err != nil {
+				t.Fatalf("server exit: %v; stderr=%s", err, stderr.String())
+			}
+			if !tc.fileOutput {
+				if !strings.Contains(stderr.String(), "data_agent_list_sessions") {
+					t.Fatal("default request logs must go to stderr")
+				}
+				if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+					t.Fatal("unconfigured file log was created")
+				}
+				return
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("file logs leaked to stderr: %s", stderr.String())
+			}
+			for _, path := range []string{logPath, logPath + ".1"} {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(data) > 1024 || !bytes.Contains(data, []byte("data_agent_list_sessions")) {
+					t.Fatalf("missing request logs or invalid rotated size: %d", len(data))
+				}
+				if bytes.Contains(data, []byte("synthetic-log-test-")) {
+					t.Fatal("log exposed credentials")
+				}
+			}
+			data, err := os.ReadFile(perfPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, line := range bytes.Split(bytes.TrimSpace(data), []byte{'\n'}) {
+				var record map[string]any
+				if err := json.Unmarshal(line, &record); err != nil || record["runtime"] == nil {
+					t.Fatal("ordinary logging corrupted the independent perf log")
+				}
+			}
+		})
+	}
+}
+
+func TestFileLoggingCapturesStartupFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "sessions"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(dir, ".data-agent", "server.log")
+	cmd := loggingCommand(t, dir)
+	cmd.Env = append(cmd.Env, "DATA_AGENT_LOG=1")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatal("startup failure must produce a nonzero exit")
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte("session storage initialization failed")) || !strings.Contains(stderr.String(), "session storage initialization failed") {
+		t.Fatal("startup failure must reach the log file and stderr")
+	}
+	if stdout.Len() != 0 {
+		t.Fatal("startup diagnostics contaminated protocol stdout")
+	}
+}
 
 func TestRemoteStartupRejectsUnsafeConfiguration(t *testing.T) {
 	for _, tc := range []struct {
