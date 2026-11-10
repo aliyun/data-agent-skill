@@ -145,10 +145,127 @@ func TestMappingScopeMigrationValidation(t *testing.T) {
 			c := remoteConfig()
 			c.Identity.JWT = JWT{Enabled: jwtMode, Secret: "synthetic-key"}
 			c.Identity.Default = &IdentityGroup{RoleArn: "role", TenantID: scope[0], AgentID: scope[1]}
-			valid := jwtMode && scope[0] == "tenant" && scope[1] == "agent" || !jwtMode && scope == [2]string{}
+			valid := scope == [2]string{} || jwtMode && scope[0] == "tenant" && scope[1] == "agent"
 			if err := c.ValidateTransport("sse"); (err == nil) != valid {
 				t.Fatalf("JWT=%v scope=%v: %v", jwtMode, scope, err)
 			}
+		}
+	}
+}
+
+func TestLegacyJWTSharedMappings(t *testing.T) {
+	c := remoteConfig()
+	c.Identity.JWT = JWT{Enabled: true, Secret: "synthetic-key"}
+	c.Identity.Groups = map[string]IdentityGroup{
+		"analysts": {RoleArn: "group-role", Users: []string{"member"}},
+	}
+	c.Identity.Default = &IdentityGroup{RoleArn: "default-role"}
+	if err := c.ValidateTransport("streamable-http"); err != nil {
+		t.Fatal(err)
+	}
+	for _, scope := range [][2]string{{"tenant-a", "agent-a"}, {"tenant-b", "agent-b"}} {
+		for _, user := range []string{"member", "other"} {
+			want := "default"
+			if user == "member" {
+				want = "analysts"
+			}
+			name, _, err := c.ResolveGroup(IdentityClaims{AuthMode: "jwt", TenantID: scope[0], AgentID: scope[1], UserID: user})
+			if err != nil || name != want {
+				t.Fatalf("legacy mapping: name=%q error=%v", name, err)
+			}
+		}
+	}
+	for _, claims := range []IdentityClaims{
+		{AuthMode: "headers", UserID: "member"},
+		{AuthMode: "jwt", UserID: "member"},
+		{AuthMode: "jwt", UserID: "member", TenantID: "t"},
+	} {
+		if _, _, err := c.ResolveGroup(claims); err == nil {
+			t.Fatal("legacy mapping must not accept missing verified scope or unsigned headers")
+		}
+	}
+	c.Identity.Groups["duplicate"] = IdentityGroup{RoleArn: "other", Users: []string{"member"}}
+	if !errors.Is(c.ValidateTransport("sse"), ErrIdentityGroupConflict) {
+		t.Fatal("duplicate shared user accepted")
+	}
+	delete(c.Identity.Groups, "duplicate")
+	c.Identity.Groups["cross-field"] = IdentityGroup{RoleArn: "other", Users: []string{"member@example.com"}}
+	if _, _, err := c.ResolveGroup(IdentityClaims{AuthMode: "jwt", TenantID: "t", AgentID: "a", UserID: "member", Email: "member@example.com"}); !errors.Is(err, ErrIdentityGroupConflict) {
+		t.Fatal("ambiguous shared identity accepted")
+	}
+	c.Identity.Default = nil
+	if _, _, err := c.ResolveGroup(IdentityClaims{AuthMode: "jwt", TenantID: "t", AgentID: "a", UserID: "unknown"}); !errors.Is(err, ErrIdentityUnmapped) {
+		t.Fatal("unmapped shared user accepted")
+	}
+}
+
+func TestMixedScopeRulesAreRejected(t *testing.T) {
+	for _, defaultScoped := range []bool{false, true} {
+		c := remoteConfig()
+		c.Identity.JWT = JWT{Enabled: true, Secret: "synthetic-key"}
+		shared := IdentityGroup{RoleArn: "shared-role", Users: []string{"member"}}
+		scoped := IdentityGroup{RoleArn: "scoped-role", TenantID: "t", AgentID: "a", Users: []string{"member"}}
+		if defaultScoped {
+			c.Identity.Default = &scoped
+			c.Identity.Groups = map[string]IdentityGroup{"shared": shared}
+		} else {
+			c.Identity.Default = &shared
+			c.Identity.Groups = map[string]IdentityGroup{"scoped": scoped}
+		}
+		if err := c.ValidateTransport("sse"); err == nil || !strings.Contains(err.Error(), "do not mix") {
+			t.Fatalf("mixed rule modes accepted: %v", err)
+		}
+	}
+}
+
+func TestLoadLegacyIdentityDefaults(t *testing.T) {
+	for _, section := range []string{"identity", "aily"} {
+		clearEnv(t)
+		t.Setenv("MCP_TRANSPORT", "streamable-http")
+		writeConfig(t, section+":\n  enabled: true\n  auth_token: synthetic-platform\n  jwt: {enabled: true, secret: synthetic-key}\n  default: {role_arn: default-role}\n  groups:\n    analysts: {role_arn: group-role, users: [member]}\napi_key: ''\napi_key_endpoint: old-control.example\n")
+		cfg, _, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Identity.Namespace != "default" || !cfg.Identity.RequireIdentity {
+			t.Fatal("missing legacy namespace/require_identity defaults")
+		}
+		cfg.Identity.Namespace = "existing-trust-domain"
+		cfg.ApplyDefaults()
+		if cfg.Identity.Namespace != "existing-trust-domain" {
+			t.Fatal("explicit namespace replaced")
+		}
+		cfg.Identity.RequireIdentity = false
+		if err := cfg.ValidateTransport("sse"); err == nil {
+			t.Fatal("anonymous fallback restored")
+		}
+	}
+}
+
+func TestLoadLegacyDefaultWithoutGroups(t *testing.T) {
+	for _, section := range []string{"identity", "aily"} {
+		for _, groups := range []string{"", "  groups: {}\n", "  groups: null\n"} {
+			t.Run(section+"/"+strings.TrimSpace(groups), func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("MCP_TRANSPORT", "streamable-http")
+				writeConfig(t, section+":\n  enabled: true\n  auth_token: synthetic-platform\n  jwt: {enabled: true, secret: synthetic-key}\n  default: {role_arn: default-role}\n"+groups)
+				cfg, _, err := Load()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(cfg.Identity.Groups) != 0 || cfg.Identity.Default == nil {
+					t.Fatal("default-only configuration must not require or create groups")
+				}
+				for _, claims := range []IdentityClaims{
+					{AuthMode: "jwt", TenantID: "tenant-a", AgentID: "agent-a", UserID: "user-a"},
+					{AuthMode: "jwt", TenantID: "tenant-b", AgentID: "agent-b", Email: "user@example.com"},
+				} {
+					name, mapped, err := cfg.ResolveGroup(claims)
+					if err != nil || name != "default" || mapped.RoleArn != "default-role" {
+						t.Fatalf("default-only mapping failed: %q, %v", name, err)
+					}
+				}
+			})
 		}
 	}
 }

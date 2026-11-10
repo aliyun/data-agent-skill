@@ -41,6 +41,7 @@ const (
 	CatRequestDatasource   = "request_datasource"
 	CatRecommendedQuestion = "recommended_question"
 	CatLLM                 = "llm"
+	CatAgentReply          = "agent_reply"
 	CatThink               = "think"
 )
 

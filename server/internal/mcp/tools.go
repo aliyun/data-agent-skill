@@ -171,12 +171,25 @@ func (s *Server) handleCreateSession(ctx context.Context, req mcp.CallToolReques
 		return mcp.NewToolResultError("plan_mode must be 'force' or 'disable'"), nil
 	}
 
+	workMode := ""
+	if value, supplied := req.GetArguments()["work_mode"]; supplied {
+		text, ok := value.(string)
+		if !ok {
+			return mcp.NewToolResultError("work_mode must be a string: ANALYSIS or CHAT"), nil
+		}
+		workMode = strings.ToUpper(strings.TrimSpace(text))
+		if workMode != "" && workMode != "ANALYSIS" && workMode != "CHAT" {
+			return mcp.NewToolResultError("work_mode must be ANALYSIS or CHAT"), nil
+		}
+	}
+
 	opts := session.CreateOpts{
 		DatabaseID:    dbID,
 		DbName:        dbName,
 		Tables:        tables,
 		Query:         query,
 		Mode:          mode,
+		WorkMode:      workMode,
 		PlanMode:      planMode,
 		AutoConfirm:   autoConfirm,
 		InstanceID:    argStr(req, "instance_id"),

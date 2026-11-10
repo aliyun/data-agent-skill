@@ -12,6 +12,40 @@ import (
 	"github.com/alibabacloud/data-agent-mcp-server/internal/event"
 )
 
+func TestStreamOncePreservesChatAgentReply(t *testing.T) {
+	const reply = "分析权限快照缺失或不匹配，未执行查询。"
+	for _, wire := range []string{"data", "delta", "standalone", "unfinished"} {
+		t.Run(wire, func(t *testing.T) {
+			payload, _ := json.Marshal(map[string]string{"content": reply})
+			events := []dataagent.SSEEvent{eventWithCheckpoint("chat_start", "chat", "", 1)}
+			if wire != "standalone" {
+				events = append(events, eventWithCheckpoint("content_start", "agent_reply", "", 2))
+			}
+			if wire == "delta" {
+				mid := len(payload) / 2
+				events = append(events, eventWithCheckpoint("delta", "agent_reply", string(payload[:mid]), 3), eventWithCheckpoint("delta", "agent_reply", string(payload[mid:]), 4))
+			} else {
+				events = append(events, eventWithCheckpoint("data", "agent_reply", string(payload), 4))
+			}
+			if wire != "unfinished" {
+				events = append(events, eventWithCheckpoint("content_finish", "agent_reply", "", 4))
+			}
+			events = append(events, eventWithCheckpoint("chat_finish", "chat", "{}", 5))
+			state := &State{SessionID: "chat-session", AgentID: "agent", Status: StatusRunning, Mode: "lite"}
+			watcher := &Watcher{state: state, store: testStore(t), client: fakeWatcherClient{events: events}}
+			finished, failed := watcher.streamOnce(context.Background())
+			snap := state.Snapshot()
+			if !finished || failed || snap.Status != StatusCompleted || len(snap.Conclusions) != 1 || snap.Conclusions[0] != reply {
+				t.Fatalf("CHAT response lost or duplicated: %+v", snap)
+			}
+			watcher.streamOnce(context.Background())
+			if len(state.Snapshot().Conclusions) != 1 {
+				t.Fatal("CHAT replay duplicated the reply")
+			}
+		})
+	}
+}
+
 func TestStreamOnceUsesLLMDeltaAsASKDataConclusionFallback(t *testing.T) {
 	state := &State{
 		SessionID: "session-1",

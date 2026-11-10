@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -196,6 +197,109 @@ func TestManagerSessionOperationConcurrentReacquisition(t *testing.T) {
 	assertNoSessionOperations(t, m)
 }
 
+func TestManagerCreateSessionWorkMode(t *testing.T) {
+	for _, tc := range []struct {
+		name, workMode, wireMode string
+	}{
+		{name: "omitted"},
+		{name: "analysis", workMode: "ANALYSIS", wireMode: "analysis"},
+		{name: "chat", workMode: "CHAT", wireMode: "chat"},
+	} {
+		for _, autoConfirm := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/auto_confirm=%t", tc.name, autoConfirm), func(t *testing.T) {
+				opts := CreateOpts{
+					DatabaseID: "db1", DbName: "analytics", Tables: []string{"sales"}, Query: "initial",
+					Mode: "pro", PlanMode: "disable", WorkMode: tc.workMode, AutoConfirm: autoConfirm,
+					WorkspaceID: "custom-workspace", CustomAgentID: "custom-agent",
+				}
+				var actions []string
+				var m *Manager
+				m = newLifecycleManager(t, func(req *http.Request) (*http.Response, error) {
+					params := req.URL.Query()
+					action := params.Get("Action")
+					actions = append(actions, action)
+					if params.Get("WorkspaceId") != opts.WorkspaceID || params.Has("WorkMode") {
+						t.Fatal("request lost workspace or sent a top-level WorkMode")
+					}
+					wantCfg := map[string]interface{}{"Language": "CHINESE", "Mode": opts.Mode, "PlanMode": opts.PlanMode}
+					response := `{"Success":true}`
+					switch action {
+					case "CreateDataAgentSession":
+						if params.Get("DatabaseId") != opts.DatabaseID {
+							t.Fatal("create lost database")
+						}
+						wantCfg["EnableSearch"] = false
+						wantCfg["CustomAgentId"] = opts.CustomAgentID
+						wantCfg["CustomAgentStage"] = "prod"
+						response = `{"Data":{"SessionId":"s1","AgentId":"a1"}}`
+					case "DescribeDataAgentSession":
+						return managerResponse(http.StatusOK, `{"Data":{"SessionStatus":"RUNNING"}}`)
+					case "SendChatMessage":
+						for key, want := range map[string]string{
+							"SessionId": "s1", "AgentId": "a1", "Message": opts.Query, "MessageType": "primary",
+						} {
+							if got := params.Get(key); got != want {
+								t.Fatalf("initial send %s = %q, want %q", key, got, want)
+							}
+						}
+						var ds dataagent.DataSource
+						if err := json.Unmarshal([]byte(params.Get("DataSource")), &ds); err != nil {
+							t.Fatalf("decode initial data source: %v", err)
+						}
+						wantDS := dataagent.DataSource{
+							DataSourceType: "database", DmsDatabaseID: opts.DatabaseID, DbName: opts.DbName,
+							Database: opts.DbName, Tables: opts.Tables, RegionID: "test",
+						}
+						if !reflect.DeepEqual(ds, wantDS) {
+							t.Fatalf("initial data source = %+v, want %+v", ds, wantDS)
+						}
+						intent, err := m.store.load("s1")
+						if err != nil || intent == nil || intent.MessageStatus != SendSending || intent.Mode != opts.Mode ||
+							intent.AutoConfirm != opts.AutoConfirm || intent.WorkspaceID != opts.WorkspaceID {
+							t.Fatalf("initial send lost persisted intent or options: %+v, %v", intent, err)
+						}
+						if opts.WorkMode != "" {
+							wantCfg["WorkMode"] = tc.wireMode
+						}
+					default:
+						return nil, fmt.Errorf("unexpected action %q", action)
+					}
+					var sessionCfg map[string]interface{}
+					if err := json.Unmarshal([]byte(params.Get("SessionConfig")), &sessionCfg); err != nil {
+						t.Fatalf("decode %s SessionConfig: %v", action, err)
+					}
+					if action == "CreateDataAgentSession" || opts.WorkMode == "" {
+						if _, ok := sessionCfg["WorkMode"]; ok {
+							t.Fatalf("%s must omit WorkMode", action)
+						}
+					}
+					if !reflect.DeepEqual(sessionCfg, wantCfg) {
+						t.Fatalf("%s SessionConfig = %#v, want %#v", action, sessionCfg, wantCfg)
+					}
+					return managerResponse(http.StatusOK, response)
+				})
+				state, err := m.CreateSession(context.Background(), opts)
+				if err != nil {
+					t.Fatalf("CreateSession() error = %v", err)
+				}
+				snap := state.Snapshot()
+				if snap.MessageStatus != SendAcknowledged || snap.Mode != opts.Mode || snap.AutoConfirm != opts.AutoConfirm ||
+					snap.WorkspaceID != opts.WorkspaceID || len(m.ListSessions()) != 1 {
+					t.Fatalf("initial send did not preserve acknowledgement, options or watcher: %+v", snap)
+				}
+				persisted, err := m.store.load("s1")
+				if err != nil || persisted == nil || persisted.MessageStatus != SendAcknowledged {
+					t.Fatalf("initial acknowledgement was not persisted: %+v, %v", persisted, err)
+				}
+				wantActions := []string{"CreateDataAgentSession", "DescribeDataAgentSession", "SendChatMessage"}
+				if !reflect.DeepEqual(actions, wantActions) {
+					t.Fatalf("actions = %v, want %v", actions, wantActions)
+				}
+			})
+		}
+	}
+}
+
 func TestManagerRequestIDsStayWithToolCallsAndWatcherOutlivesCreate(t *testing.T) {
 	type contextKey struct{}
 	streams := make(chan context.Context, 3)
@@ -210,6 +314,17 @@ func TestManagerRequestIDsStayWithToolCallsAndWatcherOutlivesCreate(t *testing.T
 		case "DescribeDataAgentSession":
 			requestID, data = "poll-id", `{"SessionStatus":"RUNNING"}`
 		case "SendChatMessage":
+			var sessionCfg map[string]interface{}
+			if err := json.Unmarshal([]byte(req.URL.Query().Get("SessionConfig")), &sessionCfg); err != nil {
+				return nil, fmt.Errorf("decode send SessionConfig: %w", err)
+			}
+			if req.URL.Query().Get("Message") == "initial" {
+				if sessionCfg["WorkMode"] != "chat" {
+					t.Error("initial send lost WorkMode")
+				}
+			} else if _, ok := sessionCfg["WorkMode"]; ok {
+				t.Error("auto-confirmation and follow-up must not resend WorkMode")
+			}
 			switch req.URL.Query().Get("Message") {
 			case "initial":
 				requestID = "initial-id"
@@ -245,7 +360,7 @@ func TestManagerRequestIDsStayWithToolCallsAndWatcherOutlivesCreate(t *testing.T
 	createCtx, cancelCreate := context.WithCancel(context.WithValue(context.Background(), contextKey{}, "create"))
 	defer cancelCreate()
 	createCtx, createIDs := dataagent.WithRequestIDs(createCtx)
-	if _, err := m.CreateSession(createCtx, CreateOpts{Query: "initial", AutoConfirm: true}); err != nil {
+	if _, err := m.CreateSession(createCtx, CreateOpts{Query: "initial", WorkMode: "CHAT", AutoConfirm: true}); err != nil {
 		t.Fatal(err)
 	}
 	streamCtx := managerReceive(t, streams)

@@ -72,7 +72,7 @@ func (i *Identity) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	type plain Identity
-	v := plain{MaxTenants: 128}
+	v := plain{MaxTenants: 128, RequireIdentity: true}
 	if err := node.Decode(&v); err != nil {
 		return errors.New("invalid identity configuration")
 	}
@@ -138,7 +138,9 @@ func (c *Config) ResolveGroup(claims IdentityClaims) (string, IdentityGroup, err
 	if (claims.UserID == "" && claims.Email == "") || mode == "jwt" && (claims.TenantID == "" || claims.AgentID == "") {
 		return "", IdentityGroup{}, ErrIdentityUnmapped
 	}
-	matches := func(g IdentityGroup) bool { return g.TenantID == claims.TenantID && g.AgentID == claims.AgentID }
+	matches := func(g IdentityGroup) bool {
+		return (g.TenantID == "" && g.AgentID == "") || (g.TenantID == claims.TenantID && g.AgentID == claims.AgentID)
+	}
 	var name string
 	var selected IdentityGroup
 	found := false
@@ -171,6 +173,7 @@ func (c *Config) ResolveGroup(claims IdentityClaims) (string, IdentityGroup, err
 
 func (c *Config) validateScopes() error {
 	seen := map[[3]string]string{}
+	var shared, scoped bool
 	check := func(g IdentityGroup) error {
 		tenant, err := NormalizeIdentity(g.TenantID)
 		if err != nil || tenant != g.TenantID {
@@ -181,8 +184,17 @@ func (c *Config) validateScopes() error {
 			return errors.New("identity mapping has invalid scope")
 		}
 		if c.Identity.JWT.Enabled {
-			if tenant == "" || agent == "" || strings.ContainsAny(tenant+agent, "*?") {
-				return errors.New("JWT identity mappings require exact tenant_id and agent_id; migrate unscoped mappings")
+			if (tenant == "") != (agent == "") || strings.ContainsAny(tenant+agent, "*?") {
+				return errors.New("JWT identity mappings must set both tenant_id and agent_id or omit both")
+			}
+			if tenant == "" {
+				shared = true
+			} else {
+				scoped = true
+			}
+			// Mixing shared defaults with explicit scopes would silently widen access.
+			if shared && scoped {
+				return errors.New("JWT identity mappings must all be scoped or all shared; do not mix mapping modes")
 			}
 		} else if tenant != "" || agent != "" {
 			return errors.New("header identity mappings must not set tenant_id or agent_id")
@@ -231,6 +243,9 @@ func (c *Config) ValidateTransport(transport string) error {
 	case "sse", "streamable-http":
 	default:
 		return errors.New("unsupported MCP transport")
+	}
+	if c.APIKey != "" {
+		return errors.New("API Key authentication is supported only with local stdio transport")
 	}
 	if !c.Identity.Enabled || !c.Identity.RequireIdentity || strings.TrimSpace(c.Identity.AuthToken) == "" || !ValidNamespace(c.Identity.Namespace) {
 		return errors.New("remote transport requires identity.enabled, require_identity, auth_token and a valid namespace; migrate anonymous or fallback configuration")

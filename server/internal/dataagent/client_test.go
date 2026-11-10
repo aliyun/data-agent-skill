@@ -1,12 +1,14 @@
 package dataagent
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -109,6 +111,460 @@ func TestSignedAPIRedirectsRejected(t *testing.T) {
 					assertSignedRedirectError(t, err)
 					if body != nil || initial.Load() != 1 || redirected.Load() != 0 || len(ids.Snapshot()) != 0 {
 						t.Fatalf("redirect returned data, retried, or forwarded: initial=%d target=%d", initial.Load(), redirected.Load())
+					}
+				})
+			}
+		}
+	}
+}
+
+func apiKeyTestClient(t *testing.T, opts ...ClientOption) *Client {
+	t.Helper()
+	c := NewClient(&Credential{APIKey: "synthetic-api-key"}, "cn-shanghai", opts...)
+	blocked := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Error("unexpected HTTP request (including STS or DMS routing probes)")
+		return nil, errors.New("unexpected request")
+	})
+	c.http.Transport, c.sse.httpClient.Transport = blocked, blocked
+	return c
+}
+
+func apiKeyRequestPayload(t *testing.T, req *http.Request) map[string]interface{} {
+	t.Helper()
+	if req.Method != http.MethodPost || req.URL.Scheme != "https" || req.URL.Path != "/apikey" || req.URL.RawQuery != "" ||
+		req.Header.Get("x-api-key") != "synthetic-api-key" || req.Header.Get("Authorization") != "" ||
+		req.Header.Get("Content-Type") != "application/json" || req.Header.Get("User-Agent") != userAgent {
+		t.Error("invalid API Key request authentication, URL, or headers")
+	}
+	for name := range req.Header {
+		if strings.HasPrefix(strings.ToLower(name), "x-acs-") {
+			t.Error("API Key request contains ACS signing headers")
+		}
+	}
+	var payload map[string]interface{}
+	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+		t.Errorf("invalid API Key JSON request: %v", err)
+	}
+	return payload
+}
+
+func TestAPIKeyActionRoutesAndNestedParams(t *testing.T) {
+	for _, override := range []bool{false, true} {
+		for _, tc := range []struct {
+			action, wireAction string
+			stream, dms        bool
+		}{
+			{"CreateDataAgentSession", "CreateDataAgentSession", false, false},
+			{"DescribeDataAgentSession", "DescribeDataAgentSession", false, false},
+			{"ListDataAgentWorkspace", "ListDataAgentWorkSpace", false, false},
+			{"ListCustomAgent", "ListCustomAgent", false, false},
+			{"SendChatMessage", "SendChatMessage", true, false},
+			{"GetChatContent", "GetChatContent", true, false},
+			{"DescribeDataAgentUsage", "DescribeDataAgentUsage", true, false},
+			{"UpdateDataAgentSession", "UpdateDataAgentSession", true, false},
+			{"CreateDataAgentFeedback", "CreateDataAgentFeedback", true, false},
+			{"ListTagMetaAsset", "listTagMetaAsset", false, true},
+		} {
+			t.Run(fmt.Sprintf("%t/%s", override, tc.action), func(t *testing.T) {
+				c := apiKeyTestClient(t)
+				if override {
+					c = apiKeyTestClient(t, WithAPIKeyEndpoint("control.example.invalid"), WithAPIKeyStreamEndpoint("stream.example.invalid"))
+				}
+				version := "2025-04-14"
+				if tc.dms {
+					version = "2018-11-01"
+				}
+				calls := 0
+				c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls++
+					payload := apiKeyRequestPayload(t, req)
+					host := c.APIKeyEndpoint()
+					if tc.stream {
+						host = c.APIKeyStreamEndpoint()
+					}
+					if req.URL.Host != host || req.Header.Get("Accept") != "application/json" ||
+						payload["Action"] != tc.wireAction || payload["Version"] != version || payload["RegionId"] != "cn-shanghai" {
+						t.Fatal("action rename, version or endpoint selection changed")
+					}
+					if jsonObj(payload, "SessionConfig")["Mode"] != "pro" || jsonObj(payload, "DataSource")["DbName"] != "db" ||
+						!reflect.DeepEqual(payload["MetaItems"], []interface{}{map[string]interface{}{"MetaId": "db,table"}}) ||
+						payload["Literal"] != "{not-json" || payload["PageNumber"] != "1" {
+						t.Fatal("nested JSON or scalar parameters changed")
+					}
+					return jsonHTTPResponse(t, map[string]interface{}{"success": true}), nil
+				})
+				params := map[string]string{"SessionConfig": `{"Mode":"pro"}`, "DataSource": `{"DbName":"db"}`,
+					"MetaItems": `[{"MetaId":"db,table"}]`, "Literal": "{not-json", "PageNumber": "1"}
+				var err error
+				if tc.dms {
+					_, err = c.callDMSEnterprise(context.Background(), c.DMSEnterpriseEndpoint(), tc.action, version, params)
+				} else {
+					_, err = c.callAPI(context.Background(), c.endpoint, tc.action, version, params)
+				}
+				if err != nil || calls != 1 {
+					t.Fatalf("calls=%d, error=%v", calls, err)
+				}
+			})
+		}
+	}
+}
+
+func TestAPIKeyWorkspaceSessionsAndMetadata(t *testing.T) {
+	t.Setenv("DATA_AGENT_SESSION_LOOKBACK_DAYS", "3")
+	c := apiKeyTestClient(t)
+	calls := make(map[string]int)
+	c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		payload := apiKeyRequestPayload(t, req)
+		action := firstStr(payload, "Action")
+		calls[action]++
+		if payload["DmsUnit"] != nil || payload["Tid"] != nil {
+			t.Fatal("API Key mode performed DMS routing or tenant resolution")
+		}
+		var data interface{}
+		switch action {
+		case "ListDataAgentWorkSpace":
+			if payload["WorkspaceType"] != "MY" || payload["PageNumber"] != "1" {
+				t.Fatal("workspace lookup did not select MY workspaces")
+			}
+			data = map[string]interface{}{"Content": []interface{}{map[string]string{"WorkspaceId": "ws-first"}, map[string]string{"WorkspaceId": "ws-second"}}}
+		case "ListDataAgentSession":
+			start, err1 := strconv.ParseInt(firstStr(payload, "StartTime"), 10, 64)
+			end, err2 := strconv.ParseInt(firstStr(payload, "EndTime"), 10, 64)
+			if err1 != nil || err2 != nil || end-start != int64(72*time.Hour/time.Millisecond) ||
+				end < time.Now().Add(-time.Minute).UnixMilli() || payload["CreateStartTime"] != nil || payload["CreateEndTime"] != nil || payload["WorkspaceId"] != "ws-first" {
+				t.Fatal("API Key session lookup lost millisecond timestamps or workspace")
+			}
+			data = map[string]interface{}{"Content": []interface{}{map[string]string{"sessionId": "session-1", "agentId": "agent-1", "status": "FINISHED"}}}
+		case "listTagMetaAsset":
+			if payload["Version"] != "2018-11-01" || payload["TagName"] != "sys::DMS-DA::cn-shanghai::space:ws-first" {
+				t.Fatal("metadata lookup lost workspace or version")
+			}
+			data = map[string]interface{}{"data": []interface{}{map[string]interface{}{"MetaEntityAttrs": map[string]interface{}{
+				"DbId": 42, "SchemaName": "db", "TableId": "table-1", "TableName": "table",
+			}}}, "TotalCount": 1}
+		default:
+			t.Fatalf("unexpected action %q; API Keys must not call STS, GetActiveRouteUnit or GetUserActiveTenant", action)
+		}
+		return jsonHTTPResponse(t, map[string]interface{}{"success": true, "code": "success", "data": data}), nil
+	})
+	if c.ResolveDMSUnit(context.Background()) != "" || c.resolveTid(context.Background(), c.DMSEnterpriseEndpoint()) != "" || len(calls) != 0 {
+		t.Fatal("API Key routing resolution should be a no-op")
+	}
+	if c.ResolveWorkspaceID(context.Background()) != "ws-first" || c.ResolveWorkspaceID(context.Background()) != "ws-first" || calls["ListDataAgentWorkSpace"] != 1 {
+		t.Fatal("first MY workspace was not cached")
+	}
+	sessions, err := c.ListRemoteSessions(context.Background(), "")
+	if err != nil || len(sessions) != 1 || sessions[0].SessionID != "session-1" || sessions[0].WorkspaceID != "ws-first" {
+		t.Fatalf("sessions=%+v error=%v", sessions, err)
+	}
+	dbs, err := c.ListDatabases(context.Background(), "")
+	if err != nil || len(dbs) != 1 || dbs[0].DbID != 42 {
+		t.Fatalf("databases=%+v error=%v", dbs, err)
+	}
+	tables, err := c.ListImportedTables(context.Background(), "42", "")
+	if err != nil || len(tables) != 1 || tables[0].TableID != "table-1" || calls["listTagMetaAsset"] != 2 {
+		t.Fatalf("tables=%+v error=%v", tables, err)
+	}
+}
+
+func TestAPIKeyUnsupportedDMSOperationsDoNotSend(t *testing.T) {
+	c := apiKeyTestClient(t, WithWorkspaceID("ws"))
+	for _, action := range []string{"GetActiveRouteUnit", "GetUserActiveTenant", "ListTables", "ListInstances", "SearchDatabase", "TagMetaAsset", "Unknown"} {
+		_, err := c.callDMSEnterprise(context.Background(), c.DMSEnterpriseEndpoint(), action, "2018-11-01", nil)
+		if !errors.Is(err, ErrAPIKeyUnsupported) {
+			t.Fatalf("%s error=%v", action, err)
+		}
+	}
+	_, tablesErr := c.ListTables(context.Background(), "db")
+	_, instancesErr := c.ListInstances(context.Background(), "private-query", "mysql", 1, 10)
+	_, searchErr := c.SearchDatabases(context.Background(), "private-query", 1, 10)
+	importErr := c.ImportDatabase(context.Background(), ImportDatabaseOpts{DmsDbID: "db", Tables: []string{"table"}})
+	for _, err := range []error{tablesErr, instancesErr, searchErr, importErr} {
+		if !errors.Is(err, ErrAPIKeyUnsupported) || strings.Contains(err.Error(), "private-query") {
+			t.Fatalf("public DMS operation must fail safely without HTTP: %v", err)
+		}
+	}
+}
+
+func TestAPIKeyResponseEnvelopesAndRequestIDs(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, want, id string
+	}{
+		{"plain", `{"Data":{"SessionId":"s"}}`, `{"Data":{"SessionId":"s"},"RequestId":"header-id"}`, "header-id"},
+		{"outer ID", `{"success":true,"code":"success","requestId":"outer-id","data":{"agentId":"a"}}`, `{"agentId":"a","RequestId":"outer-id"}`, "outer-id"},
+		{"inner ID", `{"code":"success","requestId":"outer-id","data":{"RequestID":"inner-id","Content":[]}}`, `{"Content":[],"RequestId":"inner-id"}`, "inner-id"},
+		{"list", `{"code":"success","data":{"data":[{"DbId":42}],"TotalCount":1}}`, `{"data":[{"DbId":42}],"TotalCount":1,"RequestId":"header-id"}`, "header-id"},
+		{"one layer", `{"code":"success","data":{"code":"success","data":{"FileId":"f"}}}`, `{"code":"success","data":{"FileId":"f"},"RequestId":"header-id"}`, "header-id"},
+		{"secret ID", `{"code":"success","requestId":"outer-id","data":{"requestId":"synthetic-api-key","sessionId":"s"}}`, `{"sessionId":"s","RequestId":"outer-id"}`, "outer-id"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := apiKeyTestClient(t)
+			ctx, ids := WithRequestIDs(context.Background())
+			c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Context().Value(requestIDsKey{}) != ids {
+					t.Fatal("API Key request lost caller context")
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{"X-Request-Id": []string{"header-id"}}, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+			})
+			got, err := c.callAPI(ctx, c.endpoint, "DescribeDataAgentSession", "2025-04-14", nil)
+			var want map[string]interface{}
+			json.Unmarshal([]byte(tc.want), &want)
+			if err != nil || !reflect.DeepEqual(got, want) || !reflect.DeepEqual(ids.Snapshot(), []APIRequest{{Action: "DescribeDataAgentSession", RequestID: tc.id}}) {
+				t.Fatalf("body=%v ids=%v error=%v", got, ids.Snapshot(), err)
+			}
+		})
+	}
+}
+
+func TestAPIKeySessionAndUploadResponses(t *testing.T) {
+	for _, envelope := range []string{"top", "gateway", "nested"} {
+		t.Run(envelope, func(t *testing.T) {
+			c := apiKeyTestClient(t)
+			want := &UploadSignature{UploadHost: "https://upload.example.invalid", UploadDir: "dir/", Policy: "policy",
+				OssSignature: "signature", OssSignatureVersion: "OSS4-HMAC-SHA256", OssDate: "20261027T000000Z",
+				OssSecurityToken: "oss-token", OssCredential: "oss-credential"}
+			c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				payload := apiKeyRequestPayload(t, req)
+				var data map[string]interface{}
+				switch payload["Action"] {
+				case "CreateDataAgentSession":
+					if payload["DatabaseId"] != "db" || jsonObj(payload, "SessionConfig")["Mode"] != "pro" {
+						t.Fatal("create lost session configuration")
+					}
+					data = map[string]interface{}{"sessionId": "s", "agentId": "a"}
+				case "DescribeDataAgentSession":
+					data = map[string]interface{}{"agentId": "a", "agentStatus": "FINISHED"}
+				case "SendChatMessage":
+					if req.URL.Host != c.APIKeyStreamEndpoint() || payload["MessageType"] != "primary" ||
+						payload["Message"] != "private-query" || jsonObj(payload, "DataSource")["DbName"] != "db" {
+						t.Fatal("send lost message or nested data source")
+					}
+					data = map[string]interface{}{"success": true}
+				case "DescribeFileUploadSignature":
+					if payload["FileName"] != "test.csv" || payload["FileSize"] != "123" {
+						t.Fatal("signature request lost file metadata")
+					}
+					data = map[string]interface{}{"uploadHost": want.UploadHost, "uploadDir": want.UploadDir, "policy": want.Policy,
+						"ossSignature": want.OssSignature, "ossSignatureVersion": want.OssSignatureVersion, "ossDate": want.OssDate,
+						"ossSecurityToken": want.OssSecurityToken, "ossCredential": want.OssCredential}
+				case "FileUploadCallback":
+					if payload["Filename"] != "test.csv" || payload["UploadLocation"] != "dir/test.csv" || payload["FileSize"] != "123" || payload["FileFrom"] != "Skill" {
+						t.Fatal("callback request lost file metadata")
+					}
+					data = map[string]interface{}{"fileId": "file-1"}
+				default:
+					t.Fatal("unexpected API Key request")
+				}
+				if envelope == "nested" {
+					data = map[string]interface{}{"Data": data}
+				}
+				if envelope != "top" {
+					data = map[string]interface{}{"success": true, "code": "success", "data": data}
+				}
+				data["requestId"] = "upload-request"
+				return jsonHTTPResponse(t, data), nil
+			})
+			ctx := context.Background()
+			created, err := c.CreateSession(ctx, CreateSessionOpts{DatabaseID: "db", Mode: "pro"})
+			if err != nil || created.SessionID != "s" || created.AgentID != "a" || created.RequestID != "upload-request" {
+				t.Fatalf("create=%+v error=%v", created, err)
+			}
+			described, err := c.DescribeSession(ctx, "s", "ws")
+			if err != nil || described.AgentStatus != "FINISHED" || described.RequestID != "upload-request" {
+				t.Fatalf("describe=%+v error=%v", described, err)
+			}
+			if err := c.SendMessage(ctx, SendMessageOpts{SessionID: "s", AgentID: "a", Message: "private-query", DataSource: &DataSource{DbName: "db"}}); err != nil {
+				t.Fatal(err)
+			}
+			got, err := c.GetFileUploadSignature(ctx, "test.csv", 123)
+			if err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("signature=%+v error=%v", got, err)
+			}
+			fileID, err := c.FileUploadCallback(ctx, "test.csv", "dir/test.csv", 123)
+			if err != nil || fileID != "file-1" {
+				t.Fatalf("file=%q error=%v", fileID, err)
+			}
+		})
+	}
+}
+
+func TestAPIKeyResponseLimit(t *testing.T) {
+	for _, size := range []int{apiKeyMaxResponseBytes, apiKeyMaxResponseBytes + 10000} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			c := apiKeyTestClient(t)
+			payload := `{"value":"` + strings.Repeat("x", size-len(`{"value":""}`)) + `"}`
+			reader := strings.NewReader(payload)
+			body := &failingResponseBody{Reader: reader, err: io.EOF}
+			c.http.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 200, Header: http.Header{"X-Request-Id": []string{"limit-request"}}, Body: body}, nil
+			})
+			ctx, ids := WithRequestIDs(context.Background())
+			result, err := c.callAPI(ctx, c.endpoint, "DescribeDataAgentSession", "2025-04-14", nil)
+			if size == apiKeyMaxResponseBytes {
+				if err != nil || result == nil || reader.Len() != 0 {
+					t.Fatalf("response at limit rejected: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "exceeds 4 MiB") || !strings.Contains(err.Error(), "limit-request") ||
+				IsDefiniteRejection(err) || result != nil || reader.Len() != size-apiKeyMaxResponseBytes-1 {
+				t.Fatalf("unbounded read or unclear failure: remaining=%d error=%v", reader.Len(), err)
+			}
+			if !body.closed || !reflect.DeepEqual(ids.Snapshot(), []APIRequest{{Action: "DescribeDataAgentSession", RequestID: "limit-request"}}) {
+				t.Fatal("response body not closed or request ID lost")
+			}
+		})
+	}
+}
+
+func TestAPIKeyBusyErrorsPreserveSafeBusinessCode(t *testing.T) {
+	const busy = "DMS.DataAgent.SessionInBusy"
+	const privateMessage = "synthetic-api-key private-query"
+	for _, tc := range []struct {
+		name, body, code string
+	}{
+		{"root", `{"success":false,"error_code":"` + busy + `","error_message":"` + privateMessage + `"}`, busy},
+		{"nested", `{"code":"success","data":{"success":true,"error_code":"` + busy + `","error_message":"` + privateMessage + `"}}`, busy},
+		{"nested PascalCase", `{"success":true,"data":{"Data":{"Success":false,"ErrorCode":"` + busy + `","ErrorMessage":"` + privateMessage + `"}}}`, busy},
+		{"not allowlisted", `{"success":false,"error_code":"` + busy + `.synthetic-api-key","error_message":"` + privateMessage + `"}`, "UpstreamError"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := apiKeyTestClient(t)
+			c.http.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 200, Header: http.Header{"X-Request-Id": []string{"busy-id"}}, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+			})
+			ctx, ids := WithRequestIDs(context.Background())
+			err := c.SendMessage(ctx, SendMessageOpts{Message: "private-query"})
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Code != tc.code || apiErr.RequestID != "busy-id" || !IsDefiniteRejection(err) {
+				t.Fatalf("lost business failure semantics: %v", err)
+			}
+			if tc.code == busy && apiErr.Message != "Session is busy; wait for the current request to finish." {
+				t.Fatal("busy message must be fixed and safe")
+			}
+			for _, secret := range []string{"synthetic-api-key", "private-query"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatal("busy error leaked sensitive input")
+				}
+			}
+			if !reflect.DeepEqual(ids.Snapshot(), []APIRequest{{Action: "SendChatMessage", RequestID: "busy-id"}}) {
+				t.Fatal("busy failure lost its request ID")
+			}
+		})
+	}
+}
+
+func TestAPIKeyErrorsAreSanitized(t *testing.T) {
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	const sensitive = "synthetic-api-key private-query https://example.invalid/?Signature=signed-secret"
+	for _, tc := range []struct {
+		name, body, id string
+		status         int
+		definite       bool
+	}{
+		{"root error", `{"success":false,"ErrorCode":"` + sensitive + `","ErrorMessage":"` + sensitive + `"}`, "header-id", 200, true},
+		{"nested error", `{"code":"success","requestId":"outer-id","data":{"Data":{"Success":false,"RequestId":"inner-id","Message":"` + sensitive + `"}}}`, "inner-id", 200, true},
+		{"unsafe ID", `{"success":false,"RequestId":"synthetic-api-key","Message":"` + sensitive + `"}`, "header-id", 403, true},
+		{"query ID", `{"success":false,"RequestId":"private-query","Message":"` + sensitive + `"}`, "header-id", 403, true},
+		{"server error", `{"Message":"` + sensitive + `"}`, "header-id", 503, false},
+		{"malformed", `{"secret":"` + sensitive, "header-id", 200, false},
+		{"null", `null`, "header-id", 200, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := apiKeyTestClient(t)
+			c.http.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: tc.status, Header: http.Header{"X-Request-Id": []string{"header-id"}}, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+			})
+			ctx, ids := WithRequestIDs(context.Background())
+			err := c.SendMessage(ctx, SendMessageOpts{Message: "private-query"})
+			if err == nil || IsDefiniteRejection(err) != tc.definite || !strings.Contains(err.Error(), tc.id) {
+				t.Fatalf("error classification or request ID changed: %v", err)
+			}
+			for _, secret := range []string{"synthetic-api-key", "private-query", "https://", "signed-secret"} {
+				if strings.Contains(err.Error(), secret) || strings.Contains(logs.String(), secret) {
+					t.Fatal("API Key error or log leaked sensitive data")
+				}
+			}
+			if !reflect.DeepEqual(ids.Snapshot(), []APIRequest{{Action: "SendChatMessage", RequestID: tc.id}}) {
+				t.Fatal("failed API Key request lost its safe request ID")
+			}
+		})
+	}
+	for _, readFailure := range []bool{false, true} {
+		c := apiKeyTestClient(t)
+		cause := fmt.Errorf("%s: %w", sensitive, context.DeadlineExceeded)
+		body := &failingResponseBody{Reader: strings.NewReader(""), err: cause}
+		c.http.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+			if !readFailure {
+				return nil, cause
+			}
+			return &http.Response{StatusCode: 200, Header: http.Header{"X-Request-Id": []string{"read-id"}}, Body: body}, nil
+		})
+		err := c.SendMessage(context.Background(), SendMessageOpts{Message: "private-query"})
+		if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "synthetic-api-key") ||
+			strings.Contains(err.Error(), "private-query") || strings.Contains(err.Error(), "https://") || IsDefiniteRejection(err) {
+			t.Fatalf("unsafe or misclassified transport failure: %v", err)
+		}
+		if readFailure && (!body.closed || !strings.Contains(err.Error(), "read-id")) {
+			t.Fatal("read failure lost body cleanup or request ID")
+		}
+	}
+}
+
+func TestAPIKeyRedirectsNeverForward(t *testing.T) {
+	// Cover every 3xx response, including those net/http does not follow itself.
+	for status := 300; status < 400; status++ {
+		for _, destination := range []string{"samehost", "crosshost", "downgrade", "malformed"} {
+			for _, mode := range []string{"control", "data", "metadata", "sse"} {
+				t.Run(fmt.Sprintf("%d/%s/%s", status, destination, mode), func(t *testing.T) {
+					c := apiKeyTestClient(t)
+					initial, forwarded := 0, 0
+					transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+						if req.URL.Path != "/apikey" {
+							forwarded++
+							return jsonHTTPResponse(t, map[string]interface{}{"success": true}), nil
+						}
+						initial++
+						apiKeyRequestPayload(t, req)
+						location := "/redirect-target"
+						switch destination {
+						case "crosshost":
+							location = "https://other.example.invalid/redirect-target"
+						case "downgrade":
+							location = "http://other.example.invalid/redirect-target"
+						case "malformed":
+							location = "https://other.example.invalid/%zz"
+						}
+						location += "?Signature=signed-secret&Key=synthetic-api-key"
+						return &http.Response{StatusCode: status, Header: http.Header{
+							"Location": []string{location}, "X-Acs-Request-Id": []string{"synthetic-api-key"}, "X-Request-Id": []string{"redirect-id"},
+						}, Body: io.NopCloser(strings.NewReader("event: SSE_FINISH\ndata: {\"content\":\"synthetic-api-key\"}\n\n"))}, nil
+					})
+					c.http.Transport, c.sse.httpClient.Transport = transport, transport
+					var err error
+					switch mode {
+					case "control":
+						_, err = c.CreateSession(context.Background(), CreateSessionOpts{})
+					case "data":
+						err = c.SendMessage(context.Background(), SendMessageOpts{Message: "private-query"})
+					case "metadata":
+						_, err = c.ListDatabases(context.Background(), "ws")
+					case "sse":
+						events := make(chan SSEEvent, 4)
+						var finished bool
+						finished, err = c.sse.doStream(context.Background(), "a", "s", 2, events)
+						if finished || len(events) != 0 {
+							t.Fatal("SSE consumed a redirect body")
+						}
+					}
+					if err == nil || IsDefiniteRejection(err) || initial != 1 || forwarded != 0 {
+						t.Fatalf("redirect sent, retried, or accepted: initial=%d forwarded=%d error=%v", initial, forwarded, err)
+					}
+					for _, secret := range []string{"synthetic-api-key", "signed-secret", "private-query", "https://", "http://"} {
+						if strings.Contains(err.Error(), secret) {
+							t.Fatal("redirect error leaked sensitive data")
+						}
 					}
 				})
 			}
@@ -571,6 +1027,73 @@ func testClientAuthModes(t *testing.T, run func(*testing.T, *Client)) {
 			})
 			run(t, c)
 		})
+	}
+}
+
+func TestSendMessageWorkMode(t *testing.T) {
+	for _, auth := range []string{"signed", "apikey"} {
+		for _, tc := range []struct {
+			name, workMode, wireMode string
+		}{
+			{name: "omitted"},
+			{name: "analysis", workMode: "ANALYSIS", wireMode: "analysis"},
+			{name: "chat", workMode: "CHAT", wireMode: "chat"},
+			{name: "lowercase", workMode: "chat", wireMode: "chat"},
+		} {
+			t.Run(auth+"/"+tc.name, func(t *testing.T) {
+				c := NewClient(&Credential{AccessKeyID: "test-ak", AccessKeySecret: "test-sk"}, "cn-shanghai", WithDMSUnit("test-unit"))
+				if auth == "apikey" {
+					c = apiKeyTestClient(t)
+				}
+				opts := SendMessageOpts{
+					AgentID: "test-agent", SessionID: "test-session", Message: "initial query",
+					Mode: "pro", PlanMode: "force", WorkMode: tc.workMode,
+				}
+				calls := 0
+				c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls++
+					var sessionCfg map[string]interface{}
+					if auth == "apikey" {
+						payload := apiKeyRequestPayload(t, req)
+						if payload["Action"] != "SendChatMessage" || req.URL.Host != c.APIKeyStreamEndpoint() {
+							t.Fatal("incorrect API Key send action or endpoint")
+						}
+						if _, ok := payload["WorkMode"]; ok {
+							t.Fatal("WorkMode must be nested in SessionConfig")
+						}
+						var ok bool
+						sessionCfg, ok = payload["SessionConfig"].(map[string]interface{})
+						if !ok {
+							t.Fatal("API Key SessionConfig must be a nested JSON object")
+						}
+					} else {
+						params := req.URL.Query()
+						if params.Get("Action") != "SendChatMessage" || params.Has("WorkMode") {
+							t.Fatal("incorrect signed send action or top-level WorkMode")
+						}
+						if err := json.Unmarshal([]byte(params.Get("SessionConfig")), &sessionCfg); err != nil {
+							t.Fatalf("decode signed SessionConfig query: %v", err)
+						}
+					}
+					want := map[string]interface{}{"Language": "CHINESE", "Mode": opts.Mode, "PlanMode": opts.PlanMode}
+					if tc.workMode != "" {
+						want["WorkMode"] = tc.wireMode
+					} else if _, ok := sessionCfg["WorkMode"]; ok {
+						t.Fatal("omitted WorkMode must not send an empty or default value")
+					}
+					if !reflect.DeepEqual(sessionCfg, want) {
+						t.Fatalf("SessionConfig = %#v, want %#v", sessionCfg, want)
+					}
+					return jsonHTTPResponse(t, map[string]interface{}{"Success": true}), nil
+				})
+				if err := c.SendMessage(context.Background(), opts); err != nil {
+					t.Fatalf("SendMessage() error = %v", err)
+				}
+				if calls != 1 {
+					t.Fatalf("SendMessage made %d requests, want exactly one", calls)
+				}
+			})
+		}
 	}
 }
 

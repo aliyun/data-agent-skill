@@ -177,6 +177,31 @@ func TestFileLoggingCapturesStartupFailure(t *testing.T) {
 	}
 }
 
+func TestLegacyAPIKeyStartupWithoutSDKCredentials(t *testing.T) {
+	dir := t.TempDir()
+	cmd := loggingCommand(t, dir)
+	cmd.Env = append(cmd.Env, "ALIBABA_CLOUD_ACCESS_KEY_ID=", "ALIBABA_CLOUD_ACCESS_KEY_SECRET=",
+		"DATA_AGENT_API_KEY=synthetic-private-api-key", "DATA_AGENT_LOG=1", "DEBUG=credential")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("legacy API Key startup failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "sessions")); err != nil {
+		t.Fatal("API Key startup did not initialize the session manager")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ".data-agent", "server.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("synthetic-private-api-key")) || bytes.Contains(stderr.Bytes(), []byte("synthetic-private-api-key")) {
+		t.Fatal("startup exposed API Key")
+	}
+	if stdout.Len() != 0 {
+		t.Fatal("startup contaminated stdout")
+	}
+}
+
 func TestRemoteStartupRejectsUnsafeConfiguration(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -184,7 +209,7 @@ func TestRemoteStartupRejectsUnsafeConfiguration(t *testing.T) {
 		mode os.FileMode
 	}{
 		{"disabled identity", "region: cn-hangzhou\n", 0600},
-		{"missing namespace", "identity:\n  enabled: true\n  require_identity: true\n  auth_token: synthetic-startup-secret\n", 0600},
+		{"missing role mapping", "identity:\n  enabled: true\n  require_identity: true\n  auth_token: synthetic-startup-secret\n", 0600},
 		{"unsafe secret file", "identity:\n  enabled: true\n  require_identity: true\n  namespace: startup-test\n  auth_token: synthetic-startup-secret\n", 0644},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

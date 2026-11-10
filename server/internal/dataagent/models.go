@@ -55,6 +55,7 @@ type SendMessageOpts struct {
 	WorkspaceID string
 	Mode        string
 	PlanMode    string // optional per-message plan mode: "force" or "disable"
+	WorkMode    string // ANALYSIS or CHAT; empty = server default, effective on the first message only
 }
 
 // Credential holds Alibaba Cloud credentials.
@@ -62,7 +63,11 @@ type Credential struct {
 	AccessKeyID     string
 	AccessKeySecret string
 	SecurityToken   string
+	APIKey          string // Local stdio API Key auth (alternative to AK/SK).
 }
+
+// IsAPIKey reports whether API Key authentication is selected.
+func (c *Credential) IsAPIKey() bool { return c != nil && c.APIKey != "" }
 
 // FileInfo from ListFileUpload.
 type FileInfo struct {

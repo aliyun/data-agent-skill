@@ -23,6 +23,7 @@ type CreateOpts struct {
 	Query         string
 	Mode          string // auto, lite, pro, ultra
 	PlanMode      string // "force" or "disable"; empty = server default
+	WorkMode      string // ANALYSIS or CHAT; passed only with the initial query
 	AutoConfirm   bool
 	InstanceID    string
 	InstanceName  string
@@ -391,6 +392,7 @@ func (m *Manager) CreateSession(ctx context.Context, opts CreateOpts) (*State, e
 	sendErr := m.client.SendMessage(ctx, dataagent.SendMessageOpts{
 		AgentID: agentID, SessionID: sessionID, Message: opts.Query, DataSource: ds,
 		WorkspaceID: opts.WorkspaceID, Mode: opts.Mode, PlanMode: opts.PlanMode,
+		WorkMode: opts.WorkMode,
 	})
 	delivery := SendAcknowledged
 	if sendErr != nil {

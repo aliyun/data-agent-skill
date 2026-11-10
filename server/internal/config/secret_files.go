@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -58,8 +59,10 @@ func readConfigFile(path string, containsSecret func([]byte) bool) ([]byte, erro
 		return nil, errors.New("configuration file too large")
 	}
 	if containsSecret(data) {
+		private := privateSecretFile(info)
+		allowLegacy := os.Getenv("DOTENV_UNSAFE_FILES_ALLOW") == "1"
 		actualParent, parentErr := root.Stat(".")
-		if !privateSecretFile(info) || parentErr != nil || !trustedSecretParent(actualParent) {
+		if (!private && !(allowLegacy && legacyReadableSecretFile(info))) || parentErr != nil || !trustedSecretParent(actualParent) {
 			return nil, errSecretFile
 		}
 		for dir := parent; ; dir = filepath.Dir(dir) {
@@ -70,6 +73,9 @@ func readConfigFile(path string, containsSecret func([]byte) bool) ([]byte, erro
 			if filepath.Dir(dir) == dir {
 				break
 			}
+		}
+		if !private {
+			log.Print("warning: DOTENV_UNSAFE_FILES_ALLOW=1 accepted a readable legacy secret file; use process-owned 0600/0400 files or managed environment injection")
 		}
 	}
 	return data, nil

@@ -1,6 +1,7 @@
 package dataagent
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -101,8 +102,11 @@ type Client struct {
 	// dmsEnterpriseEndpoint overrides the dms-enterprise host (2018-11-01
 	// metadata APIs). Empty means dms-enterprise.{region}.aliyuncs.com.
 	dmsEnterpriseEndpoint string
-	http                  *http.Client
-	sse                   *SSEClient
+	// API Key endpoints are independent of the signed API endpoint.
+	apiKeyEndpoint       string
+	apiKeyStreamEndpoint string
+	http                 *http.Client
+	sse                  *SSEClient
 
 	dmsUnitMu   sync.Mutex
 	dmsUnit     string // cached DMSUnit from GetActiveRouteUnit
@@ -128,6 +132,18 @@ func WithDataAgentEndpoint(endpoint string) ClientOption {
 			c.endpoint = endpoint
 		}
 	}
+}
+
+// WithAPIKeyEndpoint overrides the API Key control-plane host.
+// An empty value keeps dataagent-{region}.aliyuncs.com.
+func WithAPIKeyEndpoint(endpoint string) ClientOption {
+	return func(c *Client) { c.apiKeyEndpoint = endpoint }
+}
+
+// WithAPIKeyStreamEndpoint overrides the API Key data-plane host.
+// An empty value keeps dataagent-stream-{region}.aliyuncs.com.
+func WithAPIKeyStreamEndpoint(endpoint string) ClientOption {
+	return func(c *Client) { c.apiKeyStreamEndpoint = endpoint }
 }
 
 // WithDMSEnterpriseEndpoint overrides the dms-enterprise endpoint used by the
@@ -171,8 +187,9 @@ func NewClient(cred *Credential, region string, opts ...ClientOption) *Client {
 	c.sse.credFn = c.credFn
 	c.sse.dmsUnitFn = c.ResolveDMSUnit
 	// Endpoint overrides are applied by the options above, so propagate the
-	// resolved host into the SSE client that shares this configuration.
+	// resolved hosts into the SSE client that shares this configuration.
 	c.sse.endpoint = c.endpoint
+	c.sse.streamEndpoint = c.APIKeyStreamEndpoint()
 	return c
 }
 
@@ -200,6 +217,22 @@ func (c *Client) DMSEnterpriseEndpoint() string {
 
 // DataAgentEndpoint returns the host of the AK/SK-signed Data Agent API.
 func (c *Client) DataAgentEndpoint() string { return c.endpoint }
+
+// APIKeyEndpoint returns the effective API Key control-plane host.
+func (c *Client) APIKeyEndpoint() string {
+	if c.apiKeyEndpoint != "" {
+		return c.apiKeyEndpoint
+	}
+	return fmt.Sprintf("dataagent-%s.aliyuncs.com", c.region)
+}
+
+// APIKeyStreamEndpoint returns the effective API Key streaming host.
+func (c *Client) APIKeyStreamEndpoint() string {
+	if c.apiKeyStreamEndpoint != "" {
+		return c.apiKeyStreamEndpoint
+	}
+	return fmt.Sprintf("dataagent-stream-%s.aliyuncs.com", c.region)
+}
 
 // ---------- public API methods ----------
 
@@ -328,6 +361,10 @@ func (c *Client) SendMessage(ctx context.Context, opts SendMessageOpts) error {
 	if opts.PlanMode != "" {
 		sessionCfg["PlanMode"] = opts.PlanMode
 	}
+	if opts.WorkMode != "" {
+		// The live API accepts lowercase values despite the uppercase documentation.
+		sessionCfg["WorkMode"] = strings.ToLower(opts.WorkMode)
+	}
 	cfgBytes, _ := json.Marshal(sessionCfg)
 	params["SessionConfig"] = string(cfgBytes)
 
@@ -350,6 +387,14 @@ func (c *Client) ResolveWorkspaceID(ctx context.Context) string {
 	c.wsMu.Lock()
 	defer c.wsMu.Unlock()
 	if c.workspaceID != "" {
+		return c.workspaceID
+	}
+	if c.credential().IsAPIKey() {
+		// The personal-workspace initializer is unavailable with API Keys.
+		workspaces, err := c.ListWorkspaces(ctx, "MY")
+		if err == nil && len(workspaces) > 0 {
+			c.workspaceID = workspaces[0].WorkspaceID
+		}
 		return c.workspaceID
 	}
 	params := map[string]string{}
@@ -958,7 +1003,7 @@ func (c *Client) ListRemoteSessions(ctx context.Context, workspaceID string) ([]
 		workspaceID = c.ResolveWorkspaceID(ctx)
 	}
 	var result []RemoteSessionSummary
-	timeParams := sessionListTimeParams()
+	timeParams := sessionListTimeParams(c.credential().IsAPIKey())
 	for page := 1; page <= dataAgentListMaxPageScan; page++ {
 		params := map[string]string{
 			"WorkspaceId": workspaceID,
@@ -1006,7 +1051,7 @@ func (c *Client) ListRemoteSessions(ctx context.Context, workspaceID string) ([]
 	return result, nil
 }
 
-func sessionListTimeParams() map[string]string {
+func sessionListTimeParams(apiKeyAuth bool) map[string]string {
 	days := defaultSessionLookbackDays
 	if raw := strings.TrimSpace(os.Getenv("DATA_AGENT_SESSION_LOOKBACK_DAYS")); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
@@ -1019,6 +1064,12 @@ func sessionListTimeParams() map[string]string {
 
 	end := time.Now().UTC()
 	start := end.AddDate(0, 0, -days)
+	if apiKeyAuth {
+		return map[string]string{
+			"StartTime": strconv.FormatInt(start.UnixMilli(), 10),
+			"EndTime":   strconv.FormatInt(end.UnixMilli(), 10),
+		}
+	}
 	return map[string]string{
 		"CreateStartTime": start.Format(time.RFC3339),
 		"CreateEndTime":   end.Format(time.RFC3339),
@@ -1041,6 +1092,11 @@ func (c *Client) GetFileUploadSignature(ctx context.Context, fileName string, fi
 	data := jsonObj(body, "data")
 	if data == nil {
 		data = jsonObj(body, "Data")
+	}
+
+	if data == nil && c.credential().IsAPIKey() {
+		// The API Key envelope may already have been unwrapped.
+		data = body
 	}
 
 	return &UploadSignature{
@@ -1076,6 +1132,10 @@ func (c *Client) FileUploadCallback(ctx context.Context, filename, uploadLocatio
 		data = jsonObj(body, "data")
 	}
 
+	if data == nil && c.credential().IsAPIKey() {
+		data = body
+	}
+
 	return firstStr(data, "FileId", "fileId"), nil
 }
 
@@ -1087,6 +1147,9 @@ func (c *Client) ResolveDMSUnit(ctx context.Context) string {
 
 	if c.dmsUnit != "" {
 		return c.dmsUnit
+	}
+	if c.credential().IsAPIKey() {
+		return ""
 	}
 
 	dmsEndpoint := c.DMSEnterpriseEndpoint()
@@ -1277,13 +1340,19 @@ func readAPIResponse(action string, resp *http.Response) (map[string]interface{}
 	return result, nil
 }
 
-// callAPI makes a signed POST to the Data Agent endpoint (version 2025-04-14).
+// callAPI selects the signed API or the local API Key endpoint.
 func (c *Client) callAPI(ctx context.Context, host, action, version string, params map[string]string) (map[string]interface{}, error) {
+	if c.credential().IsAPIKey() {
+		return c.doAPIKeyPost(ctx, action, version, params)
+	}
 	return c.doSignedPost(ctx, host, action, version, params)
 }
 
 // resolveTid calls GetUserActiveTenant to obtain the DMS tenant ID.
 func (c *Client) resolveTid(ctx context.Context, dmsEndpoint string) string {
+	if c.credential().IsAPIKey() {
+		return ""
+	}
 	body, err := c.callDMSEnterprise(ctx, dmsEndpoint, "GetUserActiveTenant", "2018-11-01", nil)
 	if err != nil {
 		return ""
@@ -1301,9 +1370,137 @@ func (c *Client) resolveTid(ctx context.Context, dmsEndpoint string) string {
 	return ""
 }
 
-// callDMSEnterprise makes a signed POST to a dms-enterprise endpoint.
+// ErrAPIKeyUnsupported identifies DMS operations that require AK/SK credentials.
+var ErrAPIKeyUnsupported = errors.New("this operation is not available in API Key mode (requires AK/SK credentials)")
+
+// callDMSEnterprise permits only the legacy metadata-list proxy in API Key mode.
 func (c *Client) callDMSEnterprise(ctx context.Context, host, action, version string, params map[string]string) (map[string]interface{}, error) {
+	if c.credential().IsAPIKey() {
+		if action == "ListTagMetaAsset" {
+			return c.doAPIKeyPost(ctx, "listTagMetaAsset", version, params)
+		}
+		return nil, fmt.Errorf("%s: %w", action, ErrAPIKeyUnsupported)
+	}
 	return c.doSignedPostVersioned(ctx, host, action, version, params)
+}
+
+const apiKeyMaxResponseBytes = 4 << 20
+
+// doAPIKeyPost restores the local API Key protocol without ACS signing or retries.
+func (c *Client) doAPIKeyPost(ctx context.Context, action, version string, params map[string]string) (map[string]interface{}, error) {
+	cred := c.credential()
+	if !cred.IsAPIKey() {
+		return nil, errors.New("API Key credentials unavailable")
+	}
+	if action == "ListDataAgentWorkspace" {
+		action = "ListDataAgentWorkSpace"
+	}
+	host := c.APIKeyEndpoint()
+	switch action {
+	case "SendChatMessage", "GetChatContent", "DescribeDataAgentUsage", "UpdateDataAgentSession", "CreateDataAgentFeedback":
+		host = c.APIKeyStreamEndpoint()
+	}
+	body := map[string]interface{}{"Action": action, "Version": version, "RegionId": c.region}
+	for key, value := range params {
+		// SessionConfig, DataSource and other JSON containers must stay nested.
+		var nested interface{}
+		if len(value) > 0 && (value[0] == '{' || value[0] == '[') && json.Unmarshal([]byte(value), &nested) == nil {
+			body[key] = nested
+		} else {
+			body[key] = value
+		}
+	}
+	encoded, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+host+"/apikey", bytes.NewReader(encoded))
+	if err != nil {
+		return nil, fmt.Errorf("build API Key request: %w", &signedHTTPError{cause: err})
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("x-api-key", cred.APIKey)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("API Key HTTP request: %w", &signedHTTPError{cause: err})
+	}
+	defer resp.Body.Close()
+	id := apiKeySafeRequestID(resp.Header.Get("x-acs-request-id"), cred, params)
+	if id == "" {
+		id = apiKeySafeRequestID(resp.Header.Get("x-request-id"), cred, params)
+	}
+	defer func() { recordRequestID(ctx, action, id) }()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		failure := signedRedirectError(resp, cred)
+		failure.RequestID = id
+		return nil, failure
+	}
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, apiKeyMaxResponseBytes+1))
+	if len(payload) > apiKeyMaxResponseBytes {
+		return nil, fmt.Errorf("API Key response exceeds 4 MiB limit (request-id: %s)", id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read API Key response (request-id: %s): %w", id, &signedHTTPError{cause: err})
+	}
+	var result map[string]interface{}
+	parseErr := json.Unmarshal(payload, &result)
+	if parseErr == nil {
+		id = apiKeySafeResponseID(result, cred, params, id)
+	} else {
+		result = nil
+	}
+	apiErr := responseAPIError(result, resp.StatusCode, id, true)
+	if apiErr != nil || resp.StatusCode != http.StatusOK {
+		status, definite := resp.StatusCode, false
+		if apiErr != nil {
+			status, definite = apiErr.StatusCode, apiErr.definiteRejection
+			if safe := apiKeySafeRequestID(apiErr.RequestID, cred, params); safe != "" {
+				id = safe
+			}
+		}
+		// Only allowlisted business codes survive; upstream text can echo secrets.
+		code, message := "UpstreamError", "API Key request failed."
+		if apiErr != nil && apiErr.Code == "DMS.DataAgent.SessionInBusy" {
+			code, message = "DMS.DataAgent.SessionInBusy", "Session is busy; wait for the current request to finish."
+		}
+		return nil, &APIError{Code: code, Message: message, RequestID: id, StatusCode: status, definiteRejection: definite}
+	}
+	if parseErr != nil || result == nil {
+		return nil, fmt.Errorf("invalid API Key JSON response (request-id: %s)", id)
+	}
+	// Unwrap exactly one legacy envelope, retaining inner/outer/header ID priority.
+	if _, hasCode := result["code"]; hasCode {
+		if inner := jsonObj(result, "data"); inner != nil {
+			id = apiKeySafeResponseID(inner, cred, params, id)
+			result = inner
+		}
+	}
+	for _, key := range []string{"RequestId", "requestId", "request_id", "RequestID"} {
+		delete(result, key)
+	}
+	if id != "" {
+		result["RequestId"] = id
+	}
+	return result, nil
+}
+
+func apiKeySafeResponseID(body map[string]interface{}, cred *Credential, params map[string]string, fallback string) string {
+	for _, key := range []string{"requestId", "RequestId", "request_id", "RequestID"} {
+		if id := apiKeySafeRequestID(firstStr(body, key), cred, params); id != "" {
+			return id
+		}
+	}
+	return fallback
+}
+
+func apiKeySafeRequestID(id string, cred *Credential, params map[string]string) string {
+	id = gatewaySafeRequestID(id, cred)
+	// Even an otherwise valid ID must not echo submitted query text or URLs.
+	for _, key := range []string{"Message", "SearchKey", "UploadLocation"} {
+		if value := params[key]; value != "" && strings.Contains(id, value) {
+			return ""
+		}
+	}
+	return id
 }
 
 // doSignedPost performs a signed POST request using the default API version 2025-04-14.

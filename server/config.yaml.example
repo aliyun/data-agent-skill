@@ -5,8 +5,12 @@
 #           > ~/.data-agent/config.json (legacy)
 # Priority: env vars > .env file > this file > defaults.
 # Prefer environment/managed secret injection and the SDK credential chain.
-# Actual secret-bearing YAML/JSON/.env files must be process-owned regular files
-# with POSIX mode 0600/0400 in trusted directories; public placeholders may be 0644.
+# Secret-bearing YAML/JSON/.env: default process-owned regular files, POSIX
+# 0600/0400 in trusted directories; public placeholders may be 0644.
+# Transitional DOTENV_UNSAFE_FILES_ALLOW=1 must be set in the process environment,
+# not the unsafe .env: root/service-owned non-executable regular files (e.g. 0644),
+# no group/other writes to file or trusted parents. Final symlinks/FIFOs and Windows
+# without verified ACLs remain blocked; warns without values. Prefer 0600/0400.
 # The server does not chmod/chown, migrate files, or authorize deployment changes.
 
 region: cn-hangzhou
@@ -15,9 +19,13 @@ workspace_id: ""          # empty = auto personal workspace
 custom_agent_id: ""       # empty = the backend's built-in agent
 sessions_dir: ~/.data-agent/sessions
 
-# Only SDK default credential-chain AK/STS authentication is supported. Legacy
-# API Key inputs cause a sanitized migration error even with the gateway off;
-# remove old keys/variables rather than leaving empty YAML keys (see README.md).
+# Default: SDK credential-chain AK/STS. Legacy API Key is local stdio only;
+# Nonempty api_key requires identity.enabled=false and agent_gateway.enabled=false.
+# Empty/null api_key or endpoint-only settings do not block AK/STS multi-tenancy.
+# Real-cloud local API Key validation remains pending; prefer secret env injection.
+#api_key: ""                  # env: DATA_AGENT_API_KEY
+#api_key_endpoint: ""         # env: DATA_AGENT_API_KEY_ENDPOINT
+#api_key_stream_endpoint: ""  # env: DATA_AGENT_API_KEY_STREAM_ENDPOINT
 
 # Existing Data Agent / DMS overrides default to hosts derived from region.
 # Signed API/SSE clients reject redirects; do not change targets to bypass errors.
@@ -89,16 +97,16 @@ log:
     max_bytes: 67108864
 
 # This template defaults to LOCAL STDIO ONLY. All HTTP/SSE deployments, gateway
-# on OR off, must explicitly set enabled=true, require_identity=true, a nonempty
-# auth_token via environment, and a valid namespace. No anonymous/global fallback
-# for any remote tool or protocol method; no weak-compatibility switch.
+# on OR off, require enabled=true, require_identity=true and a nonempty auth_token.
+# No anonymous/global-key fallback for any remote tool or protocol method.
 # Every initialize/tools/list/call/notification and GET/POST/DELETE authenticates.
 # Protocol IDs are server-issued, principal-owned and leased (see README.md).
 identity:
   enabled: false
-  require_identity: true
-  # Required remotely: stable administrator-chosen non-secret trust domain,
-  # 1-64 chars [a-z0-9][a-z0-9_-]*. Never derive it from a request or RAM role.
+  require_identity: true         # omitted = true; explicit false rejected remotely
+  # Omitted/empty = "default"; explicit valid values are unchanged.
+  # Admin-chosen, 1-64 chars [a-z0-9][a-z0-9_-]*; not from requests or RAM roles.
+  # Independent deployments/trust domains sharing sessions_dir need distinct values.
   namespace: ""
   # Cached Tenants + in-progress initialization reservations, NOT connections.
   # No automatic eviction; closing a protocol session does not free a Tenant.
@@ -111,10 +119,11 @@ identity:
     secret: ""                  # inject IDENTITY_JWT_SECRET; HMAC key used as-is
     # All keys have equivalent signing authority within ONE trusted domain.
     # Use for rotation/mutually trusted apps, never unrelated organizations.
-    # Independent trust domains need separate instances/config/storage roots.
+    # Independent trust domains need separate instances/config; use distinct
+    # namespaces if sharing a sessions root. Keys do not isolate issuers.
     secrets: []                 # env: IDENTITY_JWT_SECRETS (comma-separated)
     header: ""                  # default x-aily-jwt; bare token, no Bearer prefix
-  # RoleSessionName attribution only; mapping always uses scoped user_id/email.
+  # RoleSessionName attribution only; mapping uses verified user_id/email.
   # user_id | email | enterprise_email | employee_no | tenant_id | agent_id
   session_name_claim: user_id
   # Omit prefix for historical "aily-<value>"; empty string means bare value.
@@ -126,10 +135,11 @@ identity:
     user: ""                    # default x-aily-user
     email: ""                   # default x-aily-email
     token: ""                   # default x-aily-token
-  # No default mapping: unmatched identities are rejected. To add a default,
-  # configure a real role and exact JWT tenant/agent scope (empty in header mode).
-  # Named groups win ONLY within the exact scope; multiple group matches reject,
-  # even if they have the same role. No wildcard or cross-scope default.
+  # No default: unmatched identities reject. JWT: prefer exact tenant/agent pairs
+  # on ALL groups/default, as below; legacy ALL omitted/empty pairs share mappings
+  # by signed user_id/email within one signing trust domain. No mixed/partial/* scopes.
+  # Named groups win, then default within the selected mapping mode; multiple group
+  # matches reject even for the same role. Header mode requires both scopes empty.
   #default:
   #  tenant_id: "<trusted-tenant-id>"  # JWT only; use "" in header mode
   #  agent_id: "<trusted-agent-id>"    # JWT only; use "" in header mode
@@ -148,7 +158,8 @@ identity:
   #    users: ["<user-id>", "<user-email>"]
 
 # Remote local history: sessions_dir/identity-v2/<principal_id>/ with owner.json.
-# Principal hashes namespace, auth mode, tenant/agent and typed user_id/email.
+# Protocol sessions, tenant cache and disk use the verified principal: namespace,
+# auth mode, tenant/agent and typed user_id/email, even with shared role mappings.
 # No automatic old identity/<sanitized-key> fallback, claiming or migration.
 # Historical import requires separately authorized admin ownership verification.
 # Owner markers/local isolation do not establish cloud session ACL or row isolation.

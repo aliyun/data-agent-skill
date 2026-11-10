@@ -225,6 +225,72 @@ func (f *httpFixture) initializeSSE(t *testing.T, c *sseConnection) {
 	awaitHTTP(t, func() bool { _, n := f.counts(); return n == 0 })
 }
 
+func TestLegacyJWTMappingDoesNotShareProtocolSessions(t *testing.T) {
+	for _, kind := range []string{"streamable-http", "sse"} {
+		t.Run(kind, func(t *testing.T) {
+			cfg := config.Config{HTTP: httpLimits(), Identity: config.Identity{
+				Enabled: true, RequireIdentity: true, AuthToken: "synthetic-platform-token", MaxTenants: 128,
+				JWT:     config.JWT{Enabled: true, Secret: testHTTPSecret},
+				Default: &config.IdentityGroup{RoleArn: "shared-role"},
+			}}
+			cfg.ApplyDefaults()
+			if err := cfg.ValidateTransport(kind); err != nil {
+				t.Fatal(err)
+			}
+			registry := tenant.NewRegistry(context.Background(), cfg, nil)
+			t.Cleanup(func() { _ = registry.Close() })
+			f := &httpFixture{s: New(nil, nil, "legacy-test"), jwt: true}
+			f.s.EnableJWTIdentity("")
+			if err := f.s.ConfigureHTTP(cfg.HTTP, registry.Authenticate); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			f.rt, err = f.s.newRemoteTransport(context.Background(), kind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.ts = httptest.NewServer(f.rt)
+			t.Cleanup(func() { f.rt.close(); f.ts.Close() })
+			path, id, status := "/mcp", "", 200
+			var stream *sseConnection
+			if kind == "sse" {
+				stream = f.connectSSE(t, "A")
+				f.initializeSSE(t, stream)
+				path, status = "/message?sessionId="+stream.id, 202
+			} else {
+				id = f.initialize(t, "A")
+			}
+			for _, scope := range [][3]string{{"other-tenant", "agent", "A"}, {"tenant", "other-agent", "A"}, {"tenant", "agent", "B"}} {
+				token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+					"tenant_id": scope[0], "agent_id": scope[1], "user_id": scope[2], "exp": time.Now().Add(time.Hour).Unix(),
+				}).SignedString([]byte(testHTTPSecret))
+				if err != nil {
+					t.Fatal(err)
+				}
+				req := f.request(t, "POST", path, id, "A", pingMessage)
+				req.Header.Set("x-aily-jwt", token)
+				statusHTTP(t, f.do(t, req), 404)
+			}
+			req := f.request(t, "POST", path, id, "A", pingMessage)
+			req.Header.Del("x-aily-jwt")
+			statusHTTP(t, f.do(t, req), 401)
+			req = f.request(t, "POST", path, id, "A", pingMessage)
+			req.Header.Del("x-aily-jwt")
+			req.Header.Set("x-aily-user", "A")
+			statusHTTP(t, f.do(t, req), 400)
+			req = f.request(t, "POST", path, id, "A", pingMessage)
+			req.Header.Set("x-aily-token", "incorrect-platform-token")
+			statusHTTP(t, f.do(t, req), 401)
+			statusHTTP(t, f.do(t, f.request(t, "POST", path, id, "A", pingMessage)), status)
+			if stream != nil {
+				if response := stream.next(t); !strings.Contains(response, `"id":2`) {
+					t.Fatal("owner could not use its SSE session")
+				}
+			}
+		})
+	}
+}
+
 func TestHTTPRemoteRequiresConfiguration(t *testing.T) {
 	s := New(nil, nil, "test")
 	for _, kind := range []string{"sse", "streamable-http"} {

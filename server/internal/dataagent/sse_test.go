@@ -14,6 +14,130 @@ import (
 	"time"
 )
 
+func TestAPIKeySSEFinishAndCheckpoint(t *testing.T) {
+	for _, checkpoint := range []int{-1, 0, 2} {
+		t.Run(fmt.Sprint(checkpoint), func(t *testing.T) {
+			c := apiKeyTestClient(t, WithAPIKeyEndpoint("control.example.invalid"), WithAPIKeyStreamEndpoint("stream.example.invalid"))
+			var calls atomic.Int32
+			ctx, ids := WithRequestIDs(context.Background())
+			c.sse.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls.Add(1)
+				payload := apiKeyRequestPayload(t, req)
+				if req.URL.Host != "stream.example.invalid" || req.Header.Get("Accept") != "text/event-stream" ||
+					payload["Action"] != "GetChatContent" || payload["Version"] != "2025-04-14" || payload["RegionId"] != "cn-shanghai" ||
+					payload["AgentId"] != "agent" || payload["SessionId"] != "session" || payload["DmsUnit"] != nil || req.Context().Value(requestIDsKey{}) != ids {
+					t.Error("API Key stream lost endpoint, scope, or caller context")
+				}
+				if checkpoint > 0 && payload["Checkpoint"] != "2" || checkpoint <= 0 && payload["Checkpoint"] != nil {
+					t.Error("API Key stream changed checkpoint semantics")
+				}
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(
+					"event: content_start at timestamp\ndata: {\"checkpoint\":2,\"category\":\"task_finish\"}\n\n" +
+						"event: data\ndata: {\"checkpoint\":2,\"content\":\"result\",\"channel\":{\"mission_id\":\"m\"}}\n\n" +
+						"event: content_finish\ndata: {\"checkpoint\":2}\n\n" +
+						"event: SSE_FINISH\ndata: {}\n\n" +
+						"event: data\ndata: {\"content\":\"must not consume after finish\"}\n\n"))}, nil
+			})
+			stream, err := c.StreamSSE(ctx, "agent", "session", checkpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var events []SSEEvent
+			for event := range stream {
+				events = append(events, event)
+			}
+			if calls.Load() != 1 || len(events) != 4 || events[1].Content != "result" || events[1].Data["channel"] == nil || events[3].EventType != "SSE_FINISH" {
+				t.Fatalf("stream retried or lost events: calls=%d events=%+v", calls.Load(), events)
+			}
+			for _, event := range events[:3] {
+				if event.Checkpoint == nil || *event.Checkpoint != 2 {
+					t.Fatal("shared checkpoint batch changed")
+				}
+			}
+		})
+	}
+}
+
+func TestAPIKeySSELimitsAndSanitizedLogs(t *testing.T) {
+	t.Setenv("DATA_AGENT_DEBUG_SSE", "1")
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	const sensitive = "synthetic-api-key private-query https://example.invalid/?Signature=signed-secret"
+	for _, mode := range []string{"finish", "eof", "read-error", "oversize", "http-error", "redirect"} {
+		t.Run(mode, func(t *testing.T) {
+			c := apiKeyTestClient(t)
+			var calls atomic.Int32
+			c.sse.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls.Add(1)
+				apiKeyRequestPayload(t, req)
+				text := "data: {\"event_type\":\"delta\",\"checkpoint\":2,\"content\":\"" + sensitive + "\"}\n\n"
+				status := http.StatusOK
+				var body io.ReadCloser
+				switch mode {
+				case "finish":
+					text += "data: {\"event_type\":\"SSE_FINISH\"}\n\n"
+				case "read-error":
+					body = &failingResponseBody{Reader: strings.NewReader(text), err: errors.New(sensitive)}
+				case "oversize":
+					text = "data: " + strings.Repeat("x", 1024*1024) + "\n"
+				case "http-error":
+					status = http.StatusForbidden
+				case "redirect":
+					status = http.StatusTemporaryRedirect
+				}
+				if body == nil {
+					body = io.NopCloser(strings.NewReader(text))
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{
+					"X-Acs-Request-Id": []string{"synthetic-api-key"}, "Content-Type": []string{sensitive},
+				}, Body: body}, nil
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			events := make(chan SSEEvent, 4)
+			finished, err := c.sse.doStream(ctx, "a", "synthetic-api-key", 1, events)
+			wantSuccess := mode == "finish" || mode == "eof"
+			if (err == nil) != wantSuccess || finished != wantSuccess {
+				t.Fatalf("mode=%s finished=%t error=%v", mode, finished, err)
+			}
+			if !wantSuccess {
+				for _, secret := range []string{"synthetic-api-key", "private-query", "https://", "signed-secret"} {
+					if strings.Contains(err.Error(), secret) {
+						t.Fatal("stream error exposed sensitive upstream text")
+					}
+				}
+			}
+			stream, err := c.StreamSSE(ctx, "a", "synthetic-api-key\nFORGED", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			count := 0
+			for range stream {
+				count++
+			}
+			wantCount := 0
+			if mode == "finish" {
+				wantCount = 2
+			} else if mode == "eof" || mode == "read-error" {
+				wantCount = 1
+			}
+			if count != wantCount || calls.Load() != 2 || ctx.Err() != nil {
+				t.Fatalf("stream retried or consumed invalid body: count=%d calls=%d", count, calls.Load())
+			}
+		})
+	}
+	for _, secret := range []string{"synthetic-api-key", "private-query", "https://", "signed-secret", "\nFORGED"} {
+		if strings.Contains(logs.String(), secret) {
+			t.Fatal("stream log exposed sensitive upstream text")
+		}
+	}
+	if !strings.Contains(logs.String(), "received line bytes=") || !strings.Contains(logs.String(), "connection ended") {
+		t.Fatal("safe stream diagnostics missing")
+	}
+}
+
 func TestSSERedirectsRejectedOnEveryConnection(t *testing.T) {
 	t.Setenv("DATA_AGENT_DEBUG_SSE", "1")
 	var logs bytes.Buffer

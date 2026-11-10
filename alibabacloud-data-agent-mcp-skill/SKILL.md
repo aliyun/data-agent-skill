@@ -138,6 +138,7 @@ data_agent_create_session(
   database_id?, db_name?, tables?,                 # database session
   file_id?, file_name?,                            # file session, from callback
   mode="auto|lite|pro|ultra",                       # default: auto DB / pro file
+  work_mode="ANALYSIS|CHAT",                       # optional; CHAT for more interaction
   plan_mode="force|disable",                       # optional; pro/ultra only
   auto_confirm=true,                              # plan/SQL only, never web report
   instance_id?, instance_name?, engine="mysql",    # database metadata
@@ -256,6 +257,8 @@ Use `data_agent_list_sessions(include_history=true)` → one `data_agent_status`
 | `ultra` | User explicitly requests the most thorough exploration | 2–60 min |
 
 Do not switch pro/ultra to speed up a run or restart a slow session. Durations are expectations, not polling intervals. Legacy `ASK_DATA`/`ANALYSIS`/`INSIGHT` map to lite/pro/ultra.
+
+For more interaction, clarification and back-and-forth conversation, set `work_mode="CHAT"` on `data_agent_create_session`. Use `ANALYSIS` for data-analysis interaction or omit the parameter to keep the upstream default (`ANALYSIS`). Keep `work_mode` separate from the `mode` tier above. The server sends it in the first `SendChatMessage.SessionConfig`; that configuration only takes effect on the session's first message, so do not try to switch it with `data_agent_send` on an existing session. `CHAT` does not change `auto_confirm`; set `auto_confirm=false` as well only when the user wants manual plan/SQL confirmation.
 
 For pro/ultra only, omit `plan_mode` for server behavior; use `force` when the user wants an execution plan, or `disable` when the user asks to skip planning. Do not disable a requested plan merely to reduce latency.
 

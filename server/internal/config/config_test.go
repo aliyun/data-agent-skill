@@ -1,7 +1,6 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,7 +12,7 @@ import (
 func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
-		"DATA_AGENT_CONFIG", "DATA_AGENT_ENV_FILE", "BUDDY_REGION",
+		"DATA_AGENT_CONFIG", "DATA_AGENT_ENV_FILE", "BUDDY_REGION", "DOTENV_UNSAFE_FILES_ALLOW",
 		"DATA_AGENT_REGION", "DATA_AGENT_DMS_UNIT", "DATA_AGENT_WORKSPACE_ID",
 		"DATA_AGENT_SESSIONS_DIR", "DATA_AGENT_API_KEY", "AILY_SHARED_SECRET",
 		"DATA_AGENT_API_KEY_ENDPOINT", "DATA_AGENT_API_KEY_STREAM_ENDPOINT",
@@ -487,35 +486,61 @@ func TestValidateIdentityRequiresMapping(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsLegacyAuthentication(t *testing.T) {
-	for _, enabled := range []bool{false, true} {
-		for _, withAK := range []bool{false, true} {
-			for _, key := range []string{"api_key", "api_key_endpoint", "api_key_stream_endpoint"} {
-				for _, value := range []string{"\"\"", "null", "migration-secret", "{secret: migration-secret}"} {
-					t.Run(fmt.Sprintf("yaml/%v/%v/%s/%s", enabled, withAK, key, value), func(t *testing.T) {
-						clearEnv(t)
-						setTestAK(t, withAK)
-						body := fmt.Sprintf("agent_gateway:\n  enabled: %v\n%s: %s\n", enabled, key, value)
-						writeConfig(t, body)
-						_, _, err := Load()
-						if !errors.Is(err, errLegacyAuthentication) || strings.Contains(err.Error(), "migration-secret") {
-							t.Fatalf("expected sanitized migration error, got %v", err)
-						}
-					})
+func TestLoadLegacyAuthentication(t *testing.T) {
+	for _, withAK := range []bool{false, true} {
+		for _, source := range []string{"yaml", "env"} {
+			t.Run(fmt.Sprintf("%s/ak=%t", source, withAK), func(t *testing.T) {
+				clearEnv(t)
+				setTestAK(t, withAK)
+				writeConfig(t, "api_key: synthetic-yaml-key\napi_key_endpoint: control.example\napi_key_stream_endpoint: stream.example\n")
+				want := "synthetic-yaml-key"
+				if source == "env" {
+					want = "synthetic-env-key"
+					t.Setenv("DATA_AGENT_API_KEY", want)
+					t.Setenv("DATA_AGENT_API_KEY_ENDPOINT", "env-control.example")
+					t.Setenv("DATA_AGENT_API_KEY_STREAM_ENDPOINT", "env-stream.example")
 				}
-				for _, value := range []string{"migration-secret", " "} {
-					t.Run(fmt.Sprintf("env/%v/%v/%s/%s", enabled, withAK, key, value), func(t *testing.T) {
-						clearEnv(t)
-						setTestAK(t, withAK)
-						writeConfig(t, fmt.Sprintf("agent_gateway:\n  enabled: %v\n", enabled))
-						t.Setenv("DATA_AGENT_"+strings.ToUpper(key), value)
-						_, _, err := Load()
-						if !errors.Is(err, errLegacyAuthentication) {
-							t.Fatalf("got %v", err)
-						}
-					})
+				cfg, _, err := Load()
+				if err != nil || cfg.APIKey != want {
+					t.Fatal("legacy API Key not loaded")
 				}
-			}
+				if source == "env" && (cfg.APIKeyEndpoint != "env-control.example" || cfg.APIKeyStreamEndpoint != "env-stream.example") {
+					t.Fatal("endpoint environment override not applied")
+				}
+			})
+		}
+	}
+	for _, body := range []string{
+		"api_key: ''\napi_key_endpoint: null\napi_key_stream_endpoint: old-stream.example\n",
+		"api_key: null\napi_key_endpoint: old-control.example\n",
+	} {
+		clearEnv(t)
+		writeConfig(t, body+"identity:\n  enabled: true\n  auth_token: synthetic-platform\n  default: {role_arn: synthetic-role}\n")
+		t.Setenv("MCP_TRANSPORT", "streamable-http")
+		cfg, _, err := Load()
+		if err != nil || cfg.APIKey != "" {
+			t.Fatalf("unused legacy configuration must not prevent AK/STS startup: %v", err)
+		}
+	}
+}
+
+func TestAPIKeyDoesNotDowngradeIdentityOrGateway(t *testing.T) {
+	for _, body := range []string{
+		"identity: {enabled: true, auth_token: synthetic-platform, default: {role_arn: synthetic-role}}\n",
+		"agent_gateway: {enabled: true, endpoint: dms.cn-hangzhou.aliyuncs.com}\n",
+	} {
+		clearEnv(t)
+		writeConfig(t, "api_key: synthetic-sensitive-api-key\n"+body)
+		if _, _, err := Load(); err == nil || strings.Contains(err.Error(), "synthetic-sensitive-api-key") {
+			t.Fatalf("expected sanitized incompatible credential error, got %v", err)
+		}
+	}
+	for _, transport := range []string{"sse", "streamable-http"} {
+		clearEnv(t)
+		writeConfig(t, "api_key: synthetic-sensitive-api-key\n")
+		t.Setenv("MCP_TRANSPORT", transport)
+		if _, _, err := Load(); err == nil || strings.Contains(err.Error(), "synthetic-sensitive-api-key") {
+			t.Fatalf("remote API Key must not bypass identity: %v", err)
 		}
 	}
 }
@@ -540,34 +565,33 @@ func writeConfig(t *testing.T, body string) {
 }
 
 func TestLegacyAuthenticationAliasesAndMerges(t *testing.T) {
-	for _, body := range []string{
-		"legacy: &old {api_key: secret}\n<<: *old\n",
-		"legacy: &old {api_key_endpoint: null}\n<<: [*old, {region: cn-hangzhou}]\n",
-		"legacy: &old {api_key_stream_endpoint: ''}\nintermediate: &middle {<<: *old}\n<<: *middle\n",
-		"key: &old api_key\n*old : null\n",
-		"key: &old api_key_endpoint\n*old : null\n",
-		"key: &old api_key_stream_endpoint\n*old : null\n",
-		"legacy: &old {api_key: secret}\n<<: *old\napi_key: null\n",
-		"region: cn-hangzhou\n---\napi_key: secret\n",
-		"&root {<<: *root, api_key: secret}\n",
-		`{"api_key": null}`,
+	for _, tc := range []struct{ body, key string }{
+		{"legacy: &old {api_key: synthetic-secret}\n<<: *old\n", "synthetic-secret"},
+		{"legacy: &old {api_key_endpoint: null}\n<<: [*old, {region: cn-hangzhou}]\n", ""},
+		{"legacy: &old {api_key_stream_endpoint: ''}\nintermediate: &middle {<<: *old}\n<<: *middle\n", ""},
+		{"key: &old api_key\n*old : null\n", ""},
+		{"legacy: &old {api_key: synthetic-secret}\n<<: *old\napi_key: null\n", ""},
+		{`{"api_key": null}`, ""},
+		{"extension: {api_key: not-a-top-level-key}\n", ""},
 	} {
-		t.Run(body, func(t *testing.T) {
-			clearEnv(t)
-			writeConfig(t, body)
-			if _, _, err := Load(); !errors.Is(err, errLegacyAuthentication) {
-				t.Fatalf("got %v", err)
-			}
-		})
+		clearEnv(t)
+		writeConfig(t, tc.body)
+		cfg, _, err := Load()
+		if err != nil || cfg.APIKey != tc.key {
+			t.Fatalf("legacy YAML merge not decoded: %v", err)
+		}
 	}
-	clearEnv(t)
-	writeConfig(t, "extension: {api_key: not-a-top-level-key}\n")
-	if _, _, err := Load(); err != nil {
-		t.Fatal(err)
-	}
-	writeConfig(t, "&root {<<: *root}\n")
-	if _, _, err := Load(); err == nil {
-		t.Fatal("cyclic merge accepted")
+	for _, body := range []string{
+		"region: cn-hangzhou\n---\napi_key: synthetic-secret\n",
+		"&root {<<: *root, api_key: synthetic-secret}\n",
+		"api_key: {secret: synthetic-secret}\n",
+		"api_key: [synthetic-secret]\n",
+	} {
+		clearEnv(t)
+		writeConfig(t, body)
+		if _, _, err := Load(); err == nil || strings.Contains(err.Error(), "synthetic-secret") {
+			t.Fatalf("expected sanitized malformed config error, got %v", err)
+		}
 	}
 }
 

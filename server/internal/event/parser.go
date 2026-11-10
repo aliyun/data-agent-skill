@@ -98,6 +98,9 @@ func parseDataEvent(category, content, contentType string) ParsedEvent {
 	case CatLLM:
 		return parseFallback(content, category)
 
+	case CatAgentReply:
+		return parseAgentReply(content)
+
 	case CatToolCallResponse:
 		return parseToolCallResponse(content)
 
@@ -146,6 +149,16 @@ func parseDataEvent(category, content, contentType string) ParsedEvent {
 	default:
 		return ParsedEvent{Action: ActionNone, Category: category}
 	}
+}
+
+func parseAgentReply(content string) ParsedEvent {
+	if parsed, ok := tryParseJSON(content); ok {
+		content, _ = stringField(parsed, "content")
+	}
+	if strings.TrimSpace(content) == "" {
+		return ParsedEvent{Action: ActionNone, Category: CatAgentReply}
+	}
+	return ParsedEvent{Action: ActionConclusion, Category: CatAgentReply, Content: content, Images: ExtractBase64Images(content)}
 }
 
 // mission objective conclusions may embed <trace id="..."> provenance markers
@@ -209,6 +222,9 @@ func parseContentFinish(category, content, contentType string) ParsedEvent {
 	switch category {
 	case CatLLM:
 		return parseFallback(content, category)
+
+	case CatAgentReply:
+		return parseAgentReply(content)
 
 	case CatOutputConclusion:
 		// The caller should have accumulated delta chunks and passes the

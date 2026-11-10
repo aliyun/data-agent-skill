@@ -3,7 +3,11 @@
 package config
 
 import (
+	"bytes"
+	"log"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -20,6 +24,141 @@ func (i syntheticFileInfo) Mode() os.FileMode  { return i.mode }
 func (i syntheticFileInfo) ModTime() time.Time { return time.Time{} }
 func (i syntheticFileInfo) IsDir() bool        { return i.mode.IsDir() }
 func (i syntheticFileInfo) Sys() any           { return &syscall.Stat_t{Uid: i.uid} }
+
+func TestLegacyReadableSecretFileBoundaries(t *testing.T) {
+	uid := uint32(os.Geteuid())
+	for _, owner := range []uint32{0, uid} {
+		for _, mode := range []os.FileMode{0400, 0600, 0640, 0644} {
+			if !legacyReadableSecretFile(syntheticFileInfo{mode: mode, uid: owner}) {
+				t.Fatalf("legacy readable file rejected: %o", mode)
+			}
+		}
+	}
+	for _, mode := range []os.FileMode{0666, 0620, 0602, 0700, os.ModeNamedPipe | 0600} {
+		if legacyReadableSecretFile(syntheticFileInfo{mode: mode, uid: uid}) {
+			t.Fatalf("writable/executable/nonregular file accepted: %o", mode)
+		}
+	}
+	if legacyReadableSecretFile(syntheticFileInfo{mode: 0644, uid: uid + 1}) {
+		t.Fatal("untrusted file owner accepted")
+	}
+}
+
+func TestLegacyReadableConfigAndDotEnv(t *testing.T) {
+	for _, dotenv := range []bool{false, true} {
+		for _, allow := range []string{"", "0", "1"} {
+			clearEnv(t)
+			t.Setenv("DOTENV_UNSAFE_FILES_ALLOW", allow)
+			path := filepath.Join(t.TempDir(), "legacy-config")
+			body := "identity: {auth_token: synthetic-legacy-secret}\n"
+			if dotenv {
+				body = "IDENTITY_AUTH_TOKEN=synthetic-legacy-secret\n"
+			}
+			if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+				t.Fatal(err)
+			}
+			var output bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&output)
+			var err error
+			if dotenv {
+				t.Setenv("DATA_AGENT_ENV_FILE", path)
+				err = LoadDotEnv()
+			} else {
+				t.Setenv("DATA_AGENT_CONFIG", path)
+				_, _, err = Load()
+			}
+			log.SetOutput(previous)
+			if (err == nil) != (allow == "1") {
+				t.Fatalf("dotenv=%v allow=%q error=%v", dotenv, allow, err)
+			}
+			if allow == "1" && !strings.Contains(output.String(), "warning:") {
+				t.Fatal("missing permission warning")
+			}
+			if strings.Contains(output.String(), "synthetic-legacy-secret") {
+				t.Fatal("permission warning leaked secret")
+			}
+			info, err := os.Stat(path)
+			if err != nil || info.Mode().Perm() != 0644 {
+				t.Fatal("compatibility must not change file permissions")
+			}
+		}
+	}
+}
+
+func TestDotEnvCannotEnablePermissionException(t *testing.T) {
+	for _, flag := range []string{"", "0", "1"} {
+		t.Run("process_flag="+flag, func(t *testing.T) {
+			clearEnv(t)
+			if flag == "" {
+				os.Unsetenv("DOTENV_UNSAFE_FILES_ALLOW")
+			} else {
+				t.Setenv("DOTENV_UNSAFE_FILES_ALLOW", flag)
+			}
+			os.Unsetenv("DATA_AGENT_REGION")
+			dir := t.TempDir()
+			envPath, configPath := filepath.Join(dir, "legacy.env"), filepath.Join(dir, "config.yaml")
+			if err := os.WriteFile(envPath, []byte("DOTENV_UNSAFE_FILES_ALLOW=1\nDATA_AGENT_REGION=cn-shanghai\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(configPath, []byte("identity: {auth_token: synthetic-private-value}\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("DATA_AGENT_ENV_FILE", envPath)
+			t.Setenv("DATA_AGENT_CONFIG", configPath)
+			if err := LoadDotEnv(); err != nil {
+				t.Fatal(err)
+			}
+			if os.Getenv("DOTENV_UNSAFE_FILES_ALLOW") != flag {
+				t.Fatal("dotenv changed the process-only permission exception")
+			}
+			if os.Getenv("DATA_AGENT_REGION") != "cn-shanghai" {
+				t.Fatal("normal dotenv values were not loaded")
+			}
+			if _, _, err := Load(); (err == nil) != (flag == "1") {
+				t.Fatalf("permission exception must depend on initial process environment: %v", err)
+			}
+		})
+	}
+}
+
+func TestLegacyPermissionFlagDoesNotBypassIntegrity(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("DOTENV_UNSAFE_FILES_ALLOW", "1")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("identity: {auth_token: synthetic-secret}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DATA_AGENT_CONFIG", path)
+	for _, mode := range []os.FileMode{0666, 0620, 0700} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := Load(); err == nil {
+			t.Fatalf("unsafe file permissions accepted: %o", mode)
+		}
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.yaml")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DATA_AGENT_CONFIG", link)
+	if _, _, err := Load(); err == nil {
+		t.Fatal("symlink accepted")
+	}
+	t.Setenv("DATA_AGENT_CONFIG", path)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0700)
+	if _, _, err := Load(); err == nil {
+		t.Fatal("untrusted writable directory accepted")
+	}
+}
 
 func TestSecretFileOwnerChecksWithoutChangingOwnership(t *testing.T) {
 	uid := uint32(os.Geteuid())

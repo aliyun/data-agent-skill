@@ -141,6 +141,63 @@ func TestJWTUserIDAndEmailOnlyAreDifferentPrincipals(t *testing.T) {
 	}
 }
 
+func TestLegacySharedRoleKeepsJWTPrincipalsAndStorageSeparate(t *testing.T) {
+	cfg := config.Config{Region: "cn-hangzhou", SessionsDir: t.TempDir(), HTTP: config.DefaultHTTP(), Identity: config.Identity{
+		Enabled: true, RequireIdentity: true, AuthToken: testAuthToken, MaxTenants: 128,
+		JWT:     config.JWT{Enabled: true, Secret: testSecret},
+		Default: &config.IdentityGroup{RoleArn: "shared-role"},
+	}}
+	cfg.ApplyDefaults()
+	if err := cfg.ValidateTransport("streamable-http"); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRegistry(context.Background(), cfg, fakeProvider{})
+	t.Cleanup(func() { _ = r.Close() })
+	r.newProviderFn = func(string, string) (credential.Credential, error) { return fakeProvider{}, nil }
+	seen := make(map[string]*Tenant)
+	for _, fields := range []map[string]any{
+		{"tenant_id": "t1", "agent_id": "a1", "user_id": "same-user"},
+		{"tenant_id": "t2", "agent_id": "a1", "user_id": "same-user"},
+		{"tenant_id": "t1", "agent_id": "a2", "user_id": "same-user"},
+		{"tenant_id": "t1", "agent_id": "a1", "email": "same-user"},
+	} {
+		ctx, err := r.Authenticate(jwtCtx(t, fields))
+		if err != nil {
+			t.Fatal(err)
+		}
+		principal := PrincipalFromContext(ctx)
+		if principal == nil || principal.Namespace != "default" || principal.TenantID != fields["tenant_id"] || principal.AgentID != fields["agent_id"] {
+			t.Fatal("legacy role mapping lost verified scope")
+		}
+		ten, err := r.Resolve(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := seen[principal.ID]; exists {
+			t.Fatal("different JWT scopes shared principal")
+		}
+		for _, other := range seen {
+			if other.Manager == ten.Manager || other.Client == ten.Client {
+				t.Fatal("shared role reused another principal's state")
+			}
+		}
+		seen[principal.ID] = ten
+		if ten.Group != "default" || ten.RoleArn != "shared-role" || ten.Key != principal.ID {
+			t.Fatal("legacy role mapping changed")
+		}
+		if info, err := os.Stat(filepath.Join(cfg.SessionsDir, "identity-v2", principal.ID, "owner.json")); err != nil || !info.Mode().IsRegular() {
+			t.Fatal("missing isolated owner record")
+		}
+		again, err := r.Resolve(ctx)
+		if err != nil || again != ten {
+			t.Fatal("same principal did not reuse its own tenant")
+		}
+	}
+	if _, err := r.Authenticate(WithIdentity(context.Background(), "same-user", "", testAuthToken)); !IsAuthenticationError(err) {
+		t.Fatal("shared mapping downgraded missing JWT to headers")
+	}
+}
+
 func TestStrictJWTIdentityFieldTypes(t *testing.T) {
 	invalid := []any{nil, true, false, []any{"id"}, map[string]any{"id": "value"}, json.Number("1.5"), json.Number("1e3"), "a\nb", "\x00id"}
 	for _, field := range []string{"user_id", "tenant_id", "agent_id", "email", "enterprise_email", "employee_no"} {

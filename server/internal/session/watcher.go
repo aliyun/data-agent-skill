@@ -280,12 +280,12 @@ func (w *Watcher) streamOnce(ctx context.Context) (bool, bool) {
 			contentCategory, accum = ev.Category, nil
 			return
 		case "delta":
-			if contentCategory == "output_conclusion" || contentCategory == "tool_call_response" || contentCategory == "llm" {
+			if contentCategory == "output_conclusion" || contentCategory == "tool_call_response" || contentCategory == "llm" || contentCategory == event.CatAgentReply {
 				accum = append(accum, ev.Content...)
 			}
 			return
 		case "data":
-			if (ev.Category == "llm" || ev.Category == "tool_call_response") && contentCategory == ev.Category {
+			if (ev.Category == "llm" || ev.Category == "tool_call_response" || ev.Category == event.CatAgentReply) && contentCategory == ev.Category {
 				accum = []byte(ev.Content)
 				return
 			}

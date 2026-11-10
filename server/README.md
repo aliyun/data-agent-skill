@@ -59,62 +59,78 @@ Use [config.yaml.example](config.yaml.example) for non-secret settings and
 environment injection for secrets. Do not copy placeholder credentials over an
 intended SDK workload-role provider.
 
-Actual secret-bearing YAML/JSON/**dotenv** files must be process-account-owned
-regular files in trusted directories, POSIX **0600/0400**, with no group/other
-access. Non-secret/public-placeholder files may be 0644. The loader validates
-the opened file; final symlinks are rejected in the current implementation.
-Projected secrets require a supported regular-file or environment path; Windows
-file secrets require equivalent verified ACLs or are blocked. No automatic
-chmod/chown, secret rotation or migration occurs. Real permissions, secrets and
-deployment changes require separate administrator authorization; see
+By default, actual secret-bearing YAML/JSON/**dotenv** files must be
+process-account-owned regular files in trusted directories, POSIX **0600/0400**,
+with no group/other access. Non-secret/public-placeholder files may be 0644.
+For transitional compatibility, `export DOTENV_UNSAFE_FILES_ALLOW=1` in the
+**process environment or launch command** permits root- or service-user-owned,
+non-executable regular files such as 0644, but never group/other-writable files.
+The variable is ignored in `.env` files, even non-secret ones. Trusted-parent
+ownership and no-group/other-write checks still apply; final symlinks and FIFOs
+are rejected. Windows file secrets without verified ACLs remain blocked. The
+loader validates the opened file and warns without secret values when using the
+exception; it does not change permissions. Do not retain secrets as 0644 long-term.
+No automatic chmod/chown, secret rotation or migration occurs. Real permissions,
+secrets and deployment changes require separate administrator authorization; see
 [secret-file requirements](../alibabacloud-data-agent-mcp-skill/references/INSTALLATION.md#secret-files).
 
 Priority: **env vars > `.env` > `config.yaml` > defaults**. Config file lookup:
 `$DATA_AGENT_CONFIG` > `./config.yaml` > `~/.data-agent/config.yaml`.
 
-Startup uses the **credentials-go default chain**, retaining the provider for
-subsequent credential retrieval and RAM AssumeRole source chaining. Configure
-SDK-supported environment credentials (AK/SK and, for temporary credentials,
-`ALIBABA_CLOUD_SECURITY_TOKEN`) or a supported instance/workload-role provider.
+Without a nonempty API Key, startup uses the **credentials-go default chain**,
+retaining the provider for subsequent credential retrieval and RAM AssumeRole
+source chaining. Configure SDK-supported environment credentials (AK/SK and, for
+temporary credentials, `ALIBABA_CLOUD_SECURITY_TOKEN`) or a supported
+instance/workload-role provider.
 The server does not hand-read `~/.aliyun/config.json`; do not assume Alibaba
 Cloud CLI profiles automatically work. Static STS environment values do not
 renew themselves; dynamic refresh depends on the selected provider.
 
-### API Key migration (all Go Server deployments)
+### API Key compatibility (local stdio only)
 
-API Key runtime mode is removed from ordinary API calls and SSE, regardless
-of `agent_gateway.enabled`. Remove the old YAML keys `api_key`,
-`api_key_endpoint`, `api_key_stream_endpoint` and environment variables
-`DATA_AGENT_API_KEY`, `DATA_AGENT_API_KEY_ENDPOINT`,
-`DATA_AGENT_API_KEY_STREAM_ENDPOINT` from the deployment.
+API Key authentication is supported for a **local, single-process stdio** server.
+The legacy YAML/JSON keys `api_key`, `api_key_endpoint`, `api_key_stream_endpoint`
+and environment variables `DATA_AGENT_API_KEY`, `DATA_AGENT_API_KEY_ENDPOINT`,
+`DATA_AGENT_API_KEY_STREAM_ENDPOINT` remain supported. An empty/null `api_key`,
+or old endpoint settings alone, does not select API Key mode or block AK/STS
+multi-tenant startup. A nonempty API Key cannot be combined with
+`identity.enabled=true` or `agent_gateway.enabled=true`, or used for HTTP/SSE.
+Without a nonempty API Key, usable SDK credentials are still required.
 
-Presence of any of those YAML keys (even empty) or any nonempty old environment
-variable causes an **explicit, sanitized startup migration error**, even with
-the gateway disabled or valid SDK credentials also present. No secret value is
-printed and no silent credential fallback occurs. After cleanup, startup still
-fails without usable SDK credentials. This migration does **not** remove
-`identity.auth_token`, JWT, dacli `--token`, SDK STS SecurityToken, or OSS upload
-signatures. The independent Python CLI skill is unchanged.
+API Key is distinct from `identity.auth_token`, JWT, dacli `--token`, SDK STS
+SecurityToken and OSS upload signatures. **Real-cloud validation of the restored
+local API Key path is still pending**; historical SDK/STS checks do not verify it.
+The independent Python CLI skill is unchanged.
 
 ### Remote identity and history migration
 
 The remediation contract requires **all** HTTP/SSE deployments, gateway on or
-off, to set `identity.enabled=true`, `require_identity=true`, nonempty
-`auth_token` (prefer `IDENTITY_AUTH_TOKEN`) and `namespace`. Namespace is a stable
-administrator-chosen trust domain, 1–64 characters `[a-z0-9][a-z0-9_-]*`.
-Every initialize, tools/list, call, notification and GET/POST/DELETE authenticates
-before body reading/dispatch. There is no legacy Header/global-AK fallback for
-any remote tool or protocol method. stdio remains local-only, one SDK process
-identity, never per-chat-user authorization.
+off, to use `identity.enabled=true`, `require_identity=true` and nonempty
+`auth_token` (prefer `IDENTITY_AUTH_TOKEN`). Omitted YAML `require_identity`
+defaults to true; explicit false rejects remote startup. Omitted/empty
+`identity.namespace` defaults to `default`; explicit valid values are unchanged.
+Namespace is a stable administrator-chosen trust domain, 1–64 characters
+`[a-z0-9][a-z0-9_-]*`. Independent deployments/trust domains sharing a sessions
+root must use different namespaces.
+Every initialize, tools/list, call, notification and GET/POST/DELETE validates the
+platform token and identity before body reading/dispatch. There is no anonymous,
+unsigned Header or global-key fallback for remote methods. stdio remains local-only,
+one SDK or API Key process identity, never per-chat-user authorization.
 
-JWT mode requires valid HS256/exp, nonempty `tenant_id`/`agent_id`, and user ID
-or email; each group and any default must declare exact tenant/agent scopes.
-Default applies only to unmatched users in its exact scope, not across domains.
-Multiple matching groups reject even with the same role. Explicit Header mode
-requires empty tenant/agent scopes and a trusted proxy that overwrites identity
-headers and keeps the shared token from end users. All configured JWT keys have
-equivalent signing authority within **one trusted domain**; unrelated issuers
-need separate instances/configurations/storage roots.
+JWT mode requires valid HS256/exp, nonempty signed `tenant_id`/`agent_id`, and
+`user_id` or `email`. Across **all groups and any default**, either both scope
+values are omitted/empty (legacy shared mapping), or both are exact tenant/agent
+values on every mapping. Mixed, partial and wildcard scopes are rejected.
+Legacy mappings match signed user ID/email within the administrator's shared
+signing trust domain; existing JWT customers need not add IDs to `groups`.
+Explicitly scoped mappings match only their exact tenant/agent pair. Default
+applies only to unmatched users in the selected mapping mode; multiple matching
+groups reject even with the same role. Explicit Header mode requires empty
+scopes and a trusted proxy that overwrites identity headers and keeps the platform
+token from end users; JWT mode never falls back to unsigned headers. All configured
+JWT keys have equivalent signing authority within **one trusted domain**, not
+independent issuer isolation. Unrelated issuers need separate instances/configurations
+and different namespaces if sharing a sessions root.
 
 Remote history uses `sessions_dir/identity-v2/<principal_id>/`, hashing namespace,
 auth mode, tenant/agent and typed user ID/email. `owner.json` must match the
@@ -125,6 +141,18 @@ ownership, backup and validation of IDs/files/permissions; ambiguous histories
 remain offline. Local ownership markers are not cloud session ACLs or row
 isolation. Same-role users normally share cloud permissions; RoleSessionName is
 attribution only. See the [identity and migration reference](../alibabacloud-data-agent-mcp-skill/references/INSTALLATION.md#multi-tenant-identity-mode-required-remotely).
+
+### Upgrading an existing deployment
+
+Existing unscoped JWT `groups`/`default` mappings can stay unchanged within the
+same signing trust domain; enabling `DATA_AGENT_LOG` or `DATA_AGENT_PERF_LOG`
+does not require a mapping upgrade. Empty legacy API Key settings remain valid
+with AK/STS; nonempty API Keys remain local-stdio-only. Namespace omission uses
+`default`, while explicit namespaces are preserved. Compatibility does **not**
+disable per-request authentication, protocol ownership, tenant-cache or v2 disk
+isolation by verified tenant/agent/typed user, nor enable old-directory reads.
+Use the secret-file exception above only as a transition. Release gates remain
+open, including real-cloud verification of local API Key authentication.
 
 ### HTTP limits and protocol sessions
 
@@ -440,6 +468,21 @@ file rotates once to `<file>.1` when it exceeds `log.perf.max_bytes` (default
 64 MiB); it is created `0600`. Counters are cumulative — diff consecutive lines
 (e.g. with `jq`) to obtain rates. The sampler never logs arguments, identities or
 credentials.
+
+## Interaction mode
+
+Pass `work_mode: "CHAT"` to `data_agent_create_session` when the user wants more
+interaction, clarification and back-and-forth conversation. The other value is
+`ANALYSIS`; omitting `work_mode` keeps the upstream default (`ANALYSIS`). This is
+independent of `mode` (`auto` / `lite` / `pro` / `ultra`) and `plan_mode`.
+
+The MCP server places it in `SessionConfig.WorkMode` on the initial
+[SendChatMessage](https://api.aliyun.com/api/Dms/2025-04-14/SendChatMessage?RegionId=cn-shanghai)
+request, normalized to the lowercase `chat` / `analysis` values required by the
+live API. The API only applies that session configuration on the first message,
+so choose it during creation, not through a later `data_agent_send` call.
+`CHAT` does not alter `auto_confirm`; also set `auto_confirm: false` if the user
+wants to approve plans and SQL manually. Web-report approval remains required.
 
 ## Verify
 

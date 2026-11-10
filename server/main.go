@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"time"
 
+	credential "github.com/aliyun/credentials-go/credentials"
+
 	"github.com/alibabacloud/data-agent-mcp-server/internal/config"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/dataagent"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/logging"
@@ -62,15 +64,21 @@ func run() (err error) {
 		log.Printf("MCP log enabled file=%q max_bytes=%d", cfg.Log.File, cfg.Log.MaxBytes)
 	}
 	remote := transport == "sse" || transport == "streamable-http"
-	provider, err := dataagent.NewCredentialProvider()
-	if err != nil {
-		return fmt.Errorf("failed to initialize credentials: %w", err)
+	var provider credential.Credential
+	if cfg.APIKey == "" {
+		provider, err = dataagent.NewCredentialProvider()
+		if err != nil {
+			return fmt.Errorf("failed to initialize credentials: %w", err)
+		}
 	}
 
 	var mgr *session.Manager
 	var client *dataagent.Client
 	if !remote {
 		strictCredential := func() (*dataagent.Credential, error) {
+			if cfg.APIKey != "" {
+				return &dataagent.Credential{APIKey: cfg.APIKey}, nil
+			}
 			return dataagent.CredentialFromProvider(provider)
 		}
 		cred, err := strictCredential()
@@ -94,6 +102,8 @@ func run() (err error) {
 			dataagent.WithDMSUnit(cfg.DMSUnit),
 			dataagent.WithDataAgentEndpoint(cfg.DataAgentEndpoint),
 			dataagent.WithDMSEnterpriseEndpoint(cfg.DMSEnterpriseEndpoint),
+			dataagent.WithAPIKeyEndpoint(cfg.APIKeyEndpoint),
+			dataagent.WithAPIKeyStreamEndpoint(cfg.APIKeyStreamEndpoint),
 			dataagent.WithWorkspaceID(cfg.WorkspaceID),
 		)
 		mgr, err = session.NewManager(client, cfg.SessionsDir)

@@ -24,6 +24,42 @@ func TestDataAgentEndpoint(t *testing.T) {
 	}
 }
 
+func TestAPIKeyEndpoints(t *testing.T) {
+	for _, region := range []string{"cn-shanghai", "ap-southeast-1"} {
+		for _, opts := range [][]ClientOption{nil, {WithAPIKeyEndpoint(""), WithAPIKeyStreamEndpoint("")}} {
+			c := NewClient(&Credential{APIKey: "synthetic-api-key"}, region, opts...)
+			if c.APIKeyEndpoint() != "dataagent-"+region+".aliyuncs.com" ||
+				c.APIKeyStreamEndpoint() != "dataagent-stream-"+region+".aliyuncs.com" || c.sse.streamEndpoint != c.APIKeyStreamEndpoint() {
+				t.Fatal("API Key default endpoints or SSE propagation changed")
+			}
+		}
+	}
+	c := NewClient(&Credential{}, "cn-shanghai", WithDataAgentEndpoint("signed.example.invalid"),
+		WithAPIKeyEndpoint("control.example.invalid"), WithAPIKeyStreamEndpoint("stream.example.invalid"))
+	if c.APIKeyEndpoint() != "control.example.invalid" || c.APIKeyStreamEndpoint() != "stream.example.invalid" ||
+		c.sse.streamEndpoint != "stream.example.invalid" || c.sse.endpoint != "signed.example.invalid" {
+		t.Fatal("independent endpoint overrides were not propagated")
+	}
+	sse := NewSSEClient(&Credential{}, "cn-shanghai")
+	if sse.streamEndpoint != "dataagent-stream-cn-shanghai.aliyuncs.com" || sse.region != "cn-shanghai" {
+		t.Fatal("standalone SSE defaults changed")
+	}
+}
+
+func TestCredentialIsAPIKey(t *testing.T) {
+	for _, tc := range []struct {
+		cred *Credential
+		want bool
+	}{
+		{nil, false}, {&Credential{}, false}, {&Credential{AccessKeyID: "ak", AccessKeySecret: "sk"}, false},
+		{&Credential{APIKey: "key"}, true}, {&Credential{APIKey: "key", AccessKeyID: "ak", AccessKeySecret: "sk"}, true},
+	} {
+		if tc.cred.IsAPIKey() != tc.want {
+			t.Fatal("incorrect authentication selection")
+		}
+	}
+}
+
 // The SSE client builds its own requests, so it must inherit the endpoint
 // override instead of deriving its host from the region on its own.
 func TestSSEClientInheritsEndpointOverrides(t *testing.T) {

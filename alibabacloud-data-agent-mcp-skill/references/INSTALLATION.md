@@ -66,9 +66,9 @@ The absolute path must point to the copy of this skill folder that exists on the
 OpenClaw skill installation and MCP server registration are separate steps. For hosted OpenClaw, the MCP server must run where OpenClaw can reach it, not on the user's laptop.
 
 1. Install or copy this skill folder into a location OpenClaw loads as a skill, such as the workspace skills directory, personal agent skills directory, or managed skills directory.
-2. Provision the built/deployed server with mandatory remote identity, scopes, secret injection and limits, then start it as an authorized HTTP MCP service in the OpenClaw runtime, sidecar, worker image or internal gateway using `MCP_TRANSPORT=streamable-http`. Register `data-agent` at the reachable `/mcp` URL over protected transport, carrying authentication on every method; URL-only registration is insufficient.
+2. Provision the built/deployed server with mandatory remote identity, role mappings, secret injection and limits, then start it as an authorized HTTP MCP service in the OpenClaw runtime, sidecar, worker image or internal gateway using `MCP_TRANSPORT=streamable-http`. Register `data-agent` at the reachable `/mcp` URL over protected transport, carrying authentication on every method; URL-only registration is insufficient.
 3. Use stdio only if the OpenClaw runtime itself launches local tool processes from the same filesystem that contains this skill. In that case, use the `command` and `args` from "Option 2: stdio" above.
-4. Ensure the runtime host can execute `bash` and the bundled `scripts/select-binary.sh` path, and has usable AK/STS through the credentials-go default chain (see Credentials below). Do not assume Alibaba Cloud CLI profiles are imported.
+4. Ensure the runtime host can execute `bash` and the bundled `scripts/select-binary.sh` path, and has usable AK/STS through the credentials-go default chain (or a legacy API Key for local stdio only; see Credentials below). Do not assume Alibaba Cloud CLI profiles are imported.
 5. If OpenClaw uses a tool allowlist, allow the `data-agent` server or all `data_agent_*` tools. At minimum allow `data_agent_list_workspace_databases`, `data_agent_create_session`, `data_agent_status`, `data_agent_send`, `data_agent_result`, `data_agent_list_sessions`, `data_agent_stop_session`, `data_agent_list_files`, `data_agent_get_upload_signature`, `data_agent_upload_callback`, `data_agent_search_dms_databases`, `data_agent_list_tables`, `data_agent_list_imported_tables`, `data_agent_search_instances`, `data_agent_import_database`, `data_agent_list_workspaces`, and `data_agent_list_agents`.
 6. For the optional gateway, allow the nine base `data_gateway_*` tools and, only when P2b is enabled, its two summary tools listed below. Configure remote identity and accept the summary visibility scope before enabling P2b. Restart/reload and verify 19 tools off / 28 base / 30 with P2b (before host filtering). Tool visibility is not authorization validation. If required tools are absent, do not attempt CLI, SDK, direct API or alternate-backend fallbacks.
 
@@ -99,7 +99,7 @@ For other setups, add to your user-level `~/.claude/settings.json`:
 
 ## Credentials
 
-Startup uses the **credentials-go default chain** and retains its provider for dynamic credential retrieval and RAM AssumeRole source chaining. The server does not hand-read `~/.aliyun/config.json`; an Alibaba Cloud CLI profile is not automatically an SDK credential source. Configure a provider supported by the deployed credentials-go version in the actual server process/container.
+Without a nonempty API Key, startup uses the **credentials-go default chain** and retains its provider for dynamic credential retrieval and RAM AssumeRole source chaining. The server does not hand-read `~/.aliyun/config.json`; an Alibaba Cloud CLI profile is not automatically an SDK credential source. Configure a provider supported by the deployed credentials-go version in the actual server process/container.
 
 **Explicit environment credentials** (or the server's `.env`):
 ```bash
@@ -111,16 +111,16 @@ export ALIBABA_CLOUD_ACCESS_KEY_SECRET=your-sk
 
 Alternatively, configure an SDK-supported instance/workload-role provider, such as an ECS RAM role. Remove placeholder AK/SK entries when using another provider so they do not override it. Refreshable providers must remain live; a startup credential snapshot is not sufficient. Static temporary environment values do not self-renew. In identity mode the retained source provider supplies the credentials for each user's RAM AssumeRole provider; its principal needs `sts:AssumeRole` on the mapped roles.
 
-### API Key migration — breaking for the entire Go Server
+### API Key compatibility — local stdio only
 
-API Key runtime authentication has been removed for all Data Agent, DMS and SSE calls, independent of the gateway flag. Remove these obsolete inputs from deployment configuration, secret injection and environment files:
+Legacy API Key runtime authentication is supported for a **local, single-process stdio** deployment using the existing inputs:
 
 - YAML/legacy JSON keys: `api_key`, `api_key_endpoint`, `api_key_stream_endpoint`.
 - Environment variables: `DATA_AGENT_API_KEY`, `DATA_AGENT_API_KEY_ENDPOINT`, `DATA_AGENT_API_KEY_STREAM_ENDPOINT`.
 
-Any old YAML key **even if empty**, or nonempty old environment variable, produces an explicit **sanitized startup migration error**. This applies with the gateway disabled and with valid AK/STS present; no silent switch of identity or compatibility runtime is provided. Errors identify the obsolete setting without printing its secret value. Once old settings are removed, startup still fails if the SDK chain cannot provide credentials.
+Empty/null `api_key` or old endpoint settings alone do not activate API Key mode and do not block AK/STS multi-tenant startup. A nonempty API Key cannot coexist with `identity.enabled=true` or `agent_gateway.enabled=true`, and is not supported for HTTP/SSE. Remote transports still require strong identity on every request, without anonymous or global-key fallback. Without a nonempty API Key, the SDK chain must still provide usable credentials.
 
-Keep inbound `identity.auth_token`, JWT, dacli `--token`, SDK STS `SecurityToken` and OSS upload signatures; none is the removed API Key mode. The independent Python CLI skill is unchanged.
+Inbound `identity.auth_token`, JWT, dacli `--token`, SDK STS `SecurityToken` and OSS upload signatures are distinct from API Key mode and remain supported. The independent Python CLI skill is unchanged. **Real-cloud authentication for the restored local API Key path remains unverified**; historical SDK/STS results do not validate it.
 
 ## Permission Requirements
 
@@ -159,7 +159,7 @@ Both `agent_gateway.enabled` and `agent_gateway.data_sources_enabled` default to
 
 The endpoint must be **explicit** when enabled: only the public `dms.<region>.aliyuncs.com` host matching `region` is accepted. No scheme, port, path, query, fragment, userinfo, VPC endpoint or arbitrary host. HTTPS redirects are rejected; settings do not inherit a custom Data Agent endpoint. Defaults are a 30-second outbound HTTP budget and 4 MiB decoded response limit (including errors). Resolver/STS retrieval has a separate lifetime, not an end-to-end 30-second promise. Disabled mode adds no gateway tools or requests; enabling does not probe the network at startup. No extra gateway token, user map, transport or dynamic Action setting is needed.
 
-For **all HTTP/SSE tools and protocol methods**, require `identity.enabled=true`, `require_identity=true`, nonempty `auth_token` and `namespace`, regardless of gateway flags. JWT mode requires verified tenant/agent/user claims and exact group/default scopes, never Header/global fallback. Explicit Header mode requires empty tenant/agent scopes and a trusted proxy. Follow [identity and trust requirements](#identity-scopes-and-trust); stdio represents only one local process-wide SDK identity.
+For **all HTTP/SSE tools and protocol methods**, require `identity.enabled=true`, `require_identity=true` and nonempty `auth_token`, regardless of gateway flags. Omitted YAML `require_identity` defaults to true; explicit false rejects remote startup. Omitted/empty `namespace` defaults to `default`. JWT mode requires verified tenant/agent/user claims and consistently scoped or legacy shared mappings, never unsigned Header/global-key fallback. Explicit Header mode requires empty tenant/agent scopes and a trusted proxy. Follow [identity and trust requirements](#identity-scopes-and-trust). The gateway always uses SDK/STS; stdio represents one local process identity, not per-chat-user authorization.
 
 | Tool | Parameters (`?` = optional) |
 |---|---|
@@ -211,6 +211,8 @@ Environment variables override .env and config file:
 | `ALIBABA_CLOUD_ACCESS_KEY_ID` | — | Alibaba Cloud Access Key ID |
 | `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | — | Alibaba Cloud Access Key Secret |
 | `ALIBABA_CLOUD_SECURITY_TOKEN` | — | STS token, read with the AK/SK pair when using temporary credentials |
+| `DATA_AGENT_API_KEY` | — | Legacy local-stdio API Key; incompatible with identity/gateway enabled and HTTP/SSE |
+| `DATA_AGENT_API_KEY_ENDPOINT` / `DATA_AGENT_API_KEY_STREAM_ENDPOINT` | — | Legacy API Key endpoint overrides; alone do not activate API Key mode |
 | `DATA_AGENT_REGION` | `cn-hangzhou` | DMS region |
 | `BUDDY_REGION` | — | DataBuddy container region fallback when `DATA_AGENT_REGION` is not set |
 | `DATA_AGENT_DMS_UNIT` | auto-resolved | DMS unit override (skip GetActiveRouteUnit) |
@@ -221,6 +223,7 @@ Environment variables override .env and config file:
 | `DATA_AGENT_SESSIONS_DIR` | `~/.data-agent/sessions` | Session data directory |
 | `DATA_AGENT_CONFIG` | auto-discovered | YAML config file path |
 | `DATA_AGENT_ENV_FILE` | `./.env` | .env file path |
+| `DOTENV_UNSAFE_FILES_ALLOW` | disabled | `1` in process environment only: transitional [secret-file exception](#secret-files), not an unsafe .env self-opt-in |
 | `AILY_SHARED_SECRET` / `IDENTITY_SHARED_SECRET` / `IDENTITY_AUTH_TOKEN` | — | Overrides `identity.auth_token` for caller authentication |
 | `IDENTITY_JWT_SECRET` | — | Overrides `identity.jwt.secret`, the HS256 key verifying the upstream-signed identity token |
 | `IDENTITY_JWT_SECRETS` | — | Additional comma-separated keys with equivalent signing authority in the same trusted domain |
@@ -232,9 +235,9 @@ Environment variables override .env and config file:
 
 ## Multi-Tenant Identity Mode (required remotely)
 
-**Remediation is implemented locally; deployment and real-cloud release gates remain unverified.** All remote HTTP/SSE deployments require `identity.enabled=true`, `require_identity=true`, a nonempty `auth_token` and `identity.namespace`, with the gateway enabled **or disabled**. Anonymous/legacy fallback configurations fail startup. These requirements apply to every tool and protocol method, not just gateway calls. No missing-JWT header fallback, global-AK fallback or weak-compatibility switch is provided. stdio is local-only, one process SDK identity, not per-chat-user authorization.
+**Remediation is implemented locally; deployment and real-cloud release gates remain unverified.** All remote HTTP/SSE deployments require `identity.enabled=true`, `require_identity=true` and a nonempty `auth_token`, with the gateway enabled **or disabled**. Omitted YAML `require_identity` defaults to true; explicit false rejects remote startup. Omitted/empty `identity.namespace` defaults to `default`; explicit valid values are unchanged. These requirements apply to every tool and protocol method, not just gateway calls. Anonymous, missing-JWT unsigned-header and global-key fallbacks remain forbidden. stdio is local-only, one SDK or API Key process identity, not per-chat-user authorization.
 
-Use this non-secret JWT mapping fragment with the existing configuration. Replace scope/role/member placeholders from trusted administrator records; inject secrets through environment variables, not literal YAML values:
+This non-secret JWT fragment illustrates the preferred **explicitly scoped** mapping mode. Existing shared mappings need no added tenant/agent IDs if all groups/default leave both scopes omitted/empty within the same signing trust domain (see below). Replace scope/role/member placeholders from trusted administrator records; inject secrets through environment variables, not literal YAML values:
 
 ```yaml
 identity:
@@ -269,18 +272,18 @@ identity:
 
 ### Identity scopes and trust
 
-- `namespace` is mandatory remotely, 1–64 characters matching `[a-z0-9][a-z0-9_-]*`. Choose it administratively, not from headers, unverified claims, keys or roles. Changing it creates a new identity/history space.
-- JWT verification requires HS256, `exp`, nonempty **`tenant_id` and `agent_id`**, and a usable `user_id` or `email`. Claims are used only after verification; missing/invalid/expired JWTs reject every remote request. Do not go live if the platform cannot supply required claims.
-- JWT groups and any configured default require **exact** `tenant_id`/`agent_id` values. No wildcard, guessed scope or cross-scope default is allowed. Resolve named membership only within the matching scope; use default only for zero named matches in its exact scope. Multiple groups matching user ID/email reject with `IDENTITY_GROUP_CONFLICT`, even if both map to the same role; two matches within one group count once. Old unscoped JWT mappings require explicit migration.
+- Omitted/empty `namespace` defaults to `default`; explicit valid values are preserved. Values are 1–64 characters matching `[a-z0-9][a-z0-9_-]*`, chosen administratively, not from headers, unverified claims, keys or roles. **Independent deployments/trust domains sharing a sessions root must use different namespaces.** Changing it creates a new identity/history space.
+- JWT verification still requires HS256, `exp`, nonempty **`tenant_id` and `agent_id`**, and a usable `user_id` or `email`. Claims are used only after signature verification; missing/invalid/expired JWTs reject every remote request. The platform token is also validated on every request; unsigned headers cannot replace JWT identity. Do not go live if the platform cannot supply required claims.
+- JWT mappings must use one mode across **all groups and any default**: both `tenant_id`/`agent_id` omitted/empty everywhere for legacy shared mappings, or both exact values on every mapping. Mixed modes, a single scope value and `*` wildcards are rejected. Legacy shared mappings match signed `user_id`/`email` across signed tenant/agent values within the administrator's shared signing trust domain; existing customers need not add scope IDs to `groups`/`default`. In explicitly scoped mode, named membership and default apply only within the matching tenant/agent pair; no cross-scope default applies. Default is used only for zero named matches in the selected mode. Multiple groups matching user ID/email reject with `IDENTITY_GROUP_CONFLICT`, even if both map to the same role; two matches within one group count once.
 - Header mode is a separate administrator-selected deployment (`jwt.enabled=false`), not a fallback. Group/default `tenant_id` and `agent_id` must be empty. Only a trusted proxy may hold the platform token; it must overwrite self-reported identity headers and ensure identifiers are unique across the configured namespace. Restrict network access to trusted egress.
-- `secret` plus `secrets`/`IDENTITY_JWT_SECRETS` have **equivalent signing authority in one trusted domain**. Use for key rotation or mutually trusted applications, never unrelated organizations/issuers. Independent trust domains require separate instances, configurations and storage roots.
+- `secret` plus `secrets`/`IDENTITY_JWT_SECRETS` have **equivalent signing authority in one trusted domain**, not independent issuer isolation. Use for key rotation or mutually trusted applications, never unrelated organizations/issuers. Independent trust domains require separate instances/configurations and different namespaces if sharing a sessions root.
 - Preserve exact identity numbers, case and Unicode; do not equate `user_id` with the same string used as `email`. Each request revalidates mapping; cached authorization context cannot override a changed mapping. Configuration changes require a restart, not hot reload.
 - Group workspace/custom-agent/mode values are defaults, not ACLs; explicit session arguments win. `RoleSessionName` (`<prefix>-<claim>`, normally `aily-<user_id>`) is audit attribution, **not cloud row/column isolation**. Same-role users normally share effective cloud permissions. Local ownership and cloud session ACLs are separate boundaries.
 - Retain the SDK default source provider and AssumeRole chain. The source principal needs `sts:AssumeRole` and mapped roles must trust it; do not change roles/permissions without authorization. Gateway credential failure rejects without stale snapshots or another identity. This is not a claim that the old analysis path has the gateway's strict refresh guarantee.
 
 ### Local history and explicit migration
 
-Remote state moves to `{sessions_dir}/identity-v2/{principal_id}/`. The lowercase SHA-256 identity digest encodes the ordered tuple `["principal-v2", namespace, auth_mode, tenant_id, agent_id, subject_kind, subject_value]`; user ID is preferred, otherwise email. Token expiry/signature-key rotation does not change a stable Principal, but scope, auth mode, namespace or subject kind changes do.
+Remote state moves to `{sessions_dir}/identity-v2/{principal_id}/`. The lowercase SHA-256 identity digest encodes the ordered tuple `["principal-v2", namespace, auth_mode, tenant_id, agent_id, subject_kind, subject_value]`; user ID is preferred, otherwise email. Protocol sessions, tenant caches and v2 disk history remain isolated by this verified principal, including signed tenant/agent and typed user, **even with legacy shared role mappings**. Token expiry/signature-key rotation does not change a stable Principal, but signed tenant/agent, auth mode, namespace or subject kind changes do.
 
 Each tenant directory has an atomically written `owner.json` (format version and principal ID, mode 0600). Existing ownership must match; symlink tenants, wrong owners and nonempty unmarked directories are rejected, not automatically claimed. Session IDs accept 1–128 ASCII letters/digits/`_`/`-`, excluding Windows device names; state IDs must match their directories. Root-confined storage rejects path traversal and unsafe file types/symlinks. New directories use 0700 and state/images/temp files 0600. These are local storage checks, **not cloud data authorization**.
 
@@ -315,7 +318,9 @@ Keep client/proxy budgets above the existing 55-second wait cap; header/body lim
 
 ### Secret files
 
-Prefer environment/managed secret injection and the SDK chain. Checks cover **actually loaded secret-bearing YAML, legacy JSON and dotenv files**, even if the secret is not in config.yaml. On POSIX, require process-account ownership and regular files with no group/other access (0600 or 0400) in trusted directories. Public placeholder-only examples or non-secret config may be 0644; `.gitignore` is not access control. Checks use the opened handle, not only a preceding path check. Do not assume projected/symlink secrets are supported: the current implementation rejects final symlinks; use supported environment injection or an administrator-provisioned regular file. Windows needs equivalent verified ACLs; file-secret deployment without that validation is blocked.
+Prefer environment/managed secret injection and the SDK chain. Checks cover **actually loaded secret-bearing YAML, legacy JSON and dotenv files**, even if the secret is not in config.yaml. By default, POSIX requires process-account-owned regular files with no group/other access (0600 or 0400) in trusted directories. Public placeholder-only examples or non-secret config may be 0644; `.gitignore` is not access control. Checks use the opened handle, not only a preceding path check.
+
+For transitional compatibility, an existing `export DOTENV_UNSAFE_FILES_ALLOW=1` is supported **only from the process environment or launch command**; the variable is ignored in all `.env` files, including non-secret ones. It allows root- or service-user-owned, non-executable regular files such as 0644, but still rejects group/other-writable files. Parent-directory trust/ownership and no-group/other-write checks remain enforced. Final symlinks and FIFOs remain rejected; use environment injection or an administrator-provisioned regular file instead of unsupported projected secrets. Windows file secrets without equivalent verified ACLs remain blocked. The exception emits a warning without secret values and never changes existing permissions. This is not a recommendation to keep secrets as 0644 long-term.
 
 No automatic chmod, chown, moving, secret rotation or migration occurs. Obtain explicit administrator authorization before fixing real file permissions or changing secrets; permission tightening alone does not prove previous non-exposure. Do not write secrets into commands, logs, docs or repository examples. Config placeholders are illustrative, not a promise of YAML `${VAR}` expansion.
 
@@ -340,9 +345,11 @@ govulncheck -mode=binary bin/dacli
 
 Record actual versions/results, repeat binary checks for each platform artifact, and run bounded path/identity/JSON fuzzing. Distinguish vulnerability findings from scanner execution failure; exit zero alone is not a clean scan. Rerun checks for the exact artifacts being deployed and retain the results as release evidence. Keep the pinned x/net v0.62.0 security update as well as Go 1.26.10 or newer.
 
-External gates remain open: real JWT-platform credentials on initialize, continuous SSE, notifications and DELETE with renewal; all enabled Actions through stdio/HTTP/SSE with real SDK/STS; differential roles with an explicit **A-allowed/B-denied** resource (both list non-enumeration and denial by A's known ID); same-role local history/protocol isolation separately from cloud scope; and old read-only analysis/follow-up without duplicate sends. No local signed fixture, equal positive role results or passing unit test substitutes for these gates. Shared denials lacking upstream RequestId remain un-attributed. Do not grant permissions to manufacture a passing result or claim production acceptance while gates are incomplete; see [RAM validation](ram-policies.md#validation-still-required).
+External gates remain open: real-cloud authentication of the restored local-stdio API Key path; real JWT-platform credentials on initialize, continuous SSE, notifications and DELETE with renewal; all enabled Actions through stdio/HTTP/SSE with real SDK/STS; differential roles with an explicit **A-allowed/B-denied** resource (both list non-enumeration and denial by A's known ID); same-role local history/protocol isolation separately from cloud scope; and old read-only analysis/follow-up without duplicate sends. No local signed fixture, equal positive role results or passing unit test substitutes for these gates. Shared denials lacking upstream RequestId remain un-attributed. Do not grant permissions to manufacture a passing result or claim production acceptance while gates are incomplete; see [RAM validation](ram-policies.md#validation-still-required).
 
 ## Observability
+
+`DATA_AGENT_LOG` and `DATA_AGENT_PERF_LOG` behavior is unchanged. Enabling either does not require adding scopes to legacy shared JWT mappings; retain existing credentials and identity settings. See [server logging](../../server/README.md#server-and-request-logs).
 
 All Alibaba Cloud API calls must use this User-Agent template:
 

@@ -1084,6 +1084,41 @@ func TestGatewaySanitizesRequestIDsAndErrors(t *testing.T) {
 	}
 }
 
+func TestGatewayRejectsAPIKeyCredentials(t *testing.T) {
+	for _, source := range []string{"static", "strict"} {
+		for _, mixed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/mixed=%t", source, mixed), func(t *testing.T) {
+				cred := &Credential{APIKey: "synthetic-api-key"}
+				if mixed {
+					cred = gatewayTestCredential()
+					cred.APIKey = "synthetic-api-key"
+				}
+				c := gatewayTestClient(func(*http.Request) (*http.Response, error) {
+					t.Fatal("gateway must not send API Key or mixed credentials")
+					return nil, nil
+				})
+				if source == "static" {
+					c.cred = cred
+				} else {
+					c.strictCredFn = func() (*Credential, error) { return cred, nil }
+					c.credFn = func() *Credential { t.Fatal("gateway fell back to legacy credentials"); return nil }
+				}
+				result, err := c.ListAgenticCatalog(context.Background(), GatewayPageOptions{})
+				gatewayAssertError(t, result, err, gatewayCredential)
+			})
+		}
+	}
+	cred := &Credential{APIKey: "synthetic-api-key"}
+	for _, id := range []string{cred.APIKey, "prefix-" + cred.APIKey, cred.APIKey + "-suffix"} {
+		if gatewaySafeRequestID(id, cred) != "" {
+			t.Fatal("request ID exposed an API Key")
+		}
+	}
+	if gatewaySafeRequestID("real-request-id", cred) != "real-request-id" {
+		t.Fatal("safe request ID lost")
+	}
+}
+
 func TestGatewayStrictCredentialsRefreshAndNoFallback(t *testing.T) {
 	for _, test := range []string{"legacyOnly", "strictError", "strictNil", "emptyID", "emptySecret", "whitespaceID", "tokenHeaderInjection"} {
 		t.Run(test, func(t *testing.T) {

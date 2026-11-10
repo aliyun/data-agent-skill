@@ -40,7 +40,7 @@ type IdentityGroup struct {
 	// Legacy values ASK_DATA/ANALYSIS/INSIGHT are auto-mapped.
 	Mode string `yaml:"mode"`
 	// Users lists group members by upstream user id or email. Required for
-	// named groups; ignored on the default group (which catches only its scope).
+	// named groups; ignored on the default group.
 	Users []string `yaml:"users"`
 }
 
@@ -115,7 +115,7 @@ func (i Identity) Prefix() string {
 //
 // Two ways to map users to RAM roles:
 //  1. Default: identity.default carries one role plus session defaults for
-//     unmatched users within its exact authenticated scope.
+//     unmatched users (shared, or restricted by explicit tenant/agent scope).
 //  2. Groups: each identity.groups.<name> lists its users and carries its
 //     own role and defaults. Group membership wins over the default.
 type Identity struct {
@@ -151,8 +151,8 @@ type Identity struct {
 	SessionNamePrefix *string `yaml:"session_name_prefix"`
 	// Headers overrides the identity header names (defaults: x-aily-*).
 	Headers IdentityHeaders `yaml:"headers"`
-	// Default applies only to unmatched identities in its exact tenant/agent
-	// scope (JWT), or in the configured header namespace. Nil means reject.
+	// Default applies to unmatched verified identities; explicit scopes restrict it.
+	// Nil means reject unmatched users.
 	Default *IdentityGroup `yaml:"default"`
 	// Groups maps group name -> group config. A user may belong to exactly
 	// one group (validated at startup).
@@ -210,10 +210,13 @@ type Config struct {
 	// CustomAgentID is the default custom agent for sessions that do not name
 	// one, mirroring workspace_id. An identity group's custom_agent_id wins
 	// over this, and an explicit tool argument wins over both.
-	CustomAgentID string       `yaml:"custom_agent_id"`
-	SessionsDir   string       `yaml:"sessions_dir"`
-	AgentGateway  AgentGateway `yaml:"agent_gateway"`
-	HTTP          HTTP         `yaml:"http"`
+	CustomAgentID        string       `yaml:"custom_agent_id"`
+	SessionsDir          string       `yaml:"sessions_dir"`
+	APIKey               string       `yaml:"api_key"`
+	APIKeyEndpoint       string       `yaml:"api_key_endpoint"`
+	APIKeyStreamEndpoint string       `yaml:"api_key_stream_endpoint"`
+	AgentGateway         AgentGateway `yaml:"agent_gateway"`
+	HTTP                 HTTP         `yaml:"http"`
 	// DMSEnterpriseEndpoint overrides the dms-enterprise host used by the
 	// 2018-11-01 metadata APIs (database/table/instance discovery, import
 	// tagging, GetActiveRouteUnit). Empty = dms-enterprise.{region}.aliyuncs.com.
@@ -254,6 +257,10 @@ func LoadDotEnv() error {
 			return fmt.Errorf("dotenv: %w", errSecretFile)
 		}
 		for key, value := range dotenvValues(data) {
+			// A loaded file must not relax checks on files read later.
+			if key == "DOTENV_UNSAFE_FILES_ALLOW" {
+				continue
+			}
 			if _, set := os.LookupEnv(key); !set {
 				if err := os.Setenv(key, value); err != nil {
 					return errors.New("invalid dotenv entry")
@@ -284,9 +291,6 @@ func configPath() string {
 	return ""
 }
 
-var errLegacyAuthentication = errors.New("legacy API Key configuration is no longer supported; remove the old API Key YAML keys and environment variables and migrate to the Alibaba Cloud SDK credential chain")
-
-// Inspect YAML nodes so empty/null legacy keys and alias/merge forms cannot evade migration checks.
 func decodeConfig(data []byte, cfg *Config) error {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	var documents []*yaml.Node
@@ -296,9 +300,6 @@ func decodeConfig(data []byte, cfg *Config) error {
 			break
 		} else if err != nil {
 			return errors.New("invalid server configuration YAML")
-		}
-		if hasLegacyAuthentication(&doc, make(map[*yaml.Node]bool)) {
-			return errLegacyAuthentication
 		}
 		documents = append(documents, &doc)
 	}
@@ -315,44 +316,6 @@ func decodeConfig(data []byte, cfg *Config) error {
 	return nil
 }
 
-func hasLegacyAuthentication(node *yaml.Node, seen map[*yaml.Node]bool) bool {
-	if node == nil || seen[node] {
-		return false
-	}
-	seen[node] = true
-	switch node.Kind {
-	case yaml.AliasNode:
-		return hasLegacyAuthentication(node.Alias, seen)
-	case yaml.DocumentNode, yaml.SequenceNode:
-		for _, child := range node.Content {
-			if hasLegacyAuthentication(child, seen) {
-				return true
-			}
-		}
-	case yaml.MappingNode:
-		for i := 0; i+1 < len(node.Content); i += 2 {
-			key := node.Content[i]
-			keySeen := make(map[*yaml.Node]bool)
-			for key != nil && key.Kind == yaml.AliasNode && !keySeen[key] {
-				keySeen[key] = true
-				key = key.Alias
-			}
-			if key == nil || key.Kind != yaml.ScalarNode {
-				continue
-			}
-			switch key.Value {
-			case "api_key", "api_key_endpoint", "api_key_stream_endpoint":
-				return true
-			case "<<":
-				if hasLegacyAuthentication(node.Content[i+1], seen) {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
 // Load reads configuration with priority: env vars > .env > config file > defaults.
 // Call LoadDotEnv before Load so .env values are visible as env vars.
 func Load() (Config, string, error) {
@@ -365,13 +328,6 @@ func Load() (Config, string, error) {
 		HTTP:         DefaultHTTP(),
 		Identity:     Identity{MaxTenants: 128},
 	}
-	// Reject legacy inputs before parsing or selecting any credential source.
-	for _, key := range []string{"DATA_AGENT_API_KEY", "DATA_AGENT_API_KEY_ENDPOINT", "DATA_AGENT_API_KEY_STREAM_ENDPOINT"} {
-		if os.Getenv(key) != "" {
-			return cfg, "", errLegacyAuthentication
-		}
-	}
-
 	// 1. Config file (lowest priority). yaml.v3 also parses legacy JSON.
 	// A missing file is not an error (matches the previous JSON loader);
 	// unreadable or malformed files are.
@@ -414,6 +370,15 @@ func Load() (Config, string, error) {
 	}
 	if v := os.Getenv("DATA_AGENT_ENDPOINT"); v != "" {
 		cfg.DataAgentEndpoint = v
+	}
+	if v := os.Getenv("DATA_AGENT_API_KEY"); v != "" {
+		cfg.APIKey = v
+	}
+	if v := os.Getenv("DATA_AGENT_API_KEY_ENDPOINT"); v != "" {
+		cfg.APIKeyEndpoint = v
+	}
+	if v := os.Getenv("DATA_AGENT_API_KEY_STREAM_ENDPOINT"); v != "" {
+		cfg.APIKeyStreamEndpoint = v
 	}
 	if v := os.Getenv("DATA_AGENT_WORKSPACE_ID"); v != "" {
 		cfg.WorkspaceID = v
@@ -586,6 +551,9 @@ func (c *Config) ApplyDefaults() {
 		}
 	}
 	c.LegacyIdentity = nil
+	if c.Identity.Enabled && c.Identity.Namespace == "" {
+		c.Identity.Namespace = "default"
+	}
 	// Legacy "shared_secret" key feeds AuthToken unless auth_token/env is set.
 	if c.Identity.AuthToken == "" && c.Identity.LegacySharedSecret != "" {
 		c.Identity.AuthToken = c.Identity.LegacySharedSecret
@@ -636,6 +604,9 @@ func isValidSessionNameClaim(name string) bool {
 }
 
 func (c *Config) validate() error {
+	if c.APIKey != "" && (c.Identity.Enabled || c.AgentGateway.Enabled) {
+		return errors.New("identity and agent_gateway require AK/STS credentials; API Key is supported only in local single-identity mode")
+	}
 	if c.Identity.Namespace != "" && !ValidNamespace(c.Identity.Namespace) {
 		return errors.New("invalid identity.namespace")
 	}

@@ -208,7 +208,7 @@ func (c *Client) gatewayCredential() (*Credential, error) {
 		cred = c.cred
 	}
 	// credential() may silently fall back to stale snapshots or the static identity.
-	if cred == nil || !gatewayCredentialPart(cred.AccessKeyID) || !gatewayCredentialPart(cred.AccessKeySecret) ||
+	if cred == nil || cred.IsAPIKey() || !gatewayCredentialPart(cred.AccessKeyID) || !gatewayCredentialPart(cred.AccessKeySecret) ||
 		(cred.SecurityToken != "" && !gatewayCredentialPart(cred.SecurityToken)) {
 		return nil, gatewayError(gatewayCredential, "", false)
 	}
@@ -440,7 +440,7 @@ func gatewaySafeRequestID(id string, cred *Credential) string {
 		}
 	}
 	if cred != nil {
-		for _, secret := range []string{cred.AccessKeyID, cred.AccessKeySecret, cred.SecurityToken} {
+		for _, secret := range []string{cred.AccessKeyID, cred.AccessKeySecret, cred.SecurityToken, cred.APIKey} {
 			if secret != "" && strings.Contains(id, secret) {
 				return ""
 			}

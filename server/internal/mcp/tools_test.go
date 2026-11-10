@@ -262,7 +262,20 @@ func TestCreateAndSendToolUpstreamRequestIDs(t *testing.T) {
 		case "DescribeDataAgentSession":
 			fmt.Fprint(w, `{"RequestId":"describe-request","Data":{"SessionStatus":"RUNNING","AgentId":"test-agent"}}`)
 		case "SendChatMessage":
-			fmt.Fprintf(w, `{"RequestId":"send-request-%d","Success":true}`, sends.Add(1))
+			call := sends.Add(1)
+			var sessionConfig map[string]any
+			if err := json.Unmarshal([]byte(r.URL.Query().Get("SessionConfig")), &sessionConfig); err != nil {
+				t.Errorf("invalid SessionConfig: %v", err)
+			}
+			if call == 1 && sessionConfig["WorkMode"] != "chat" {
+				t.Error("MCP work_mode did not reach the first SendChatMessage")
+			}
+			if call > 1 {
+				if _, present := sessionConfig["WorkMode"]; present {
+					t.Error("follow-up must not override the first-message interaction mode")
+				}
+			}
+			fmt.Fprintf(w, `{"RequestId":"send-request-%d","Success":true}`, call)
 		case "GetChatContent":
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("x-acs-request-id", "background-stream-request")
@@ -286,7 +299,7 @@ func TestCreateAndSendToolUpstreamRequestIDs(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	res, err := s.withTenant((*Server).handleCreateSession)(ctx, createReq(map[string]any{
-		"query": "synthetic test", "custom_agent_id": "test-custom-agent",
+		"query": "synthetic test", "custom_agent_id": "test-custom-agent", "work_mode": "CHAT",
 	}))
 	if err != nil || res.IsError {
 		t.Fatalf("create failed: %+v, err=%v", res, err)
