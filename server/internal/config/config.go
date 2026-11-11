@@ -53,12 +53,7 @@ type IdentityHeaders struct {
 	Token string `yaml:"token"` // default: x-aily-token
 }
 
-// JWT configures verification of the upstream-signed identity token.
-//
-// Every key has equivalent signing authority within identity.namespace.
-// Multiple keys support rotation or mutually trusted applications, never
-// independent untrusted issuers. JWT mode requires JWT on every remote request
-// and never downgrades to unsigned headers.
+// JWT keys share signing authority; absent JWTs may use trusted Header identity.
 type JWT struct {
 	Enabled bool `yaml:"enabled"`
 	// Secret is a single HMAC key, shown in the platform's MCP editor and used
@@ -314,6 +309,24 @@ func decodeConfig(data []byte, cfg *Config) error {
 		return errors.New("invalid server configuration YAML")
 	}
 	return nil
+}
+
+func LoadAuthToken(path string) (string, error) {
+	data, err := readConfigFile(expandHome(path), yamlContainsSecret)
+	if os.IsNotExist(err) {
+		return "", errors.New("client configuration file not found")
+	}
+	if err != nil {
+		return "", fmt.Errorf("client configuration: %w", errSecretFile)
+	}
+	var cfg Config
+	if err := decodeConfig(data, &cfg); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(cfg.Identity.AuthToken) == "" {
+		return "", errors.New("identity.auth_token is missing or empty in client configuration")
+	}
+	return cfg.Identity.AuthToken, nil
 }
 
 // Load reads configuration with priority: env vars > .env > config file > defaults.

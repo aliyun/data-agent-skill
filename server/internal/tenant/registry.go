@@ -175,9 +175,13 @@ func (r *Registry) Authenticate(ctx context.Context) (context.Context, error) {
 	var claims *Claims
 	var err error
 	mode := "headers"
-	if id.JWT.Enabled {
+	rawJWT, hasJWT := ctx.Value(jwtCtxKey{}).(string)
+	if hasJWT {
+		if !id.JWT.Enabled {
+			return nil, errAuthentication
+		}
 		mode = "jwt"
-		claims, err = VerifyJWT(JWTFromContext(ctx), id.JWT.AllSecrets()...)
+		claims, err = VerifyJWT(rawJWT, id.JWT.AllSecrets()...)
 	} else {
 		claims = &Claims{}
 		claims.UserID, err = config.NormalizeIdentity(user)
@@ -196,9 +200,8 @@ func (r *Registry) Authenticate(ctx context.Context) (context.Context, error) {
 	if err != nil {
 		return nil, errAuthentication
 	}
-	// The default audit field follows the same user-id/email subject rule as
-	// Principal. Explicit alternative claims must be present, without fallback.
-	if sessionValue == "" && (id.SessionNameClaim == "" || id.SessionNameClaim == "user_id") {
+	// Legacy Header callers may not supply the selected JWT-only audit claim.
+	if sessionValue == "" && (mode == "headers" || id.SessionNameClaim == "" || id.SessionNameClaim == "user_id") {
 		sessionValue = principal.SubjectValue
 	}
 	if sessionValue == "" {

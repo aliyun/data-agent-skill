@@ -3,6 +3,7 @@ package mcp
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,17 +54,21 @@ func newHTTPFixture(t *testing.T, kind string, limits config.HTTP, jwtMode bool)
 		group.TenantID, group.AgentID = "tenant", "agent"
 	}
 	cfg.Identity.Groups["shared-role"] = group
+	return newConfiguredHTTPFixture(t, kind, cfg)
+}
+func newConfiguredHTTPFixture(t *testing.T, kind string, cfg config.Config) *httpFixture {
+	t.Helper()
 	registry := tenant.NewRegistry(context.Background(), cfg, nil)
 	t.Cleanup(func() { _ = registry.Close() })
-	f := &httpFixture{s: New(nil, nil, "test"), jwt: jwtMode}
-	if jwtMode {
-		f.s.EnableJWTIdentity("")
+	f := &httpFixture{s: New(nil, nil, "test"), jwt: cfg.Identity.JWT.Enabled}
+	if f.jwt {
+		f.s.EnableJWTIdentity(cfg.Identity.JWT.Header)
 	}
 	f.s.SetResolver(func(context.Context) (*session.Manager, *dataagent.Client, SessionDefaults, error) {
 		f.resolves.Add(1)
 		return nil, nil, SessionDefaults{}, errors.New("unexpected resolver")
 	})
-	if err := f.s.ConfigureHTTP(limits, registry.Authenticate); err != nil {
+	if err := f.s.ConfigureHTTP(cfg.HTTP, registry.Authenticate); err != nil {
 		t.Fatal(err)
 	}
 	var err error
@@ -77,9 +82,33 @@ func newHTTPFixture(t *testing.T, kind string, limits config.HTTP, jwtMode bool)
 	t.Cleanup(func() { f.rt.close(); f.ts.Close() })
 	return f
 }
+func newSharedJWTHTTPFixture(t *testing.T, kind string, groups bool) *httpFixture {
+	t.Helper()
+	cfg := config.Config{HTTP: httpLimits(), Identity: config.Identity{
+		Enabled: true, RequireIdentity: true, AuthToken: "synthetic-platform-token", MaxTenants: 128,
+		SessionNameClaim: "email",
+		JWT:              config.JWT{Enabled: true, Secret: testHTTPSecret},
+		Default:          &config.IdentityGroup{RoleArn: "shared-role"},
+	}}
+	if groups {
+		cfg.Identity.Default = nil
+		cfg.Identity.Groups = map[string]config.IdentityGroup{
+			"shared-role": {RoleArn: "shared-role", Users: []string{"A", "B", "a@example.test"}},
+		}
+	}
+	cfg.ApplyDefaults()
+	if err := cfg.ValidateTransport(kind); err != nil {
+		t.Fatal(err)
+	}
+	return newConfiguredHTTPFixture(t, kind, cfg)
+}
 func signHTTPToken(t *testing.T, user, secret string, expires time.Time) string {
 	t.Helper()
-	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"user_id": user, "tenant_id": "tenant", "agent_id": "agent", "exp": expires.Unix()}).SignedString([]byte(secret))
+	return signHTTPClaims(t, jwt.MapClaims{"user_id": user, "tenant_id": "tenant", "agent_id": "agent", "exp": expires.Unix()}, secret)
+}
+func signHTTPClaims(t *testing.T, claims jwt.MapClaims, secret string) string {
+	t.Helper()
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +198,11 @@ type sseConnection struct {
 
 func (f *httpFixture) connectSSE(t *testing.T, user string) *sseConnection {
 	t.Helper()
-	resp := f.do(t, f.request(t, "GET", "/sse", "", user, ""))
+	return f.connectSSERequest(t, f.request(t, "GET", "/sse", "", user, ""))
+}
+func (f *httpFixture) connectSSERequest(t *testing.T, request *http.Request) *sseConnection {
+	t.Helper()
+	resp := f.do(t, request)
 	if resp.StatusCode != 200 {
 		statusHTTP(t, resp, 200)
 	}
@@ -237,20 +270,7 @@ func TestLegacyJWTMappingDoesNotShareProtocolSessions(t *testing.T) {
 			if err := cfg.ValidateTransport(kind); err != nil {
 				t.Fatal(err)
 			}
-			registry := tenant.NewRegistry(context.Background(), cfg, nil)
-			t.Cleanup(func() { _ = registry.Close() })
-			f := &httpFixture{s: New(nil, nil, "legacy-test"), jwt: true}
-			f.s.EnableJWTIdentity("")
-			if err := f.s.ConfigureHTTP(cfg.HTTP, registry.Authenticate); err != nil {
-				t.Fatal(err)
-			}
-			var err error
-			f.rt, err = f.s.newRemoteTransport(context.Background(), kind)
-			if err != nil {
-				t.Fatal(err)
-			}
-			f.ts = httptest.NewServer(f.rt)
-			t.Cleanup(func() { f.rt.close(); f.ts.Close() })
+			f := newConfiguredHTTPFixture(t, kind, cfg)
 			path, id, status := "/mcp", "", 200
 			var stream *sseConnection
 			if kind == "sse" {
@@ -277,7 +297,7 @@ func TestLegacyJWTMappingDoesNotShareProtocolSessions(t *testing.T) {
 			req = f.request(t, "POST", path, id, "A", pingMessage)
 			req.Header.Del("x-aily-jwt")
 			req.Header.Set("x-aily-user", "A")
-			statusHTTP(t, f.do(t, req), 400)
+			statusHTTP(t, f.do(t, req), 404)
 			req = f.request(t, "POST", path, id, "A", pingMessage)
 			req.Header.Set("x-aily-token", "incorrect-platform-token")
 			statusHTTP(t, f.do(t, req), 401)
@@ -289,6 +309,205 @@ func TestLegacyJWTMappingDoesNotShareProtocolSessions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSharedJWTHTTPLifecycleAndPrincipalIsolation(t *testing.T) {
+	for _, kind := range []string{"streamable-http", "sse"} {
+		for _, groups := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/groups=%t", kind, groups), func(t *testing.T) {
+				f := newSharedJWTHTTPFixture(t, kind, groups)
+				type caller struct{ name, mode, user, email, tenantID, agentID string }
+				callers := []caller{
+					{"header-user-email-fallback", "headers", "A", "", "", ""},
+					{"header-email-only", "headers", "", "a@example.test", "", ""},
+					{"jwt-no-scope", "jwt", "A", "a@example.test", "", ""},
+					{"jwt-tenant-only", "jwt", "A", "a@example.test", "tenant", ""},
+					{"jwt-agent-only", "jwt", "A", "a@example.test", "", "agent"},
+					{"jwt-full-scope", "jwt", "A", "a@example.test", "tenant", "agent"},
+					{"jwt-other-user", "jwt", "B", "b@example.test", "tenant", "agent"},
+				}
+				request := func(c caller, method, path, id, body string) *http.Request {
+					r := f.request(t, method, path, id, "", body)
+					r.Header.Set("x-aily-token", "synthetic-platform-token")
+					if c.mode == "headers" {
+						if c.user != "" {
+							r.Header.Set("x-aily-user", c.user)
+						}
+						if c.email != "" {
+							r.Header.Set("x-aily-email", c.email)
+						}
+					} else {
+						claims := jwt.MapClaims{"user_id": c.user, "email": c.email, "exp": time.Now().Add(time.Hour).Unix()}
+						if c.tenantID != "" {
+							claims["tenant_id"] = c.tenantID
+						}
+						if c.agentID != "" {
+							claims["agent_id"] = c.agentID
+						}
+						r.Header.Set("x-aily-jwt", signHTTPClaims(t, claims, testHTTPSecret))
+						// Mixed plain headers must never replace either signed field.
+						r.Header.Set("x-aily-user", "spoofed-user")
+						r.Header.Set("x-aily-email", "spoofed@example.test")
+					}
+					return r
+				}
+				// Exercise the real tenant-dispatch wrapper with a wholly local resolver
+				// and handler: neither the empty manager nor client performs any I/O.
+				observed := make(chan *tenant.Principal, len(callers)+1)
+				f.s.SetResolver(func(ctx context.Context) (*session.Manager, *dataagent.Client, SessionDefaults, error) {
+					f.resolves.Add(1)
+					if tenant.PrincipalFromContext(ctx) == nil {
+						return nil, nil, SessionDefaults{}, errors.New("missing verified principal")
+					}
+					return &session.Manager{}, &dataagent.Client{}, SessionDefaults{}, nil
+				})
+				f.s.mcp.AddTool(mcp.NewTool("local_identity_probe"), f.s.withTenant(func(_ *Server, ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+					select {
+					case observed <- tenant.PrincipalFromContext(ctx):
+						return mcp.NewToolResultText("local-dispatch-ok"), nil
+					default:
+						return nil, errors.New("unexpected additional local dispatch")
+					}
+				}))
+				type protocolSession struct {
+					owner    caller
+					path, id string
+					stream   *sseConnection
+				}
+				post := func(p *protocolSession, body string, notification bool) string {
+					resp := f.do(t, request(p.owner, "POST", p.path, p.id, body))
+					want := 200
+					if kind == "sse" || notification {
+						want = 202
+					}
+					if kind != "sse" && p.id == "" {
+						p.id = resp.Header.Get("Mcp-Session-Id")
+					}
+					result := statusHTTP(t, resp, want)
+					if p.stream != nil && !notification {
+						result = p.stream.next(t)
+					}
+					awaitHTTP(t, func() bool { _, in := f.counts(); return in == 0 })
+					return result
+				}
+				const list = `{"jsonrpc":"2.0","id":3,"method":"tools/list"}`
+				const call = `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"local_identity_probe"}}`
+				var sessions []*protocolSession
+				for _, c := range callers {
+					p := &protocolSession{owner: c, path: "/mcp"}
+					if kind == "sse" {
+						p.stream = f.connectSSERequest(t, request(c, "GET", "/sse", "", ""))
+						p.path = "/message?sessionId=" + p.stream.id
+					}
+					if result := httpRPCResult(t, post(p, initMessage, false), 1); !strings.Contains(string(result), "protocolVersion") {
+						t.Fatalf("%s: initialize failed: %s", c.name, result)
+					}
+					if p.stream == nil && p.id == "" {
+						t.Fatalf("%s: initialize did not issue a session", c.name)
+					}
+					post(p, `{"jsonrpc":"2.0","method":"notifications/initialized"}`, true)
+					if result := httpRPCResult(t, post(p, list, false), 3); !strings.Contains(string(result), `"local_identity_probe"`) {
+						t.Fatalf("%s: local tool not listed: %s", c.name, result)
+					}
+					result := httpRPCResult(t, post(p, call, false), 4)
+					if !strings.Contains(string(result), "local-dispatch-ok") || strings.Contains(string(result), `"isError":true`) {
+						t.Fatalf("%s: tool dispatch failed: %s", c.name, result)
+					}
+					var principal *tenant.Principal
+					select {
+					case principal = <-observed:
+					default:
+						t.Fatalf("%s: tool handler was not dispatched", c.name)
+					}
+					subjectKind, subject := "user_id", c.user
+					if subject == "" {
+						subjectKind, subject = "email", c.email
+					}
+					canonical, err := json.Marshal([7]string{"principal-v2", "default", c.mode, c.tenantID, c.agentID, subjectKind, subject})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if principal == nil || principal.ID != fmt.Sprintf("%x", sha256.Sum256(canonical)) || principal.Namespace != "default" || principal.AuthMode != c.mode || principal.UserID != c.user || principal.Email != c.email || principal.TenantID != c.tenantID || principal.AgentID != c.agentID || principal.SubjectKind != subjectKind || principal.SubjectValue != subject {
+						t.Fatalf("%s: incorrect verified principal: %+v", c.name, principal)
+					}
+					sessions = append(sessions, p)
+				}
+				// Every direction is checked, including full/partial/absent JWT scopes
+				// and Header/JWT identities with the same user or email.
+				for _, p := range sessions {
+					for _, other := range callers {
+						if other.name == p.owner.name {
+							continue
+						}
+						methods := []string{"POST"}
+						if kind != "sse" {
+							methods = append(methods, "GET", "DELETE")
+						}
+						for _, method := range methods {
+							body := ""
+							if method == "POST" {
+								body = call
+							}
+							r := request(other, method, p.path, p.id, body)
+							if other.mode == "jwt" {
+								r.Header.Set("x-aily-user", p.owner.user)
+								r.Header.Set("x-aily-email", p.owner.email)
+							}
+							t.Run(p.owner.name+"/reject/"+other.name+"/"+method, func(t *testing.T) {
+								f.rejectBeforeDispatch(t, r, 404)
+							})
+						}
+					}
+					// Removing spoofed headers, or supplying email after Header fallback,
+					// must leave the legitimate owner's protocol principal unchanged.
+					r := request(p.owner, "POST", p.path, p.id, pingMessage)
+					if p.owner.mode == "jwt" {
+						r.Header.Del("x-aily-user")
+						r.Header.Del("x-aily-email")
+					} else if p.owner.user != "" {
+						r.Header.Set("x-aily-email", "a@example.test")
+					}
+					want := 200
+					if p.stream != nil {
+						want = 202
+					}
+					result := statusHTTP(t, f.do(t, r), want)
+					if p.stream != nil {
+						result = p.stream.next(t)
+					}
+					httpRPCResult(t, result, 2)
+					awaitHTTP(t, func() bool { _, in := f.counts(); return in == 0 })
+				}
+				if got := f.resolves.Load(); got != int64(len(callers)) {
+					t.Fatalf("resolver calls=%d, want=%d", got, len(callers))
+				}
+				for _, p := range sessions {
+					if p.stream != nil {
+						_ = p.stream.response.Body.Close()
+					} else {
+						statusHTTP(t, f.do(t, request(p.owner, "DELETE", p.path, p.id, "")), 200)
+					}
+				}
+				awaitHTTP(t, func() bool { n, in := f.counts(); return n == 0 && in == 0 })
+				for _, p := range sessions {
+					f.rejectBeforeDispatch(t, request(p.owner, "POST", p.path, p.id, call), 404)
+				}
+			})
+		}
+	}
+}
+
+func httpRPCResult(t *testing.T, body string, id int) json.RawMessage {
+	t.Helper()
+	var response struct {
+		ID     int             `json:"id"`
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &response); err != nil || response.ID != id || len(response.Error) != 0 || len(response.Result) == 0 {
+		t.Fatalf("unexpected RPC response for id=%d: %s (decode error: %v)", id, body, err)
+	}
+	return response.Result
 }
 
 func TestHTTPRemoteRequiresConfiguration(t *testing.T) {
@@ -311,22 +530,147 @@ func TestHTTPRemoteRequiresConfiguration(t *testing.T) {
 	}
 }
 
+type httpAuthRoute struct{ method, path, body string }
+
+func httpAuthenticationRoutes(kind string) []httpAuthRoute {
+	paths := []httpAuthRoute{
+		{"POST", "/mcp", initMessage},
+		{"POST", "/mcp", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`},
+		{"POST", "/mcp", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"data_agent_list_workspaces"}}`},
+		{"POST", "/mcp", `{"jsonrpc":"2.0","method":"notifications/initialized"}`},
+		{"GET", "/mcp", ""},
+		{"DELETE", "/mcp", ""},
+	}
+	if kind == "sse" {
+		paths = paths[:4]
+		for i := range paths {
+			paths[i].path = "/message?sessionId=synthetic-unknown"
+		}
+		paths = append(paths, httpAuthRoute{"GET", "/sse", ""})
+	}
+	return paths
+}
+
+func TestSharedJWTHTTPAuthenticationCannotDowngrade(t *testing.T) {
+	for _, kind := range []string{"streamable-http", "sse"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newSharedJWTHTTPFixture(t, kind, false)
+			request := func(method, path, id, body string) *http.Request {
+				r := f.request(t, method, path, id, "", body)
+				r.Header.Set("x-aily-token", "synthetic-platform-token")
+				r.Header.Set("x-aily-user", "A")
+				r.Header.Set("x-aily-email", "a@example.test")
+				return r
+			}
+			path, id, want := "/mcp", "", 200
+			var stream *sseConnection
+			if kind == "sse" {
+				stream = f.connectSSERequest(t, request("GET", "/sse", "", ""))
+				path, want = "/message?sessionId="+stream.id, 202
+			}
+			resp := f.do(t, request("POST", path, "", initMessage))
+			if kind != "sse" {
+				id = resp.Header.Get("Mcp-Session-Id")
+				if id == "" {
+					statusHTTP(t, resp, 200)
+					t.Fatal("Header initialization did not issue a session")
+				}
+			}
+			body := statusHTTP(t, resp, want)
+			if stream != nil {
+				body = stream.next(t)
+			}
+			httpRPCResult(t, body, 1)
+			awaitHTTP(t, func() bool { _, in := f.counts(); return in == 0 })
+			claims := jwt.MapClaims{"user_id": "A", "email": "a@example.test", "exp": time.Now().Add(time.Hour).Unix()}
+			valid := signHTTPClaims(t, claims, testHTTPSecret)
+			badSignature := signHTTPClaims(t, claims, "synthetic-wrong-signing-key")
+			claims["exp"] = time.Now().Add(-time.Minute).Unix()
+			expired := signHTTPClaims(t, claims, testHTTPSecret)
+			claims["exp"] = time.Now().Add(time.Hour).Unix()
+			delete(claims, "email")
+			missingEmail := signHTTPClaims(t, claims, testHTTPSecret)
+			claims["email"] = " "
+			blankEmail := signHTTPClaims(t, claims, testHTTPSecret)
+			for _, route := range httpAuthenticationRoutes(kind) {
+				if route.method == "POST" {
+					route.path = path
+				}
+				for _, invalid := range []struct{ name, token string }{
+					{"empty", ""}, {"whitespace", " \t "}, {"malformed", "bad"},
+					{"bad-signature", badSignature}, {"expired", expired},
+					{"missing-selected-email", missingEmail}, {"blank-selected-email", blankEmail},
+				} {
+					t.Run(route.method+"/"+route.body+"/jwt-"+invalid.name, func(t *testing.T) {
+						r := request(route.method, route.path, id, route.body)
+						// Set, not Del: even a present-but-empty JWT forbids Header fallback.
+						r.Header.Set("x-aily-jwt", invalid.token)
+						f.rejectBeforeDispatch(t, r, 401)
+					})
+				}
+				for _, jwtPresent := range []bool{false, true} {
+					for _, token := range []string{"", "wrong-platform-token"} {
+						t.Run(fmt.Sprintf("%s/%s/jwt=%t/platform=%q", route.method, route.body, jwtPresent, token), func(t *testing.T) {
+							r := request(route.method, route.path, id, route.body)
+							if jwtPresent {
+								r.Header.Set("x-aily-jwt", valid)
+							}
+							if token == "" {
+								r.Header.Del("x-aily-token")
+							} else {
+								r.Header.Set("x-aily-token", token)
+							}
+							f.rejectBeforeDispatch(t, r, 401)
+						})
+					}
+				}
+				r := request(route.method, route.path, id, route.body)
+				r.Header.Del("x-aily-user")
+				r.Header.Del("x-aily-email")
+				f.rejectBeforeDispatch(t, r, 401)
+			}
+			if f.resolves.Load() != 0 {
+				t.Fatal("rejected credentials reached tenant/STS resolver")
+			}
+			if n, in := f.counts(); n != 1 || in != 0 {
+				t.Fatalf("rejected requests changed live reservations: %d/%d", n, in)
+			}
+			body = statusHTTP(t, f.do(t, request("POST", path, id, pingMessage)), want)
+			if stream != nil {
+				body = stream.next(t)
+			}
+			httpRPCResult(t, body, 2)
+		})
+	}
+}
+
+func TestHTTPDisabledJWTRejectsHeaderPresence(t *testing.T) {
+	for _, kind := range []string{"streamable-http", "sse"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newHTTPFixture(t, kind, httpLimits(), false)
+			for _, route := range httpAuthenticationRoutes(kind) {
+				for _, token := range []string{"", " \t ", "bad", signHTTPToken(t, "A", testHTTPSecret, time.Now().Add(time.Hour))} {
+					r := f.request(t, route.method, route.path, "", "A", route.body)
+					r.Header.Set("x-aily-jwt", token)
+					f.rejectBeforeDispatch(t, r, 400)
+				}
+			}
+			if n, in := f.counts(); n != 0 || in != 0 {
+				t.Fatalf("disabled JWT reserved sessions: %d/%d", n, in)
+			}
+		})
+	}
+}
+
 func TestHTTPAuthenticationBeforeBodyAndDispatch(t *testing.T) {
 	for _, kind := range []string{"sse", "streamable-http"} {
 		for _, gateway := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/gateway=%t", kind, gateway), func(t *testing.T) {
 				f := newHTTPFixture(t, kind, httpLimits(), true)
 				f.s.EnableGateway(gateway, false, true)
-				paths := []struct{ method, path, body string }{{"POST", "/mcp", initMessage}, {"POST", "/mcp", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`}, {"POST", "/mcp", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"data_agent_list_workspaces"}}`}, {"POST", "/mcp", `{"jsonrpc":"2.0","method":"notifications/initialized"}`}, {"GET", "/mcp", ""}, {"DELETE", "/mcp", ""}}
-				if kind == "sse" {
-					for i := range paths {
-						paths[i].path = "/message?sessionId=synthetic-unknown"
-					}
-					paths = paths[:4]
-					paths = append(paths, struct{ method, path, body string }{"GET", "/sse", ""})
-				}
+				paths := httpAuthenticationRoutes(kind)
 				for _, route := range paths {
-					for _, variant := range []string{"missing-platform", "wrong-platform", "missing-jwt", "bad-jwt", "expired", "missing-scope", "unmapped", "spoofed-header"} {
+					for _, variant := range []string{"missing-platform", "wrong-platform", "missing-jwt", "bad-jwt", "expired", "missing-scope", "missing-tenant", "missing-agent", "header-unmapped", "unmapped", "invalid-jwt-with-headers", "unmapped-jwt-with-headers"} {
 						r := f.request(t, route.method, route.path, "", "A", route.body)
 						want := 401
 						switch variant {
@@ -340,17 +684,36 @@ func TestHTTPAuthenticationBeforeBodyAndDispatch(t *testing.T) {
 							r.Header.Set("x-aily-jwt", "bad")
 						case "expired":
 							r.Header.Set("x-aily-jwt", signHTTPToken(t, "A", testHTTPSecret, time.Now().Add(-time.Second)))
-						case "missing-scope":
-							tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"user_id": "A", "exp": time.Now().Add(time.Hour).Unix()}).SignedString([]byte(testHTTPSecret))
-							r.Header.Set("x-aily-jwt", tok)
-						case "unmapped":
-							r.Header.Set("x-aily-jwt", signHTTPToken(t, "C", testHTTPSecret, time.Now().Add(time.Hour)))
+						case "missing-scope", "missing-tenant", "missing-agent":
+							claims := jwt.MapClaims{"user_id": "A", "exp": time.Now().Add(time.Hour).Unix()}
+							if variant == "missing-tenant" {
+								claims["agent_id"] = "agent"
+							}
+							if variant == "missing-agent" {
+								claims["tenant_id"] = "tenant"
+							}
+							r.Header.Set("x-aily-jwt", signHTTPClaims(t, claims, testHTTPSecret))
 							want = 403
-						case "spoofed-header":
+						case "header-unmapped":
+							r.Header.Del("x-aily-jwt")
 							r.Header.Set("x-aily-user", "A")
-							want = 400
+							r.Header.Set("x-aily-email", "a@example.test")
+							want = 403
+						case "unmapped", "unmapped-jwt-with-headers":
+							r.Header.Set("x-aily-jwt", signHTTPToken(t, "C", testHTTPSecret, time.Now().Add(time.Hour)))
+							if variant == "unmapped-jwt-with-headers" {
+								r.Header.Set("x-aily-user", "A")
+								r.Header.Set("x-aily-email", "a@example.test")
+							}
+							want = 403
+						case "invalid-jwt-with-headers":
+							r.Header.Set("x-aily-jwt", "bad")
+							r.Header.Set("x-aily-user", "A")
+							r.Header.Set("x-aily-email", "a@example.test")
 						}
-						statusHTTP(t, f.do(t, r), want)
+						t.Run(route.method+"/"+route.path+"/"+variant, func(t *testing.T) {
+							f.rejectBeforeDispatch(t, r, want)
+						})
 					}
 				}
 				if f.resolves.Load() != 0 {
@@ -370,6 +733,25 @@ func TestHTTPAuthenticationBeforeBodyAndDispatch(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func (f *httpFixture) rejectBeforeDispatch(t *testing.T, request *http.Request, want int) {
+	t.Helper()
+	before := f.resolves.Load()
+	statusHTTP(t, f.do(t, request), want)
+	if request.Method == http.MethodPost {
+		probe := request.Clone(context.Background())
+		probe.Body = &neverReadBody{t: t}
+		probe.ContentLength = -1
+		w := httptest.NewRecorder()
+		f.rt.ServeHTTP(w, probe)
+		if w.Code != want {
+			t.Fatalf("rejection with unread body: status=%d, want=%d", w.Code, want)
+		}
+	}
+	if f.resolves.Load() != before {
+		t.Fatal("rejected request reached tenant/STS resolver")
 	}
 }
 

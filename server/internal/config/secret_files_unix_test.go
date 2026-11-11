@@ -160,6 +160,81 @@ func TestLegacyPermissionFlagDoesNotBypassIntegrity(t *testing.T) {
 	}
 }
 
+func TestLoadAuthToken(t *testing.T) {
+	t.Setenv("DOTENV_UNSAFE_FILES_ALLOW", "0")
+	t.Setenv("IDENTITY_AUTH_TOKEN", "synthetic-server-environment-token")
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{"yaml", "identity:\n  auth_token: 'synthetic-token: #quoted'\n  jwt:\n    secret: synthetic-signing-secret\n", "synthetic-token: #quoted"},
+		{"json", `{"identity":{"auth_token":"synthetic-json-token"}}`, "synthetic-json-token"},
+		{"missing", "identity: {}\n", ""},
+		{"empty", "identity: {auth_token: ''}\n", ""},
+		{"blank", "identity: {auth_token: '  '}\n", ""},
+		{"null", "identity: {auth_token: null}\n", ""},
+		{"other credentials", "api_key: synthetic-api-key\nidentity: {jwt: {secret: synthetic-signing-secret}}\n", ""},
+		{"wrong type", "identity: {auth_token: [synthetic-hidden-value]}\n", ""},
+		{"malformed", "identity: {auth_token: [synthetic-hidden-value\n", ""},
+		{"multiple documents", "identity: {auth_token: synthetic-hidden-value}\n---\nidentity: {}\n", ""},
+		{"cyclic alias", "identity: &loop {auth_token: *loop}\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := LoadAuthToken(path)
+			if (err == nil) != (tc.want != "") || got != tc.want {
+				t.Fatalf("unexpected token result: error=%v", err)
+			}
+			if err != nil && strings.Contains(err.Error(), "synthetic-") {
+				t.Fatal("configuration error leaked a credential")
+			}
+		})
+	}
+}
+
+func TestLoadAuthTokenFileSecurity(t *testing.T) {
+	t.Setenv("DOTENV_UNSAFE_FILES_ALLOW", "0")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if _, err := LoadAuthToken(path); err == nil || err.Error() != "client configuration file not found" {
+		t.Fatalf("missing file: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("identity: {auth_token: synthetic-file-token}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+	if token, err := LoadAuthToken("~/config.yaml"); err != nil || token != "synthetic-file-token" {
+		t.Fatalf("home-relative path: %v", err)
+	}
+	link := filepath.Join(dir, "link.yaml")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadAuthToken(link); err == nil {
+		t.Fatal("symlink accepted")
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadAuthToken(path); err == nil {
+		t.Fatal("publicly readable token accepted")
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0700)
+	if _, err := LoadAuthToken(path); err == nil {
+		t.Fatal("untrusted writable directory accepted")
+	}
+}
+
 func TestSecretFileOwnerChecksWithoutChangingOwnership(t *testing.T) {
 	uid := uint32(os.Geteuid())
 	for _, mode := range []os.FileMode{0600, 0400} {

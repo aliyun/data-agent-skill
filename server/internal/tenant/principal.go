@@ -61,7 +61,7 @@ func makePrincipal(namespace, mode string, c *Claims) (*Principal, error) {
 	if !config.ValidNamespace(namespace) || (mode != "jwt" && mode != "headers") {
 		return nil, errAuthentication
 	}
-	if mode == "jwt" && (c.TenantID == "" || c.AgentID == "") || mode == "headers" && (c.TenantID != "" || c.AgentID != "") {
+	if mode == "headers" && (c.TenantID != "" || c.AgentID != "") {
 		return nil, errAuthentication
 	}
 	kind, value := "user_id", c.UserID

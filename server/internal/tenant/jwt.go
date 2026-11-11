@@ -1,11 +1,6 @@
 package tenant
 
-// JWT verification for upstream-signed end-user identity.
-//
-// Feishu Aily signs the caller's identity into a JWT and sends it on every MCP
-// request. Remote authentication requires both this signature and the platform
-// token. Header identity is supported only as an explicitly selected trusted
-// proxy deployment, never as a missing-JWT fallback.
+// A supplied JWT must verify; only its absence permits trusted Header identity.
 
 import (
 	"bytes"
@@ -169,8 +164,8 @@ func VerifyJWT(token string, secrets ...string) (*Claims, error) {
 			claims.DepartmentIDs = append(claims.DepartmentIDs, s)
 		}
 	}
-	if (claims.UserID == "" && claims.Email == "") || claims.TenantID == "" || claims.AgentID == "" {
-		return nil, errors.New("identity token missing required identity or scope")
+	if claims.UserID == "" && claims.Email == "" {
+		return nil, errors.New("identity token missing required identity")
 	}
 	// Do not let numeric date parsing round an overflowing/fractional expiry.
 	exp, ok := mc["exp"].(json.Number)

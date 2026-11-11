@@ -440,10 +440,7 @@ func (t *remoteTransport) checkHeaders(r *http.Request) int {
 			return http.StatusBadRequest
 		}
 	}
-	if t.owner.jwtIdentity && (r.Header.Get(t.owner.hdrUser) != "" || r.Header.Get(t.owner.hdrEmail) != "") {
-		return http.StatusBadRequest
-	}
-	if !t.owner.jwtIdentity && r.Header.Get(t.owner.hdrJWT) != "" {
+	if !t.owner.jwtIdentity && len(r.Header.Values(t.owner.hdrJWT)) != 0 {
 		return http.StatusBadRequest
 	}
 	if r.Header.Get("Authorization") != "" && !strings.EqualFold(t.owner.hdrToken, "Authorization") && !strings.EqualFold(t.owner.hdrJWT, "Authorization") {

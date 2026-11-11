@@ -46,6 +46,9 @@ func TestPrincipalCanonicalTupleAndRotation(t *testing.T) {
 	for _, tc := range []struct{ namespace, mode, tenant, agent, user, email string }{
 		{"other", "jwt", "tenant", "agent", "a+b", ""},
 		{"domain", "headers", "", "", "a+b", ""},
+		{"domain", "jwt", "", "", "a+b", ""},
+		{"domain", "jwt", "tenant", "", "a+b", ""},
+		{"domain", "jwt", "", "agent", "a+b", ""},
 		{"domain", "jwt", "other", "agent", "a+b", ""},
 		{"domain", "jwt", "tenant", "other", "a+b", ""},
 		{"domain", "jwt", "tenant", "agent", "", "a+b"},
@@ -160,13 +163,20 @@ func TestLegacySharedRoleKeepsJWTPrincipalsAndStorageSeparate(t *testing.T) {
 		{"tenant_id": "t2", "agent_id": "a1", "user_id": "same-user"},
 		{"tenant_id": "t1", "agent_id": "a2", "user_id": "same-user"},
 		{"tenant_id": "t1", "agent_id": "a1", "email": "same-user"},
+		{"user_id": "same-user"},
+		{"tenant_id": "t1", "user_id": "same-user"},
+		{"agent_id": "a1", "user_id": "same-user"},
+		{"email": "same-user"},
 	} {
-		ctx, err := r.Authenticate(jwtCtx(t, fields))
+		token := signToken(t, testSecret, fields, time.Now().Add(time.Hour))
+		ctx, err := r.Authenticate(WithIdentity(WithJWT(context.Background(), token), "", "", testAuthToken))
 		if err != nil {
 			t.Fatal(err)
 		}
 		principal := PrincipalFromContext(ctx)
-		if principal == nil || principal.Namespace != "default" || principal.TenantID != fields["tenant_id"] || principal.AgentID != fields["agent_id"] {
+		tenantID, _ := fields["tenant_id"].(string)
+		agentID, _ := fields["agent_id"].(string)
+		if principal == nil || principal.Namespace != "default" || principal.TenantID != tenantID || principal.AgentID != agentID {
 			t.Fatal("legacy role mapping lost verified scope")
 		}
 		ten, err := r.Resolve(ctx)
@@ -193,8 +203,25 @@ func TestLegacySharedRoleKeepsJWTPrincipalsAndStorageSeparate(t *testing.T) {
 			t.Fatal("same principal did not reuse its own tenant")
 		}
 	}
-	if _, err := r.Authenticate(WithIdentity(context.Background(), "same-user", "", testAuthToken)); !IsAuthenticationError(err) {
-		t.Fatal("shared mapping downgraded missing JWT to headers")
+	ctx, err := r.Authenticate(WithIdentity(context.Background(), "same-user", "", testAuthToken))
+	if err != nil {
+		t.Fatal("legacy Header identity rejected", err)
+	}
+	principal := PrincipalFromContext(ctx)
+	if principal.AuthMode != "headers" || !principal.ExpiresAt.IsZero() || seen[principal.ID] != nil {
+		t.Fatal("Header identity shared a JWT principal")
+	}
+	ten, err := r.Resolve(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, other := range seen {
+		if ten.Manager == other.Manager || ten.Client == other.Client || ten.Key == other.Key {
+			t.Fatal("Header identity shared JWT state")
+		}
+	}
+	if _, err := os.Stat(filepath.Join(cfg.SessionsDir, "identity-v2", principal.ID, "owner.json")); err != nil {
+		t.Fatal("missing Header owner record", err)
 	}
 }
 
@@ -210,11 +237,16 @@ func TestStrictJWTIdentityFieldTypes(t *testing.T) {
 		}
 	}
 	for _, field := range []string{"tenant_id", "agent_id"} {
-		for _, empty := range []any{"", "   ", nil} {
-			c := ailyClaims()
-			c[field] = empty
-			if _, err := VerifyJWT(signToken(t, testSecret, c, time.Now().Add(time.Hour)), testSecret); err == nil {
-				t.Fatal("JWT missing required scope accepted")
+		for _, empty := range []string{"", "   "} {
+			fields := ailyClaims()
+			fields[field] = empty
+			claims, err := VerifyJWT(signToken(t, testSecret, fields, time.Now().Add(time.Hour)), testSecret)
+			if err != nil {
+				t.Fatal("legacy optional scope rejected", err)
+			}
+			value, _ := claims.Field(field)
+			if value != "" {
+				t.Fatal("empty scope was synthesized")
 			}
 		}
 	}

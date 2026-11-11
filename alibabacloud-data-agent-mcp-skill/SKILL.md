@@ -40,11 +40,19 @@ Treat prior P2a/P2b automated/cloud checks as **historical pre-remediation evide
 
 Keep setup/install separate from runtime task execution; do not create a new skill or install anything to bypass missing tools.
 
-- [references/INSTALLATION.md](references/INSTALLATION.md): Go 1.26.10 minimum, retained SDK default chain, mandatory remote identity/scopes, secret-file ownership, exact HTTP limits, identity-v2 migration and release gates.
-- [README.md](README.md): human deployment and dacli verification (`--jwt` / `AILY_JWT`; Streamable HTTP only).
+- [references/INSTALLATION.md](references/INSTALLATION.md): Go 1.26.10 minimum, retained SDK default chain, per-request token/identity, shared versus scoped mappings, secret-file ownership, exact HTTP limits, identity-v2 migration and release gates.
+- [README.md](README.md): human deployment and dacli verification (`--config` reads the platform token, never issues a JWT; `--jwt` / `AILY_JWT` for JWT identity; Streamable HTTP only).
 - [references/ram-policies.md](references/ram-policies.md): API versus data permissions and pending real authorization evidence.
 
-Reject identity failures without retrying Header/global credentials, for **any** remote tool or protocol method. Keep stdio local-only; do not claim same-role users, RoleSessionName or local owner markers provide cloud row isolation. Never self-migrate history, claim unowned directories or modify real secrets/permissions/deployments; refer these to the administrator and linked setup requirements. The independent Python CLI remains separate.
+Require platform-token validation on **every** remote tool and protocol request. Keep the token only with trusted upstreams, never end users. Apply these identity rules without introducing a compatibility switch:
+
+- With `jwt.enabled=true`, allow trusted Header user/email only when the JWT header is **completely absent** and mappings are shared. Reject a present empty/invalid/expired JWT without downgrade; use a valid HS256/exp JWT's identity and ignore simultaneous plain user/email headers. With `jwt.enabled=false`, reject any JWT header, even empty.
+- Keep all `groups`/`default` mappings consistently shared (both tenant/agent fields omitted/empty) or explicitly scoped (both exact nonempty values). Shared mappings accept trusted Header identity and valid JWTs lacking `tenant_id` or `agent_id`; scoped mappings require complete matching signed JWT scope and cannot match Header identity. Reject mixed/partial/wildcard mapping scopes.
+- Require the Header upstream to authenticate callers, overwrite self-reported identity headers and ensure namespace-wide ID uniqueness; restrict server access to trusted upstreams. Do not automatically retry rejected JWTs by removing them or switching identity/global credentials.
+- Allow a missing Header `session_name_claim` value to fall back to user_id/email. Require an explicitly selected non-default JWT claim to exist; only default user_id can fall back to email. Treat RoleSessionName as attribution, not authorization.
+- Preserve `principal-v2` namespace/`auth_mode`/scope/typed-subject isolation for protocol sessions, tenant caches and history, including shared mappings. Do not merge Header/JWT history or migrate v1 automatically; do not allow anonymous/global-AK fallback.
+
+Keep stdio local-only; do not claim same-role users or local owner markers provide cloud row isolation. Never self-migrate history, claim unowned directories or modify real secrets/permissions/deployments; refer these to the administrator and linked setup requirements. The independent Python CLI remains separate.
 
 # Gateway Metadata Tools (9 Base + 2 P2b, Optional)
 
@@ -306,7 +314,7 @@ On a tool/network error, report a bounded failure rather than retrying indefinit
 | Gateway tools missing | Report gateway unavailable/disabled or host-filtered; no CLI/API/SQL fallback |
 | Legacy credential migration error | Ask operator to remove obsolete API Key inputs and configure SDK AK/STS; do not reveal secrets |
 | Credential loading/refresh error | Refer operator to supported credentials-go provider setup; do not promise CLI profile loading |
-| Remote identity/session rejected | Report failure; require operator-verified identity/scopes and owned live protocol ID; never retry Header/global identity or automatically replay unknown sends |
+| Remote identity/session rejected | Report failure; require operator-verified identity, shared/scoped mapping and owned live protocol ID. Trusted Header is allowed only with no JWT header and shared mappings; never remove a rejected JWT to retry as Header/global identity or automatically replay unknown sends |
 | Gateway permission denied | Report request IDs; ask operator to check RAM and data ACL separately, not grant blanket full access |
 | Empty workspace database list | Discover/import via DMS, then re-read the workspace list |
 | Invalid InstanceId / database_None | Re-read workspace metadata and map instance_resource_id to instance_name |

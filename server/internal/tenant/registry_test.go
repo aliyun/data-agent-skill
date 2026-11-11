@@ -268,7 +268,7 @@ func TestRedactCredentials(t *testing.T) {
 
 func TestGatewayJWTRequiresValidTokenNoHeaderDowngrade(t *testing.T) {
 	for name, raw := range map[string]string{
-		"missing":         "",
+		"empty":           "",
 		"invalid":         "not-a-jwt",
 		"wrong signature": signToken(t, "other-secret", ailyClaims(), time.Now().Add(time.Hour)),
 		"expired":         signToken(t, testSecret, ailyClaims(), time.Now().Add(-time.Minute)),

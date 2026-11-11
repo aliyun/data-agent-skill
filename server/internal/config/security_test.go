@@ -126,6 +126,17 @@ func TestScopedMappingsAndCrossFieldConflict(t *testing.T) {
 			t.Fatalf("scope match: %q %v", name, err)
 		}
 	}
+	for _, claims := range []IdentityClaims{
+		{AuthMode: "headers", UserID: "id"},
+		{AuthMode: "headers", UserID: "id", TenantID: "t1", AgentID: "a1"},
+		{AuthMode: "jwt", UserID: "id"},
+		{AuthMode: "jwt", UserID: "id", TenantID: "t1"},
+		{AuthMode: "jwt", UserID: "id", AgentID: "a1"},
+	} {
+		if _, _, err := c.ResolveGroup(claims); !errors.Is(err, ErrIdentityUnmapped) {
+			t.Fatal("legacy identity bypassed explicit scope mapping")
+		}
+	}
 	c.Identity.Groups["cross"] = IdentityGroup{RoleArn: "shared", TenantID: "t1", AgentID: "a1", Users: []string{"other@example.com"}}
 	for i := 0; i < 100; i++ {
 		_, _, err := c.ResolveGroup(IdentityClaims{AuthMode: "jwt", TenantID: "t1", AgentID: "a1", UserID: "id", Email: "other@example.com"})
@@ -163,7 +174,7 @@ func TestLegacyJWTSharedMappings(t *testing.T) {
 	if err := c.ValidateTransport("streamable-http"); err != nil {
 		t.Fatal(err)
 	}
-	for _, scope := range [][2]string{{"tenant-a", "agent-a"}, {"tenant-b", "agent-b"}} {
+	for _, scope := range [][2]string{{"tenant-a", "agent-a"}, {"tenant-b", "agent-b"}, {"", ""}, {"tenant-a", ""}, {"", "agent-a"}} {
 		for _, user := range []string{"member", "other"} {
 			want := "default"
 			if user == "member" {
@@ -175,13 +186,24 @@ func TestLegacyJWTSharedMappings(t *testing.T) {
 			}
 		}
 	}
+	for _, user := range []string{"member", "other"} {
+		want := "default"
+		if user == "member" {
+			want = "analysts"
+		}
+		if name, _, err := c.ResolveGroup(IdentityClaims{AuthMode: "headers", UserID: user}); err != nil || name != want {
+			t.Fatalf("legacy Header mapping failed: %q %v", name, err)
+		}
+	}
 	for _, claims := range []IdentityClaims{
-		{AuthMode: "headers", UserID: "member"},
-		{AuthMode: "jwt", UserID: "member"},
-		{AuthMode: "jwt", UserID: "member", TenantID: "t"},
+		{AuthMode: "headers", UserID: "member", TenantID: "t"},
+		{AuthMode: "headers", UserID: "member", AgentID: "a"},
+		{AuthMode: "invalid", UserID: "member"},
+		{AuthMode: "jwt"},
+		{AuthMode: "headers"},
 	} {
 		if _, _, err := c.ResolveGroup(claims); err == nil {
-			t.Fatal("legacy mapping must not accept missing verified scope or unsigned headers")
+			t.Fatal("invalid identity accepted by legacy mapping")
 		}
 	}
 	c.Identity.Groups["duplicate"] = IdentityGroup{RoleArn: "other", Users: []string{"member"}}

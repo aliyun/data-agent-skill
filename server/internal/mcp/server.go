@@ -275,7 +275,9 @@ func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest
 // install a trusted Principal before dispatch, and tool-time Resolve consumes
 // only that verified context.
 func (s *Server) identityHTTPContext(ctx context.Context, r *http.Request) context.Context {
-	ctx = tenant.WithJWT(ctx, strings.TrimSpace(r.Header.Get(s.hdrJWT)))
+	if len(r.Header.Values(s.hdrJWT)) != 0 {
+		ctx = tenant.WithJWT(ctx, strings.TrimSpace(r.Header.Get(s.hdrJWT)))
+	}
 	return tenant.WithIdentity(ctx,
 		r.Header.Get(s.hdrUser),
 		r.Header.Get(s.hdrEmail),

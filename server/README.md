@@ -113,28 +113,49 @@ Namespace is a stable administrator-chosen trust domain, 1–64 characters
 `[a-z0-9][a-z0-9_-]*`. Independent deployments/trust domains sharing a sessions
 root must use different namespaces.
 Every initialize, tools/list, call, notification and GET/POST/DELETE validates the
-platform token and identity before body reading/dispatch. There is no anonymous,
-unsigned Header or global-key fallback for remote methods. stdio remains local-only,
-one SDK or API Key process identity, never per-chat-user authorization.
+platform token and identity before body reading/dispatch. Only trusted upstreams
+may hold the platform token; never distribute it to end users. There is no anonymous
+or global-AK/key fallback for remote methods. stdio remains local-only, one SDK or
+API Key process identity, never per-chat-user authorization.
 
-JWT mode requires valid HS256/exp, nonempty signed `tenant_id`/`agent_id`, and
-`user_id` or `email`. Across **all groups and any default**, either both scope
-values are omitted/empty (legacy shared mapping), or both are exact tenant/agent
-values on every mapping. Mixed, partial and wildcard scopes are rejected.
-Legacy mappings match signed user ID/email within the administrator's shared
-signing trust domain; existing JWT customers need not add IDs to `groups`.
-Explicitly scoped mappings match only their exact tenant/agent pair. Default
-applies only to unmatched users in the selected mapping mode; multiple matching
-groups reject even with the same role. Explicit Header mode requires empty
-scopes and a trusted proxy that overwrites identity headers and keeps the platform
-token from end users; JWT mode never falls back to unsigned headers. All configured
-JWT keys have equivalent signing authority within **one trusted domain**, not
-independent issuer isolation. Unrelated issuers need separate instances/configurations
-and different namespaces if sharing a sessions root.
+With `identity.jwt.enabled=true`, a **completely absent JWT header** permits trusted
+Header `user`/`email` identity, subject to shared mappings below. A present but empty,
+invalid or expired JWT is rejected, never downgraded to Header identity. A valid
+HS256 JWT with `exp` and usable `user_id` or `email` takes precedence; simultaneous
+plain user/email headers are ignored for identity. With `jwt.enabled=false`, trusted
+Header identity is used and any JWT header, including an empty one, is rejected.
+No new compatibility switch is needed.
 
-Remote history uses `sessions_dir/identity-v2/<principal_id>/`, hashing namespace,
-auth mode, tenant/agent and typed user ID/email. `owner.json` must match the
-principal; nonempty unmarked directories are not automatically claimed. No old
+Across **all groups and any default**, either both `tenant_id`/`agent_id` mapping
+values are omitted/empty (legacy shared mapping), or both are exact nonempty values
+on every mapping. Mixed shared/scoped mappings, partial scopes and wildcards are
+rejected. Shared mappings accept trusted Header identity and valid HS256/exp JWTs
+without `tenant_id` or `agent_id`; matching uses user ID/email within the trusted
+domain. Existing shared `groups`/`default` need no added scope IDs. Explicitly scoped
+mappings require a JWT with both signed scope claims matching the mapping exactly;
+Header identity cannot match them. Default applies only to unmatched users in the
+selected mapping mode and, when scoped, within that exact scope. Multiple matching
+groups reject even with the same role.
+
+On either Header path, the trusted upstream must authenticate the caller, overwrite
+client-supplied identity headers, keep the platform token from end users, and ensure
+identifier uniqueness within the namespace. Restrict server access to trusted
+upstreams; the token authenticates that upstream, not an end user's self-reported
+identity. All configured JWT keys have equivalent signing authority within **one
+trusted domain**, not independent issuer isolation. Unrelated issuers need separate
+instances/configurations and different namespaces if sharing a sessions root.
+
+For RoleSessionName attribution, a missing `session_name_claim` value on the Header
+path falls back to `user_id`, then `email`. On the JWT path, an explicitly selected
+non-default claim must exist; only the default `user_id` selection can fall back to
+email. This does not change user/email role matching or grant cloud isolation.
+
+Remote history uses `sessions_dir/identity-v2/<principal_id>/`. The `principal-v2`
+digest includes namespace, `auth_mode`, tenant/agent scope (including absent scope)
+and typed user ID/email. Protocol sessions, tenant caches and disk history retain
+this isolation even with shared role mappings. Header and JWT history never merge
+automatically, even for the same user. `owner.json` must match the principal;
+nonempty unmarked directories are not automatically claimed. No old v1
 `identity/<sanitized-key>` read fallback, deletion or automatic migration exists.
 Offline import requires separately authorized administrator proof of unique
 ownership, backup and validation of IDs/files/permissions; ambiguous histories
@@ -144,10 +165,13 @@ attribution only. See the [identity and migration reference](../alibabacloud-dat
 
 ### Upgrading an existing deployment
 
-Existing unscoped JWT `groups`/`default` mappings can stay unchanged within the
-same signing trust domain; enabling `DATA_AGENT_LOG` or `DATA_AGENT_PERF_LOG`
-does not require a mapping upgrade. Empty legacy API Key settings remain valid
-with AK/STS; nonempty API Keys remain local-stdio-only. Namespace omission uses
+Existing unscoped `groups`/`default` mappings can stay unchanged within the same
+trusted domain: they support trusted Header identity with no JWT header, even when
+JWT is enabled, and valid JWTs without tenant/agent claims. A supplied JWT must pass
+verification; explicitly scoped mappings still require complete matching JWT scope.
+Enabling `DATA_AGENT_LOG` or `DATA_AGENT_PERF_LOG` does not require a mapping upgrade.
+Empty legacy API Key settings remain valid with AK/STS; nonempty API Keys remain
+local-stdio-only. Namespace omission uses
 `default`, while explicit namespaces are preserved. Compatibility does **not**
 disable per-request authentication, protocol ownership, tenant-cache or v2 disk
 isolation by verified tenant/agent/typed user, nor enable old-directory reads.
@@ -488,16 +512,43 @@ wants to approve plans and SQL manually. Web-report approval remains required.
 
 ```bash
 make dacli
-# Provision AILY_TOKEN and, in JWT mode, AILY_JWT through trusted env injection.
+# In a trusted upstream/operator context, inject AILY_TOKEN and the selected identity.
+# JWT identity uses AILY_JWT; Header identity uses AILY_USER/AILY_EMAIL with no JWT.
 ./bin/dacli --url http://localhost:61026/mcp tools   # 19 off / 28 base / 30 with P2b
 ./bin/dacli ... dbs                               # workspace databases
 ./bin/dacli ... ask <db> "<tables>" "<question>"  # end-to-end analysis
 ```
 
-dacli accepts `--jwt` / `AILY_JWT` and `--token` / `AILY_TOKEN`; prefer environment
-injection so secrets do not appear in command history/process arguments. Header
-mode instead uses `--user`/`--email` (or `AILY_USER`/`AILY_EMAIL`) with the platform
-token from a trusted test context. `--user` does not replace required JWT claims.
+dacli also accepts `--config` to read `identity.auth_token` from an existing server
+configuration file without copying the token into shell history or process arguments.
+For an authorized trusted upstream/operator using shared mappings, the 8931 Header
+examples below work with JWT either enabled or disabled. Replace `actual-user` with
+the actual authenticated, mapped user; never give this token/config file to end users:
+
+```bash
+unset AILY_JWT  # or add --jwt '' to each command to omit the JWT header
+./bin/dacli --url http://127.0.0.1:8931/mcp --config ./config.yaml --user actual-user tools
+./bin/dacli --url http://127.0.0.1:8931/mcp --config ./config.yaml --user actual-user dbs
+./bin/dacli --url http://127.0.0.1:8931/mcp --config ./config.yaml --user actual-user sessions
+```
+
+Use the actual server port and configuration path. A nonempty `--token` overrides
+`AILY_TOKEN`; the selected token takes precedence over `--config`, which is read
+only when that token is empty. Without `--config`, no configuration file is read.
+Only `identity.auth_token` supplies the client token: server environment overrides
+and `.env` files are not loaded. The existing secret-file ownership, permissions
+and trusted-directory checks still apply. `--config` reads the token; it does not
+issue or sign a JWT. The server's JWT signing secret is not a client JWT. For JWT
+identity, supply a valid `--jwt` / `AILY_JWT`; explicitly scoped mappings require
+both matching scope claims and cannot use the Header examples above.
+
+Prefer trusted environment injection for `AILY_TOKEN` and `AILY_JWT` so secrets do
+not appear in command history/process arguments. Header identity uses `--user`/
+`--email` (or `AILY_USER`/`AILY_EMAIL`) with the platform token and no JWT header.
+In dacli, `--jwt ''` omits the JWT header; it does not send an empty header (which
+the server rejects). Do not automatically remove a rejected JWT to retry as Header.
+A valid JWT takes precedence over `--user`/`--email`; these flags cannot supply or
+replace required signed claims, including an explicit non-default session-name claim.
 dacli authenticates initialization, tool requests, notifications and DELETE,
 and closes its protocol session on exit. It remains a **Streamable HTTP client**;
 parsing event-framed HTTP responses is not support for the separate SSE transport.

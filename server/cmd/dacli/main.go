@@ -42,6 +42,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/alibabacloud/data-agent-mcp-server/internal/config"
 )
 
 type client struct {
@@ -499,8 +501,18 @@ func main() {
 	user := flag.String("user", os.Getenv("AILY_USER"), "x-aily-user (Feishu user_id)")
 	email := flag.String("email", os.Getenv("AILY_EMAIL"), "x-aily-email (Feishu email)")
 	token := flag.String("token", os.Getenv("AILY_TOKEN"), "x-aily-token (prefer AILY_TOKEN environment variable)")
+	configPath := flag.String("config", "", "Read identity.auth_token from this YAML file when --token/AILY_TOKEN is empty")
 	jwt := flag.String("jwt", os.Getenv("AILY_JWT"), "x-aily-jwt (prefer AILY_JWT environment variable)")
 	flag.Parse()
+
+	if *token == "" && *configPath != "" {
+		var err error
+		*token, err = config.LoadAuthToken(*configPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "config:", err)
+			os.Exit(1)
+		}
+	}
 
 	c := &client{
 		url: *url, user: *user, email: *email, token: *token, jwt: *jwt,

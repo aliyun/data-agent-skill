@@ -99,7 +99,8 @@ log:
 # This template defaults to LOCAL STDIO ONLY. All HTTP/SSE deployments, gateway
 # on OR off, require enabled=true, require_identity=true and a nonempty auth_token.
 # No anonymous/global-key fallback for any remote tool or protocol method.
-# Every initialize/tools/list/call/notification and GET/POST/DELETE authenticates.
+# Every initialize/tools/list/call/notification and GET/POST/DELETE validates the
+# platform token and identity. Keep the token only with trusted upstreams, never users.
 # Protocol IDs are server-issued, principal-owned and leased (see README.md).
 identity:
   enabled: false
@@ -113,9 +114,13 @@ identity:
   max_tenants: 128
   auth_token: ""                 # inject IDENTITY_AUTH_TOKEN; trusted platform only
   jwt:
-    enabled: false              # explicit trusted-header mode; not JWT fallback
-    # When true, ALL remote requests need a valid HS256 JWT with exp, nonempty
-    # tenant_id + agent_id, and user_id or email. Missing/invalid JWT is rejected.
+    enabled: false              # trusted Header identity; any JWT header rejects
+    # When true, a completely absent JWT header allows trusted Header user/email
+    # under shared mappings. A present empty/invalid/expired JWT rejects; no downgrade.
+    # Valid HS256 + exp + user_id or email takes precedence; plain user/email ignored.
+    # Shared mappings allow JWTs without tenant_id/agent_id; scoped mappings require
+    # both signed claims to match exactly and cannot match Header identity.
+    # These paths use the existing enabled setting, not a new compatibility switch.
     secret: ""                  # inject IDENTITY_JWT_SECRET; HMAC key used as-is
     # All keys have equivalent signing authority within ONE trusted domain.
     # Use for rotation/mutually trusted apps, never unrelated organizations.
@@ -124,22 +129,28 @@ identity:
     secrets: []                 # env: IDENTITY_JWT_SECRETS (comma-separated)
     header: ""                  # default x-aily-jwt; bare token, no Bearer prefix
   # RoleSessionName attribution only; mapping uses verified user_id/email.
+  # Header path: a missing selected claim falls back to user_id, then email.
+  # JWT: an explicitly selected non-default claim must exist; only the default
+  # user_id selection may fall back to email.
   # user_id | email | enterprise_email | employee_no | tenant_id | agent_id
   session_name_claim: user_id
   # Omit prefix for historical "aily-<value>"; empty string means bare value.
   # Env: IDENTITY_SESSION_NAME_PREFIX (empty is meaningful).
   #session_name_prefix: ""
-  # Header mode: trusted proxy must overwrite client identity headers, keep the
-  # platform token from end users, and guarantee unique IDs within namespace.
+  # Both Header paths: trusted upstream must authenticate callers and overwrite
+  # client identity headers, keep the platform token from end users, and guarantee
+  # unique IDs within namespace. Restrict server access to trusted upstreams.
   headers:
     user: ""                    # default x-aily-user
     email: ""                   # default x-aily-email
     token: ""                   # default x-aily-token
-  # No default: unmatched identities reject. JWT: prefer exact tenant/agent pairs
-  # on ALL groups/default, as below; legacy ALL omitted/empty pairs share mappings
-  # by signed user_id/email within one signing trust domain. No mixed/partial/* scopes.
-  # Named groups win, then default within the selected mapping mode; multiple group
-  # matches reject even for the same role. Header mode requires both scopes empty.
+  # No default: unmatched identities reject. Use exact nonempty tenant/agent pairs
+  # on ALL groups/default for scoped JWT-only mappings, as below; Header cannot match.
+  # Or omit/empty BOTH fields on ALL mappings to share by trusted user_id/email:
+  # accepts Header and valid HS256/exp JWTs without tenant_id/agent_id. No added IDs needed.
+  # No mixed shared/scoped, partial or wildcard scopes. Named groups win, then default
+  # within the selected mode (and exact scope if scoped); multiple matches reject
+  # even for the same role. Both Header paths require shared (unscoped) mappings.
   #default:
   #  tenant_id: "<trusted-tenant-id>"  # JWT only; use "" in header mode
   #  agent_id: "<trusted-agent-id>"    # JWT only; use "" in header mode
@@ -158,9 +169,10 @@ identity:
   #    users: ["<user-id>", "<user-email>"]
 
 # Remote local history: sessions_dir/identity-v2/<principal_id>/ with owner.json.
-# Protocol sessions, tenant cache and disk use the verified principal: namespace,
-# auth mode, tenant/agent and typed user_id/email, even with shared role mappings.
-# No automatic old identity/<sanitized-key> fallback, claiming or migration.
+# Protocol sessions, tenant cache and disk use principal-v2: namespace, auth_mode,
+# tenant/agent scope (including absent scope) and typed user_id/email, even with
+# shared role mappings. Header/JWT histories do not merge automatically.
+# No automatic old v1 identity/<sanitized-key> fallback, claiming or migration.
 # Historical import requires separately authorized admin ownership verification.
 # Owner markers/local isolation do not establish cloud session ACL or row isolation.
 # stdio uses one confined local process root, never per-chat-user authorization.

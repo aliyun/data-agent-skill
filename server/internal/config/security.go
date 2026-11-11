@@ -121,11 +121,8 @@ var ErrIdentityGroupConflict = errors.New("IDENTITY_GROUP_CONFLICT")
 var ErrIdentityUnmapped = errors.New("identity has no role mapping")
 
 func (c *Config) ResolveGroup(claims IdentityClaims) (string, IdentityGroup, error) {
-	mode := "headers"
-	if c.Identity.JWT.Enabled {
-		mode = "jwt"
-	}
-	if claims.AuthMode != mode || (mode == "jwt" && (claims.TenantID == "" || claims.AgentID == "")) || (mode == "headers" && (claims.TenantID != "" || claims.AgentID != "")) {
+	mode := claims.AuthMode
+	if (mode != "jwt" && mode != "headers") || (mode == "jwt" && !c.Identity.JWT.Enabled) {
 		return "", IdentityGroup{}, ErrIdentityUnmapped
 	}
 	for _, field := range []*string{&claims.UserID, &claims.Email, &claims.TenantID, &claims.AgentID} {
@@ -135,11 +132,14 @@ func (c *Config) ResolveGroup(claims IdentityClaims) (string, IdentityGroup, err
 		}
 		*field = normalized
 	}
-	if (claims.UserID == "" && claims.Email == "") || mode == "jwt" && (claims.TenantID == "" || claims.AgentID == "") {
+	if (claims.UserID == "" && claims.Email == "") || mode == "headers" && (claims.TenantID != "" || claims.AgentID != "") {
 		return "", IdentityGroup{}, ErrIdentityUnmapped
 	}
 	matches := func(g IdentityGroup) bool {
-		return (g.TenantID == "" && g.AgentID == "") || (g.TenantID == claims.TenantID && g.AgentID == claims.AgentID)
+		if g.TenantID == "" && g.AgentID == "" {
+			return true
+		}
+		return mode == "jwt" && g.TenantID != "" && g.AgentID != "" && g.TenantID == claims.TenantID && g.AgentID == claims.AgentID
 	}
 	var name string
 	var selected IdentityGroup
