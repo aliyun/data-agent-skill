@@ -49,13 +49,13 @@ func TestLogConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Log.Enabled || cfg.Log.File != defaultFile || cfg.Log.MaxBytes != 64<<20 {
+	if cfg.Log.Enabled || cfg.Log.File != defaultFile || cfg.Log.MaxBytes != 67108864 {
 		t.Fatalf("unexpected log defaults: %+v", cfg.Log)
 	}
 
 	t.Setenv("DATA_AGENT_LOG", "1")
 	cfg, _, err = Load()
-	if err != nil || !cfg.Log.Enabled || cfg.Log.File != defaultFile || cfg.Log.MaxBytes != 64<<20 {
+	if err != nil || !cfg.Log.Enabled || cfg.Log.File != defaultFile || cfg.Log.MaxBytes != 67108864 {
 		t.Fatalf("flag alone must enable default file logging: %+v, %v", cfg.Log, err)
 	}
 	t.Setenv("DATA_AGENT_LOG", "")
@@ -217,6 +217,38 @@ func TestLogPerfPathConflicts(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDatedLogBackupConflicts(t *testing.T) {
+	for _, suffix := range []string{"20261112-160005.123456789", "7"} {
+		t.Run(suffix, func(t *testing.T) {
+			clearEnv(t)
+			dir := t.TempDir()
+			serverFile := filepath.Join(dir, "server.log")
+			perfFile := serverFile + "." + suffix
+			writeConfig(t, fmt.Sprintf("log:\n  enabled: true\n  file: %s\n  perf:\n    enabled: true\n    file: %s\n", serverFile, perfFile))
+			if _, _, err := Load(); err == nil {
+				t.Fatal("performance file overlaps server backup namespace")
+			}
+		})
+	}
+}
+
+func TestDatedLogBackupHardLinkConflicts(t *testing.T) {
+	clearEnv(t)
+	dir := t.TempDir()
+	serverFile, perfFile := filepath.Join(dir, "server.log"), filepath.Join(dir, "perf.log")
+	backup := serverFile + ".20261112-160005.123456789"
+	if err := os.WriteFile(backup, []byte("untouched"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(backup, perfFile); err != nil {
+		t.Fatal(err)
+	}
+	writeConfig(t, fmt.Sprintf("log:\n  enabled: true\n  file: %s\n  perf:\n    enabled: true\n    file: %s\n", serverFile, perfFile))
+	if _, _, err := Load(); err == nil {
+		t.Fatal("performance file aliases dated server backup")
 	}
 }
 

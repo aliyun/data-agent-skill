@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -58,8 +59,10 @@ type APIRequest struct {
 
 // A collector belongs to one tool call, never to a shared client.
 type RequestIDs struct {
-	mu       sync.Mutex
-	requests []APIRequest
+	mu          sync.Mutex
+	requests    []APIRequest
+	logRequests []APIRequest
+	logID       string
 }
 
 type requestIDsKey struct{}
@@ -70,6 +73,12 @@ func WithRequestIDs(ctx context.Context) (context.Context, *RequestIDs) {
 	return context.WithValue(ctx, requestIDsKey{}, ids), ids
 }
 
+func (ids *RequestIDs) SetLogID(id string) {
+	ids.mu.Lock()
+	defer ids.mu.Unlock()
+	ids.logID = id
+}
+
 // Snapshot returns an independent copy in response-completion order.
 func (ids *RequestIDs) Snapshot() []APIRequest {
 	ids.mu.Lock()
@@ -77,7 +86,13 @@ func (ids *RequestIDs) Snapshot() []APIRequest {
 	return append([]APIRequest(nil), ids.requests...)
 }
 
-func recordRequestID(ctx context.Context, action, requestID string) {
+func (ids *RequestIDs) LogSnapshot() []APIRequest {
+	ids.mu.Lock()
+	defer ids.mu.Unlock()
+	return append([]APIRequest(nil), ids.logRequests...)
+}
+
+func recordRequestID(ctx context.Context, action, requestID, logRequestID string) {
 	if requestID == "" {
 		return
 	}
@@ -88,6 +103,9 @@ func recordRequestID(ctx context.Context, action, requestID string) {
 	ids.mu.Lock()
 	defer ids.mu.Unlock()
 	ids.requests = append(ids.requests, APIRequest{Action: action, RequestID: requestID})
+	if logRequestID != "" {
+		ids.logRequests = append(ids.logRequests, APIRequest{Action: action, RequestID: logRequestID})
+	}
 }
 
 // Client is the main API client for Alibaba Cloud Data Agent.
@@ -1218,6 +1236,50 @@ func (e *APIError) Error() string {
 		e.StatusCode, e.Code, e.RequestID, e.Message)
 }
 
+func logAPIFailure(ctx context.Context, action string, status int, id string, err error, cred *Credential, params map[string]string) {
+	if err == nil {
+		return
+	}
+	code, kind := "UpstreamError", "request_failure"
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr != nil {
+		status = apiErr.StatusCode
+		if safe := apiKeySafeRequestID(apiErr.RequestID, cred, params); safe != "" {
+			id = safe
+		}
+		kind = "api_error"
+		switch apiErr.Code {
+		case "RedirectRejected", "InvalidParameter", "MissingParameter", "Forbidden", "AccessDenied", "Throttling", "InternalError", "ServiceUnavailable", "InvalidAccessKeyId", "InvalidSecurityToken", "SignatureDoesNotMatch", "DMS.DataAgent.SessionInBusy", "DMS.DataAgent.CheckDatabasePermissionFailed", "210204":
+			code = apiErr.Code
+		}
+	} else if errors.Is(err, context.Canceled) {
+		kind = "canceled"
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		kind = "timeout"
+	} else {
+		var transport net.Error
+		if errors.As(err, &transport) {
+			kind = "network"
+			if transport.Timeout() {
+				kind = "timeout"
+			}
+		}
+	}
+	if status < 100 || status > 599 {
+		status = 0
+	}
+	id = apiKeySafeRequestID(id, cred, params)
+	localID := "-"
+	if ids, ok := ctx.Value(requestIDsKey{}).(*RequestIDs); ok {
+		ids.mu.Lock()
+		if safe := gatewaySafeRequestID(ids.logID, cred); safe != "" {
+			localID = safe
+		}
+		ids.mu.Unlock()
+	}
+	log.Printf("[req:%s] upstream action=%q status=%d code=%q error=%s upstream_request_id=%q", localID, action, status, code, kind, id)
+}
+
 func IsDefiniteRejection(err error) bool {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr == nil || apiErr.StatusCode >= 500 {
@@ -1387,8 +1449,16 @@ func (c *Client) callDMSEnterprise(ctx context.Context, host, action, version st
 const apiKeyMaxResponseBytes = 4 << 20
 
 // doAPIKeyPost restores the local API Key protocol without ACS signing or retries.
-func (c *Client) doAPIKeyPost(ctx context.Context, action, version string, params map[string]string) (map[string]interface{}, error) {
+func (c *Client) doAPIKeyPost(ctx context.Context, action, version string, params map[string]string) (_ map[string]interface{}, resultErr error) {
 	cred := c.credential()
+	status, id := 0, ""
+	var diagnosticErr error
+	defer func() {
+		if diagnosticErr == nil {
+			diagnosticErr = resultErr
+		}
+		logAPIFailure(ctx, action, status, id, diagnosticErr, cred, params)
+	}()
 	if !cred.IsAPIKey() {
 		return nil, errors.New("API Key credentials unavailable")
 	}
@@ -1424,11 +1494,12 @@ func (c *Client) doAPIKeyPost(ctx context.Context, action, version string, param
 		return nil, fmt.Errorf("API Key HTTP request: %w", &signedHTTPError{cause: err})
 	}
 	defer resp.Body.Close()
-	id := apiKeySafeRequestID(resp.Header.Get("x-acs-request-id"), cred, params)
+	status = resp.StatusCode
+	id = apiKeySafeRequestID(resp.Header.Get("x-acs-request-id"), cred, params)
 	if id == "" {
 		id = apiKeySafeRequestID(resp.Header.Get("x-request-id"), cred, params)
 	}
-	defer func() { recordRequestID(ctx, action, id) }()
+	defer func() { recordRequestID(ctx, action, id, id) }()
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		failure := signedRedirectError(resp, cred)
 		failure.RequestID = id
@@ -1452,6 +1523,7 @@ func (c *Client) doAPIKeyPost(ctx context.Context, action, version string, param
 	if apiErr != nil || resp.StatusCode != http.StatusOK {
 		status, definite := resp.StatusCode, false
 		if apiErr != nil {
+			diagnosticErr = apiErr
 			status, definite = apiErr.StatusCode, apiErr.definiteRejection
 			if safe := apiKeySafeRequestID(apiErr.RequestID, cred, params); safe != "" {
 				id = safe
@@ -1509,7 +1581,7 @@ func (c *Client) doSignedPost(ctx context.Context, host, action, version string,
 }
 
 // doSignedPostVersioned performs a signed POST request with the specified API version.
-func (c *Client) doSignedPostVersioned(ctx context.Context, host, action, version string, params map[string]string) (map[string]interface{}, error) {
+func (c *Client) doSignedPostVersioned(ctx context.Context, host, action, version string, params map[string]string) (_ map[string]interface{}, resultErr error) {
 	if params == nil {
 		params = map[string]string{}
 	}
@@ -1517,6 +1589,8 @@ func (c *Client) doSignedPostVersioned(ctx context.Context, host, action, versio
 	// Build signed headers. We need to override the version in the signer for
 	// dms-enterprise calls that use a different version.
 	cred := c.credential()
+	status, id := 0, ""
+	defer func() { logAPIFailure(ctx, action, status, id, resultErr, cred, params) }()
 	headers := signRequestVersioned(cred, "POST", host, action, version, params, "")
 	headers["User-Agent"] = userAgent
 
@@ -1536,6 +1610,8 @@ func (c *Client) doSignedPostVersioned(ctx context.Context, host, action, versio
 		return nil, fmt.Errorf("HTTP %s: %w", action, &signedHTTPError{cause: err})
 	}
 	defer resp.Body.Close()
+	status = resp.StatusCode
+	id = apiKeySafeRequestID(responseRequestID(nil, resp), cred, params)
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		// Never parse a redirect body or reflect its Location/error fields.
 		return nil, fmt.Errorf("%s returned HTTP %d: %w", action, resp.StatusCode, signedRedirectError(resp, cred))
@@ -1545,7 +1621,8 @@ func (c *Client) doSignedPostVersioned(ctx context.Context, host, action, versio
 	if err != nil {
 		return nil, err
 	}
-	recordRequestID(ctx, action, jsonStr(result, "RequestId"))
+	id = apiKeySafeRequestID(jsonStr(result, "RequestId"), cred, params)
+	recordRequestID(ctx, action, jsonStr(result, "RequestId"), id)
 	return result, nil
 }
 

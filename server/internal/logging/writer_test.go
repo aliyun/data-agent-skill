@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func openWriter(t *testing.T, path string, maxBytes int64) *Writer {
@@ -46,6 +47,21 @@ func writeRecord(t *testing.T, w *Writer, record string) {
 	}
 }
 
+func datedBackups(t *testing.T, path string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		if IsBackup(filepath.Base(path), entry.Name()) {
+			names = append(names, filepath.Join(filepath.Dir(path), entry.Name()))
+		}
+	}
+	return names
+}
+
 func TestAppendAndRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "logs", "server.log")
 	w := openWriter(t, path, 8)
@@ -57,10 +73,14 @@ func TestAppendAndRestart(t *testing.T) {
 	writeRecord(t, w, "two\n")
 	assertFile(t, path, "one\ntwo\n")
 	writeRecord(t, w, "three\n")
-	assertFile(t, path+".1", "one\ntwo\n")
+	backups := datedBackups(t, path)
+	if len(backups) != 1 {
+		t.Fatal("expected one dated backup", backups)
+	}
+	assertFile(t, backups[0], "one\ntwo\n")
 	assertFile(t, path, "three\n")
 	if runtime.GOOS != "windows" {
-		for _, name := range []string{path, path + ".1", filepath.Dir(path)} {
+		for _, name := range []string{path, backups[0], filepath.Dir(path)} {
 			info, err := os.Stat(name)
 			if err != nil {
 				t.Fatal(err)
@@ -72,22 +92,112 @@ func TestAppendAndRestart(t *testing.T) {
 	}
 }
 
-func TestRotationKeepsOneBackupAndWholeRecords(t *testing.T) {
+func TestRotationKeepsDatedBackupsAndWholeRecords(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "server.log")
 	w := openWriter(t, path, 8)
 	writeRecord(t, w, "one\n")
 	writeRecord(t, w, "two\n")
-	if _, err := os.Stat(path + ".1"); !os.IsNotExist(err) {
-		t.Fatalf("unexpected rotation at exactly max_bytes: %v", err)
+	if got := datedBackups(t, path); len(got) != 0 {
+		t.Fatal("unexpected rotation at exactly max_bytes", got)
 	}
 	writeRecord(t, w, "three\n")
-	assertFile(t, path+".1", "one\ntwo\n")
 	writeRecord(t, w, "four\n")
-	assertFile(t, path+".1", "three\n")
-	assertFile(t, path, "four\n")
-	if _, err := os.Stat(path + ".2"); !os.IsNotExist(err) {
-		t.Fatalf("unexpected second backup: %v", err)
+	backups := datedBackups(t, path)
+	if len(backups) != 2 {
+		t.Fatal("same-day rotation lost a backup", backups)
 	}
+	assertFile(t, backups[0], "one\ntwo\n")
+	assertFile(t, backups[1], "three\n")
+	assertFile(t, path, "four\n")
+	for _, name := range backups {
+		if _, err := time.Parse(backupTimeFormat, strings.TrimPrefix(name, path+".")); err != nil {
+			t.Fatal("backup suffix must be a UTC timestamp", name)
+		}
+	}
+}
+
+func TestRetentionKeepsEightFilesAndPrunesOldest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.log")
+	w := openWriter(t, path, 16)
+	unrelated := path + ".notes"
+	if err := os.WriteFile(unrelated, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 20; i++ {
+		writeRecord(t, w, fmt.Sprintf("record-%02d\n", i))
+		if len(datedBackups(t, path)) > 7 {
+			t.Fatal("more than eight log files retained")
+		}
+	}
+	backups := datedBackups(t, path)
+	if len(backups) != 7 {
+		t.Fatal("expected seven backups", backups)
+	}
+	for i, name := range backups {
+		assertFile(t, name, fmt.Sprintf("record-%02d\n", i+13))
+	}
+	assertFile(t, path, "record-20\n")
+	assertFile(t, unrelated, "keep")
+}
+
+func TestRetentionIncludesLegacyNumberedBackup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.log")
+	legacy := path + ".1"
+	if err := os.WriteFile(legacy, []byte("legacy"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(legacy, old, old); err != nil {
+		t.Fatal(err)
+	}
+	w := openWriter(t, path, 4)
+	for i := 1; i <= 9; i++ {
+		writeRecord(t, w, fmt.Sprintf("%03d\n", i))
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatal("legacy backup escaped retention")
+	}
+	if len(datedBackups(t, path)) != 7 {
+		t.Fatal("legacy migration changed file limit")
+	}
+}
+
+func TestFailedArchiveKeepsExistingBackups(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("requires POSIX directory permissions for a non-root process")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server.log")
+	w := openWriter(t, path, 4)
+	var fallback bytes.Buffer
+	w.fallback = &fallback
+	for i := 1; i <= 8; i++ {
+		writeRecord(t, w, fmt.Sprintf("%03d\n", i))
+	}
+	backups := datedBackups(t, path)
+	if len(backups) != 7 {
+		t.Fatal("expected full backup ring", backups)
+	}
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0700)
+	writeRecord(t, w, "009\n")
+	for i, name := range backups {
+		assertFile(t, name, fmt.Sprintf("%03d\n", i+1))
+	}
+	assertFile(t, path, "008\n")
+	if len(datedBackups(t, path)) != 7 || !strings.Contains(fallback.String(), "009\n") {
+		t.Fatal("failed archival deleted history or lost fallback")
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeRecord(t, w, "010\n")
+	if len(datedBackups(t, path)) != 7 {
+		t.Fatal("retention did not recover")
+	}
+	assertFile(t, path, "010\n")
 }
 
 func TestOversizedRecordIsNotTruncated(t *testing.T) {
@@ -99,7 +209,11 @@ func TestOversizedRecordIsNotTruncated(t *testing.T) {
 		t.Fatalf("must not rotate an empty file: %v", err)
 	}
 	writeRecord(t, w, "end\n")
-	assertFile(t, path+".1", "oversized\n")
+	backups := datedBackups(t, path)
+	if len(backups) != 1 {
+		t.Fatal("missing oversized dated backup", backups)
+	}
+	assertFile(t, backups[0], "oversized\n")
 	assertFile(t, path, "end\n")
 }
 
@@ -172,7 +286,11 @@ func TestRotationFailureFallsBackAndRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeRecord(t, w, "end\n")
-	assertFile(t, path+".1", "one\n")
+	backups := datedBackups(t, path)
+	if len(backups) != 1 {
+		t.Fatal("missing dated backup after recovery", backups)
+	}
+	assertFile(t, backups[0], "one\n")
 	assertFile(t, path, "end\n")
 }
 

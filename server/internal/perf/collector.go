@@ -16,6 +16,8 @@ import (
 	"runtime/metrics"
 	"sync"
 	"time"
+
+	"github.com/alibabacloud/data-agent-mcp-server/internal/logging"
 )
 
 const (
@@ -32,7 +34,7 @@ type Source func() map[string]any
 type Options struct {
 	Path     string        // log file; parent directory is created if missing
 	Interval time.Duration // sampling period, floored at one second
-	MaxBytes int64         // rotate to <path>.1 when the file exceeds this size
+	MaxBytes int64         // bytes per file; current plus seven dated backups
 	DiskPath string        // filesystem to report free space for (e.g. sessions dir)
 }
 
@@ -45,6 +47,7 @@ type Collector struct {
 	sources []namedSource
 	file    *os.File
 	size    int64
+	failed  bool
 
 	prevProcCPU procCPU
 	prevHostCPU hostCPU
@@ -133,15 +136,28 @@ func (c *Collector) sample(event string) {
 	}
 	data = append(data, '\n')
 	if c.file == nil {
-		return
+		if err := c.open(); err != nil {
+			c.writeFailed()
+			return
+		}
 	}
-	if c.size+int64(len(data)) > c.opts.MaxBytes {
-		c.rotateLocked()
+	if c.size > 0 && int64(len(data)) > c.opts.MaxBytes-c.size {
+		if err := c.rotateLocked(); err != nil {
+			c.writeFailed()
+			return
+		}
 	}
 	n, err := c.file.Write(data)
 	c.size += int64(n)
-	if err != nil {
-		log.Printf("perf: write sample: %v", err)
+	if err != nil || n != len(data) {
+		_ = c.file.Close()
+		c.file = nil
+		c.writeFailed()
+		return
+	}
+	if c.failed {
+		log.Print("perf: file output recovered; samples during failure were dropped")
+		c.failed = false
 	}
 }
 
@@ -194,16 +210,23 @@ func (c *Collector) open() error {
 	return nil
 }
 
-// rotateLocked keeps exactly one previous generation; the perf log is a
-// diagnostic ring, not an audit trail.
-func (c *Collector) rotateLocked() {
-	_ = c.file.Close()
+// Rotate and prune under the same lock as writes.
+func (c *Collector) rotateLocked() error {
+	err := c.file.Close()
 	c.file = nil
-	if err := os.Rename(c.opts.Path, c.opts.Path+".1"); err != nil && !os.IsNotExist(err) {
-		log.Printf("perf: rotate: %v", err)
+	if err != nil {
+		return err
 	}
-	if err := c.open(); err != nil {
-		log.Printf("perf: reopen after rotate: %v", err)
+	if err := logging.Rotate(c.opts.Path); err != nil {
+		return err
+	}
+	return c.open()
+}
+
+func (c *Collector) writeFailed() {
+	if !c.failed {
+		log.Print("perf: file output unavailable; retrying on the next sample")
+		c.failed = true
 	}
 }
 

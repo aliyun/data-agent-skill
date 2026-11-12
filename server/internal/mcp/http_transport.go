@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -53,6 +54,10 @@ type remoteTransport struct {
 	http     *server.StreamableHTTPServer
 	cancel   context.CancelFunc
 	stopped  chan struct{}
+	logMu    sync.Mutex
+	logStart time.Time
+	logCount int
+	logDrops uint64
 }
 
 func (s *Server) newRemoteTransport(ctx context.Context, kind string) (*remoteTransport, error) {
@@ -170,32 +175,58 @@ func rejectHTTP(w http.ResponseWriter, code int) {
 	http.Error(w, http.StatusText(code), code)
 }
 
+func (t *remoteTransport) reject(w http.ResponseWriter, r *http.Request, code int, stage string) {
+	if t.owner.reqLog != RequestLogOff {
+		id := newRequestID()
+		w.Header().Set("X-Mcp-Request-Id", id)
+		t.logMu.Lock()
+		now := time.Now()
+		if now.Sub(t.logStart) >= time.Second {
+			t.logStart, t.logCount = now, 0
+		}
+		if t.logCount < 10 {
+			t.logCount++
+			method := "other"
+			switch r.Method {
+			case http.MethodGet, http.MethodPost, http.MethodDelete:
+				method = r.Method
+			}
+			log.Printf("[http:%s] rejected transport=%s method=%s stage=%s status=%d suppressed=%d", id, t.kind, method, stage, code, t.logDrops)
+			t.logDrops = 0
+		} else {
+			t.logDrops++
+		}
+		t.logMu.Unlock()
+	}
+	rejectHTTP(w, code)
+}
+
 func (t *remoteTransport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Fixed categories only; never echo an unverified header, token or body.
 	if code := t.checkHeaders(r); code != 0 {
-		rejectHTTP(w, code)
+		t.reject(w, r, code, "headers")
 		return
 	}
 	if (t.kind == "sse" && !((r.URL.Path == "/sse" && r.Method == http.MethodGet) || (r.URL.Path == "/message" && r.Method == http.MethodPost))) || (t.kind != "sse" && (r.URL.Path != "/mcp" || (r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodDelete))) {
-		rejectHTTP(w, http.StatusMethodNotAllowed)
+		t.reject(w, r, http.StatusMethodNotAllowed, "route")
 		return
 	}
 	ctx, err := t.owner.authenticate(t.owner.identityHTTPContext(r.Context(), r))
 	if err != nil {
-		code := http.StatusForbidden
+		code, stage := http.StatusForbidden, "mapping"
 		if tenant.IsAuthenticationError(err) {
-			code = http.StatusUnauthorized
+			code, stage = http.StatusUnauthorized, "identity"
 		}
-		rejectHTTP(w, code)
+		t.reject(w, r, code, stage)
 		return
 	}
 	if ctx == nil {
-		rejectHTTP(w, http.StatusUnauthorized)
+		t.reject(w, r, http.StatusUnauthorized, "identity")
 		return
 	}
 	principal := tenant.PrincipalFromContext(ctx)
 	if principal == nil || principal.ID == "" || (!principal.ExpiresAt.IsZero() && !time.Now().Before(principal.ExpiresAt)) {
-		rejectHTTP(w, http.StatusUnauthorized)
+		t.reject(w, r, http.StatusUnauthorized, "identity")
 		return
 	}
 	r = r.WithContext(ctx)
@@ -204,13 +235,13 @@ func (t *remoteTransport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		id = r.URL.Query().Get("sessionId")
 		// SSE reconnects always issue a new ID, never adopt a caller's ID.
 		if r.Method == http.MethodGet && id != "" {
-			rejectHTTP(w, http.StatusNotFound)
+			t.reject(w, r, http.StatusNotFound, "session")
 			return
 		}
 	}
 	if r.Method == http.MethodDelete {
 		if code := t.sessions.deleteOwned(id, principal); code != 0 {
-			rejectHTTP(w, code)
+			t.reject(w, r, code, "session")
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -223,7 +254,7 @@ func (t *remoteTransport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if fresh {
 		b, code = t.sessions.reserve(principal)
 		if code != 0 {
-			rejectHTTP(w, code)
+			t.reject(w, r, code, "capacity")
 			return
 		}
 		defer func() {
@@ -240,7 +271,7 @@ func (t *remoteTransport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if b != nil && fresh {
 			t.sessions.revoke(b)
 		}
-		rejectHTTP(w, code)
+		t.reject(w, r, code, "session")
 		return
 	}
 	// SSE POST transfers completion ownership to a single bounded goroutine.
@@ -269,17 +300,17 @@ func (t *remoteTransport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Header.Get("Content-Type") != "application/json" {
-		rejectHTTP(w, http.StatusUnsupportedMediaType)
+		t.reject(w, r, http.StatusUnsupportedMediaType, "content_type")
 		return
 	}
 	body, code := t.readBody(w, r)
 	if code != 0 {
-		rejectHTTP(w, code)
+		t.reject(w, r, code, "body")
 		return
 	}
 	message, err := inspectMessage(body)
 	if err != nil {
-		rejectHTTP(w, http.StatusBadRequest)
+		t.reject(w, r, http.StatusBadRequest, "message")
 		return
 	}
 	initialize := message.method == "initialize"
@@ -288,11 +319,11 @@ func (t *remoteTransport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if l.check() != nil {
 			code = http.StatusNotFound
 		}
-		rejectHTTP(w, code)
+		t.reject(w, r, code, "lifecycle")
 		return
 	}
 	if err := l.check(); err != nil {
-		rejectHTTP(w, http.StatusNotFound)
+		t.reject(w, r, http.StatusNotFound, "session")
 		return
 	}
 	if t.kind == "sse" {

@@ -20,6 +20,80 @@ import (
 	"time"
 )
 
+func TestAPIFailureLogsSafeMetadata(t *testing.T) {
+	cred := &Credential{AccessKeyID: "synthetic-credential-id", AccessKeySecret: "synthetic-credential-secret", SecurityToken: "synthetic-credential-token"}
+	for _, tc := range []struct {
+		name, body, want string
+		status           int
+	}{
+		{"permission", `{"Code":"Forbidden","Message":"synthetic-private-message","RequestId":"upstream-safe-id"}`, `code="Forbidden"`, 403},
+		{"business", `{"Success":false,"Code":"DMS.DataAgent.SessionInBusy","Message":"synthetic-private-message","RequestId":"upstream-safe-id"}`, `code="DMS.DataAgent.SessionInBusy"`, 200},
+		{"secret code", `{"Code":"synthetic-credential-secret","Message":"synthetic-private-message","RequestId":"synthetic-credential-token"}`, `code="UpstreamError"`, 500},
+		{"invalid JSON", `not-json synthetic-private-message`, `error=request_failure`, 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewClient(cred, "test")
+			c.http.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: tc.status, Header: http.Header{"X-Acs-Request-Id": []string{"header-safe-id"}}, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+			})
+			ctx, ids := WithRequestIDs(context.Background())
+			ids.SetLogID("deadbeef")
+			var output bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&output)
+			_, err := c.callAPI(ctx, c.endpoint, "SendChatMessage", "2025-04-14", map[string]string{"Message": "synthetic-private-message"})
+			log.SetOutput(previous)
+			text := output.String()
+			if err == nil || !strings.Contains(text, "[req:deadbeef] upstream") || !strings.Contains(text, tc.want) || !strings.Contains(text, `action="SendChatMessage"`) {
+				t.Fatalf("missing safe error diagnostic: %s", text)
+			}
+			for _, value := range []string{cred.AccessKeyID, cred.AccessKeySecret, cred.SecurityToken, "synthetic-private-message"} {
+				if strings.Contains(text, value) {
+					t.Fatal("upstream diagnostics leaked credentials or content")
+				}
+			}
+		})
+	}
+}
+
+func TestAPIKeyFailureLogKeepsAllowlistedCode(t *testing.T) {
+	c := apiKeyTestClient(t)
+	c.http.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 403, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"Code":"Forbidden","Message":"synthetic-private-message","RequestId":"upstream-safe-id"}`))}, nil
+	})
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	defer log.SetOutput(previous)
+	_, err := c.callAPI(context.Background(), c.endpoint, "ListDataAgentWorkspace", "2025-04-14", nil)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "UpstreamError" {
+		t.Fatal("caller error redaction changed")
+	}
+	text := output.String()
+	if !strings.Contains(text, `code="Forbidden"`) || !strings.Contains(text, `upstream_request_id="upstream-safe-id"`) || strings.Contains(text, "synthetic-private-message") || strings.Contains(text, c.credential().APIKey) {
+		t.Fatal("API Key diagnostic lost safe code or leaked content", text)
+	}
+}
+
+func TestRequestLogIDsDoNotChangeResponseIDs(t *testing.T) {
+	cred := &Credential{AccessKeyID: "test-id", AccessKeySecret: "synthetic-private-secret"}
+	c := NewClient(cred, "test")
+	c.http.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"RequestId":"initial-id","Success":true}`))}, nil
+	})
+	ctx, ids := WithRequestIDs(context.Background())
+	if _, err := c.callAPI(ctx, c.endpoint, "SendChatMessage", "2025-04-14", map[string]string{"Message": "initial"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := ids.Snapshot(); len(got) != 1 || got[0].RequestID != "initial-id" {
+		t.Fatal("response request ID changed", got)
+	}
+	if got := ids.LogSnapshot(); len(got) != 0 {
+		t.Fatal("message echo entered log metadata", got)
+	}
+}
+
 // Keep the production clients/policies, injecting only a local TLS transport.
 // Both receivers count requests independently, including method-changing redirects.
 func signedRedirectFixture(t *testing.T, status int, destination string) (*Client, *atomic.Int32, *atomic.Int32) {
@@ -850,10 +924,10 @@ func TestSuccessfulAPIRequestIDs(t *testing.T) {
 func TestRequestIDsSnapshotAndScope(t *testing.T) {
 	base := context.Background()
 	ctx, ids := WithRequestIDs(base)
-	recordRequestID(base, "uncollected", "uncollected-id")
-	recordRequestID(ctx, "missing", "")
-	recordRequestID(ctx, "first", "same-id")
-	recordRequestID(ctx, "first", "same-id")
+	recordRequestID(base, "uncollected", "uncollected-id", "uncollected-id")
+	recordRequestID(ctx, "missing", "", "")
+	recordRequestID(ctx, "first", "same-id", "same-id")
+	recordRequestID(ctx, "first", "same-id", "same-id")
 	want := []APIRequest{{Action: "first", RequestID: "same-id"}, {Action: "first", RequestID: "same-id"}}
 	snapshot := ids.Snapshot()
 	if !reflect.DeepEqual(snapshot, want) {
@@ -864,11 +938,11 @@ func TestRequestIDsSnapshotAndScope(t *testing.T) {
 		t.Fatal("snapshot aliases collector storage")
 	}
 	child, childIDs := WithRequestIDs(ctx)
-	recordRequestID(child, "child", "child-id")
+	recordRequestID(child, "child", "child-id", "child-id")
 	if !reflect.DeepEqual(ids.Snapshot(), want) || len(childIDs.Snapshot()) != 1 {
 		t.Fatal("nested collector leaked into its parent")
 	}
-	recordRequestID(ctx, "later", "later-id")
+	recordRequestID(ctx, "later", "later-id", "later-id")
 	if len(snapshot) != 2 || snapshot[1] != want[1] {
 		t.Fatal("later append changed an earlier snapshot")
 	}
@@ -881,7 +955,7 @@ func TestRequestIDsConcurrentSnapshots(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			recordRequestID(ctx, "concurrent", strconv.Itoa(i))
+			recordRequestID(ctx, "concurrent", strconv.Itoa(i), strconv.Itoa(i))
 			snapshot := ids.Snapshot()
 			if len(snapshot) > 0 {
 				snapshot[0].RequestID = "snapshot-only"

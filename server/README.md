@@ -382,7 +382,8 @@ export DATA_AGENT_LOG=1
 ```
 
 No path or size setting is required: the defaults are `~/.data-agent/server.log`
-and **64 MiB** with one `.1` backup. `DATA_AGENT_LOG_FILE` and
+and **64 MiB per file**, keeping the current file plus **7 dated backups** (8 files,
+about **512 MiB per log type**). `DATA_AGENT_LOG_FILE` and
 `DATA_AGENT_LOG_MAX_BYTES` are optional overrides; setting a path alone does not
 enable file logging. Ordinary file logging and performance sampling have separate
 switches: set both `DATA_AGENT_LOG=1` and `DATA_AGENT_PERF_LOG=1` to enable both.
@@ -405,7 +406,10 @@ enable HTTP or change authentication. For systemd or containers, set the
 variables in the service environment and restart it.
 
 The server appends to an existing regular file. At the default **64 MiB** limit,
-it moves the log to `<file>.1`, retaining one backup. Set `log.max_bytes` or
+it archives the log with a UTC date/time suffix, such as
+`server.log.20261112-160005.123456789`. Keep at most seven backups, deleting the
+oldest by modification time when rotating again. Existing numbered backups count
+toward the same limit; unrelated filenames are not deleted. Set `log.max_bytes` or
 `DATA_AGENT_LOG_MAX_BYTES` to a positive byte count to adjust the limit. On POSIX,
 new files use `0600` and new directories use `0700`; existing permissions are not changed.
 Symlink log files and, on POSIX, group/world-accessible existing logs are rejected.
@@ -416,16 +420,31 @@ record is kept intact and can exceed the size limit.
 If the configured file cannot be opened at startup, the server reports the error
 to stderr and exits. If later writes or rotation fail, ordinary logging falls
 back to stderr, never stdout, and retries file output on subsequent writes.
-Configuration errors before logging is initialized still go to stderr.
+Configuration errors before logging is initialized still go to stderr; retain
+supervisor/container stderr alongside the file log. File logging does not redirect
+protocol stdout or capture dacli/client logs. To follow rotation, use `tail -F`
+rather than `tail -f`; check the current file and its dated backups.
 
 Request detail remains controlled by `log.requests` / `DATA_AGENT_LOG_REQUESTS`:
 `basic` by default remotely, `off` by default under stdio. `full` includes redacted
 arguments for existing tools but may contain business questions; use it for
 short troubleshooting, not routine operation. Existing credential-redaction,
-identity-safety and gateway logging restrictions still apply.
+identity-safety and gateway logging restrictions still apply. Completion lines
+include the failure stage/category and the last safe upstream action/RequestId
+when available. Upstream failures separately record HTTP status, an allowlisted
+error code (otherwise `UpstreamError`) and a safe RequestId, never raw messages,
+response bodies or signed URLs. Upstream runtime failures are logged even when
+per-tool logging is off; only the local request correlation ID is then absent.
+
+HTTP ingress rejections record transport, known HTTP method, rejection stage and
+status. With request logging enabled, `X-Mcp-Request-Id` identifies the rejection;
+these logs omit headers, body, URL, client IP and unverified identity. Each transport
+logs at most 10 rejections per second, with a suppressed count on the next logged
+rejection; request logging `off` disables these entries. stdio transport errors
+use the same configured log destination with fixed summaries, not raw payloads.
 
 Ordinary logs and the performance sampler below are independent. When both use
-files, their current paths and `<file>.1` backup paths must not overlap. Startup
+files, their current paths and dated/numbered backup paths must not overlap. Startup
 checks normalized paths, existing directory symlinks and hard-linked files to
 prevent mixed output or one writer rotating the other's data.
 
@@ -474,6 +493,11 @@ collection, while 1 second is useful for short diagnostic runs. Ensure the serve
 account can write to the log directory. To disable, set `enabled: false` or
 `DATA_AGENT_PERF_LOG=0` and restart; an environment override takes precedence.
 
+If performance-log writes or rotation/reopening fail, sampling retries on the next
+interval. Failure and recovery summaries go to the ordinary server log, once per
+outage/recovery; samples during an outage are dropped, not buffered or replayed.
+A single oversized sample remains intact and can exceed the configured limit.
+
 The sampler appends one JSON object per line to a dedicated file, separate from
 ordinary server/request logs, so a production stall can be reconstructed
 afterwards. Each record carries:
@@ -488,8 +512,9 @@ afterwards. Each record carries:
 | `sessions` | stdio only: SSE watcher counts by session status |
 
 The first record is tagged `"event":"start"`, the last `"event":"shutdown"`. The
-file rotates once to `<file>.1` when it exceeds `log.perf.max_bytes` (default
-64 MiB); it is created `0600`. Counters are cumulative — diff consecutive lines
+file rotates with the same UTC date/time suffix and seven-backup retention when it
+exceeds `log.perf.max_bytes` (default 64 MiB per file, about 512 MiB for 8 files).
+It is created `0600`. Counters are cumulative — diff consecutive lines
 (e.g. with `jq`) to obtain rates. The sampler never logs arguments, identities or
 credentials.
 

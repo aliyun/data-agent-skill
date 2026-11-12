@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alibabacloud/data-agent-mcp-server/internal/logging"
 	"gopkg.in/yaml.v3"
 )
 
@@ -167,7 +168,7 @@ const DefaultLogMaxBytes = 64 << 20
 type Log struct {
 	Enabled  bool   `yaml:"enabled"`
 	File     string `yaml:"file"`      // default ~/.data-agent/server.log
-	MaxBytes int64  `yaml:"max_bytes"` // positive bytes, then rotate to <file>.1
+	MaxBytes int64  `yaml:"max_bytes"` // bytes per file; current plus seven dated backups
 	// Requests selects how much of every tool call is logged:
 	//   basic — tool name, caller, outcome, duration (default remotely)
 	//   full  — adds arguments with sensitive values redacted;
@@ -185,7 +186,7 @@ type Perf struct {
 	Enabled         bool   `yaml:"enabled"`
 	File            string `yaml:"file"`             // default ~/.data-agent/perf.log
 	IntervalSeconds int    `yaml:"interval_seconds"` // default 30, minimum 1
-	MaxBytes        int64  `yaml:"max_bytes"`        // default 64 MiB, then rotate to <file>.1
+	MaxBytes        int64  `yaml:"max_bytes"`        // default 64 MiB; current plus seven dated backups
 }
 
 // AgentGateway configures the fixed Agentic OpenAPI metadata tools.
@@ -503,23 +504,43 @@ func Load() (Config, string, error) {
 }
 
 func validateLogFiles(serverFile, perfFile string) error {
-	paths := [4]string{serverFile, serverFile + ".1", perfFile, perfFile + ".1"}
-	var resolved [4]string
-	var info [4]os.FileInfo
-	for i, path := range paths {
-		var err error
-		resolved[i], err = resolveLogPath(path)
-		if err != nil {
-			return errors.New("invalid log file path")
+	type logPath struct {
+		resolved string
+		info     os.FileInfo
+	}
+	var groups [2][]logPath
+	for group, file := range []string{serverFile, perfFile} {
+		paths := []string{file}
+		for i := 1; i < logging.RetainedFiles; i++ {
+			paths = append(paths, file+"."+strconv.Itoa(i))
 		}
-		info[i], err = os.Stat(path)
+		entries, err := os.ReadDir(filepath.Dir(file))
 		if err != nil && !os.IsNotExist(err) {
 			return errors.New("invalid log file path")
 		}
+		for _, entry := range entries {
+			if logging.IsBackup(filepath.Base(file), entry.Name()) {
+				paths = append(paths, filepath.Join(filepath.Dir(file), entry.Name()))
+			}
+		}
+		for _, path := range paths {
+			resolved, err := resolveLogPath(path)
+			if err != nil {
+				return errors.New("invalid log file path")
+			}
+			info, err := os.Stat(path)
+			if err != nil && !os.IsNotExist(err) {
+				return errors.New("invalid log file path")
+			}
+			groups[group] = append(groups[group], logPath{resolved: resolved, info: info})
+		}
 	}
-	for i := 0; i < 2; i++ {
-		for j := 2; j < 4; j++ {
-			if resolved[i] == resolved[j] || (info[i] != nil && info[j] != nil && os.SameFile(info[i], info[j])) {
+	if logging.IsBackup(groups[0][0].resolved, groups[1][0].resolved) || logging.IsBackup(groups[1][0].resolved, groups[0][0].resolved) {
+		return errors.New("log.file and log.perf.file must not overlap, including rotation backups")
+	}
+	for _, server := range groups[0] {
+		for _, perf := range groups[1] {
+			if server.resolved == perf.resolved || (server.info != nil && perf.info != nil && os.SameFile(server.info, perf.info)) {
 				return errors.New("log.file and log.perf.file must not overlap, including rotation backups")
 			}
 		}

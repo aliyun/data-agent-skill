@@ -365,9 +365,9 @@ func (c *Client) callGateway(ctx context.Context, action string, params map[stri
 			retryAfter = resp.Header.Get("Retry-After")
 			result, failure, retry = readGatewayResponse(resp, action, opts.MaxResponseBytes, cred, params)
 			if result != nil {
-				recordRequestID(ctx, action, result.RequestID)
+				recordRequestID(ctx, action, result.RequestID, result.RequestID)
 			} else if failure != nil {
-				recordRequestID(ctx, action, failure.RequestID)
+				recordRequestID(ctx, action, failure.RequestID, failure.RequestID)
 			}
 		}
 		if ctx.Err() != nil {

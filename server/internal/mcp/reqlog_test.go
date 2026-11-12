@@ -6,13 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/alibabacloud/data-agent-mcp-server/internal/config"
+	"github.com/alibabacloud/data-agent-mcp-server/internal/dataagent"
 	"github.com/alibabacloud/data-agent-mcp-server/internal/tenant"
 )
 
@@ -37,6 +41,112 @@ func callReq(tool string, args map[string]any) mcp.CallToolRequest {
 	req.Params.Name = tool
 	req.Params.Arguments = args
 	return req
+}
+
+type logFailureReader struct{}
+
+func (logFailureReader) Read([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestStdioTransportUsesConfiguredLogger(t *testing.T) {
+	s := New(nil, nil, "test")
+	var failure error
+	out := captureLog(t, func() {
+		failure = s.runStdio(context.Background(), logFailureReader{}, io.Discard)
+	})
+	if failure == nil || !strings.Contains(out, "[stdio] stage=read error=transport_failure") {
+		t.Fatalf("stdio error missing from configured logger: %v %s", failure, out)
+	}
+	out = captureLog(t, func() {
+		stdioLogWriter{}.Write([]byte("Error handling message: synthetic-secret\nFORGED\n"))
+	})
+	if strings.Contains(out, "synthetic-secret") || strings.Contains(out, "FORGED") || strings.Count(out, "\n") != 1 {
+		t.Fatal("stdio diagnostics leaked raw errors", out)
+	}
+}
+
+func TestHTTPRejectLogsAreSafeAndBounded(t *testing.T) {
+	for _, kind := range []string{"streamable-http", "sse"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newHTTPFixture(t, kind, httpLimits(), false)
+			f.s.SetRequestLogLevel(RequestLogBasic)
+			path := "/mcp"
+			method := http.MethodPost
+			body := initMessage
+			if kind == "sse" {
+				path, method, body = "/sse", http.MethodGet, ""
+			}
+			out := captureLog(t, func() {
+				for i := 0; i < 25; i++ {
+					r := f.request(t, method, path, "", "", body)
+					r.Header.Set("X-Aily-Token", "synthetic-unverified-token")
+					r.Header.Set("X-Aily-User", "synthetic-unverified-user")
+					resp := f.do(t, r)
+					id := resp.Header.Get("X-Mcp-Request-Id")
+					statusHTTP(t, resp, 401)
+					if len(id) != 8 {
+						t.Fatal("missing rejection correlation ID")
+					}
+				}
+			})
+			if got := strings.Count(out, "\n"); got != 10 || !strings.Contains(out, "stage=identity status=401") {
+				t.Fatalf("unexpected rejection log count: %d %s", got, out)
+			}
+			for _, value := range []string{"synthetic-unverified", "clientInfo", "127.0.0.1"} {
+				if strings.Contains(out, value) {
+					t.Fatal("unverified request content reached log")
+				}
+			}
+			f.rt.logMu.Lock()
+			f.rt.logStart = time.Now().Add(-time.Second)
+			f.rt.logMu.Unlock()
+			out = captureLog(t, func() {
+				statusHTTP(t, f.do(t, f.request(t, method, path, "", "", body)), 401)
+			})
+			if !strings.Contains(out, "suppressed=15") {
+				t.Fatal("missing suppression count", out)
+			}
+			f.s.SetRequestLogLevel(RequestLogOff)
+			out = captureLog(t, func() {
+				resp := f.do(t, f.request(t, method, path, "", "", body))
+				if resp.Header.Get("X-Mcp-Request-Id") != "" {
+					t.Fatal("disabled request logs issued a log ID")
+				}
+				statusHTTP(t, resp, 401)
+			})
+			if out != "" {
+				t.Fatal("request log off ignored", out)
+			}
+		})
+	}
+}
+
+func TestToolFailureAndUpstreamLogShareRequestID(t *testing.T) {
+	cred := &dataagent.Credential{AccessKeyID: "synthetic-log-id", AccessKeySecret: "synthetic-log-secret"}
+	client := newRequestIDTestClient(t, cred, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `{"Code":"Forbidden","Message":"synthetic-private-message","RequestId":"upstream-safe-id"}`)
+	})
+	s := New(nil, client, "test")
+	s.SetRequestLogLevel(RequestLogBasic)
+	out := captureLog(t, func() {
+		result, err := s.withTenant((*Server).handleListWorkspaces)(context.Background(), callReq("data_agent_list_workspaces", nil))
+		if err != nil || result == nil || !result.IsError {
+			t.Fatal("expected upstream tool error")
+		}
+	})
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected start, upstream error and completion: %s", out)
+	}
+	end := strings.IndexByte(lines[0], ']')
+	if end < 0 || !strings.HasPrefix(lines[1], lines[0][:end+1]) || !strings.HasPrefix(lines[2], lines[0][:end+1]) || !strings.Contains(out, `status=403 code="Forbidden"`) || !strings.Contains(out, "tool_error") || !strings.Contains(out, "stage=tool") {
+		t.Fatal("missing correlated failure summaries", out)
+	}
+	for _, value := range []string{cred.AccessKeyID, cred.AccessKeySecret, "synthetic-private-message"} {
+		if strings.Contains(out, value) {
+			t.Fatal("raw credentials or response content leaked into logs")
+		}
+	}
 }
 
 func TestParseRequestLogLevel(t *testing.T) {

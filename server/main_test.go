@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/alibabacloud/data-agent-mcp-server/internal/logging"
 )
 
 func TestLoggingSubprocess(t *testing.T) {
@@ -126,7 +128,20 @@ func TestStdioLoggingDestinationAndRotation(t *testing.T) {
 			if stderr.Len() != 0 {
 				t.Fatalf("file logs leaked to stderr: %s", stderr.String())
 			}
-			for _, path := range []string{logPath, logPath + ".1"} {
+			paths := []string{logPath}
+			entries, err := os.ReadDir(filepath.Dir(logPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if logging.IsBackup(filepath.Base(logPath), entry.Name()) {
+					paths = append(paths, filepath.Join(filepath.Dir(logPath), entry.Name()))
+				}
+			}
+			if len(paths) < 2 || len(paths) > 8 {
+				t.Fatal("expected current file and at most seven dated backups", paths)
+			}
+			for _, path := range paths {
 				data, err := os.ReadFile(path)
 				if err != nil {
 					t.Fatal(err)

@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -221,6 +223,10 @@ func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest
 	return func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, err error) {
 		ctx, requestIDs := dataagent.WithRequestIDs(ctx)
 		rec := s.startToolCall(ctx, req)
+		if rec != nil {
+			rec.stage, rec.upstream = "validation", requestIDs
+			requestIDs.SetLogID(rec.id)
+		}
 		started := time.Now()
 		s.stats.begin(req.Params.Name)
 		defer func() {
@@ -250,7 +256,13 @@ func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest
 			if leaseFrom(ctx) != nil {
 				return mcp.NewToolResultError("Tenant resolution unavailable."), nil
 			}
+			if rec != nil {
+				rec.stage = "tool"
+			}
 			return h(s, ctx, req)
+		}
+		if rec != nil {
+			rec.stage = "tenant"
 		}
 		mgr, client, defaults, err := s.resolve(ctx)
 		if err != nil {
@@ -260,12 +272,18 @@ func (s *Server) withTenant(h func(*Server, context.Context, mcp.CallToolRequest
 			if leaseFrom(ctx) != nil {
 				return mcp.NewToolResultError("Tenant resolution unavailable."), nil
 			}
+			if rec != nil {
+				rec.stage = "tool"
+			}
 			return h(s, ctx, req) // local process identity only
 		}
 		scoped := *s
 		scoped.mgr = mgr
 		scoped.client = client
 		scoped.defaults = defaults
+		if rec != nil {
+			rec.stage = "tool"
+		}
 		return h(&scoped, ctx, req)
 	}
 }
@@ -285,14 +303,22 @@ func (s *Server) identityHTTPContext(ctx context.Context, r *http.Request) conte
 	)
 }
 
+func (s *Server) runStdio(ctx context.Context, input io.Reader, output io.Writer) error {
+	stdio := server.NewStdioServer(s.mcp)
+	stdio.SetErrorLogger(log.New(stdioLogWriter{}, "", 0))
+	if err := stdio.Listen(ctx, input, output); err != nil {
+		return &stdioTransportError{cause: err}
+	}
+	return nil
+}
+
 func (s *Server) Run(ctx context.Context) error {
 	transport := os.Getenv("MCP_TRANSPORT")
 	switch transport {
 	case "sse", "streamable-http":
 		return s.runHTTP(ctx, transport)
 	case "", "stdio":
-		stdio := server.NewStdioServer(s.mcp)
-		return stdio.Listen(ctx, os.Stdin, os.Stdout)
+		return s.runStdio(ctx, os.Stdin, os.Stdout)
 	default:
 		return fmt.Errorf("unsupported MCP transport")
 	}

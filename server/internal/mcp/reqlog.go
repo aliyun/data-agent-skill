@@ -1,17 +1,21 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/alibabacloud/data-agent-mcp-server/internal/dataagent"
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/alibabacloud/data-agent-mcp-server/internal/tenant"
@@ -104,11 +108,13 @@ const (
 // callRecord tracks one tool call so the completion line can report the
 // outcome and how long the call took.
 type callRecord struct {
-	srv    *Server
-	id     string
-	tool   string
-	caller string
-	start  time.Time
+	srv      *Server
+	id       string
+	tool     string
+	caller   string
+	start    time.Time
+	stage    string
+	upstream *dataagent.RequestIDs
 }
 
 // startToolCall emits the request line and returns a record used to emit the
@@ -124,6 +130,7 @@ func (s *Server) startToolCall(ctx context.Context, req mcp.CallToolRequest) *ca
 		tool:   quoteForLog(req.Params.Name),
 		caller: quoteForLog(callerFromContext(ctx, s.jwtIdentity)),
 		start:  time.Now(),
+		stage:  "tool",
 	}
 
 	if s.reqLog >= RequestLogFull {
@@ -147,9 +154,64 @@ func (r *callRecord) finish(res *mcp.CallToolResult, err error) {
 	case res != nil && res.IsError:
 		outcome = "tool_error"
 	}
-	// Upstream errors may contain credentials or signed URLs even in basic mode.
-	log.Printf("[req:%s] <- %s %s duration=%s",
-		r.id, r.tool, outcome, time.Since(r.start).Round(time.Millisecond))
+	detail := ""
+	if outcome != "ok" {
+		kind := "tool_failure"
+		if err != nil {
+			kind = diagnosticErrorKind(err)
+		}
+		detail = fmt.Sprintf(" stage=%s error=%s", r.stage, kind)
+	}
+	if r.upstream != nil {
+		requests := r.upstream.LogSnapshot()
+		if len(requests) > 0 {
+			last := requests[len(requests)-1]
+			detail += fmt.Sprintf(" upstream_calls=%d action=%s upstream_request_id=%s", len(requests), quoteForLog(last.Action), quoteForLog(last.RequestID))
+		}
+	}
+	log.Printf("[req:%s] <- %s %s duration=%s%s",
+		r.id, r.tool, outcome, time.Since(r.start).Round(time.Millisecond), detail)
+}
+
+type stdioTransportError struct{ cause error }
+
+func (e *stdioTransportError) Error() string {
+	return fmt.Sprintf("stdio transport failed (%s)", diagnosticErrorKind(e.cause))
+}
+
+func (e *stdioTransportError) Unwrap() error { return e.cause }
+
+type stdioLogWriter struct{}
+
+func (stdioLogWriter) Write(p []byte) (int, error) {
+	stage := "transport"
+	switch {
+	case bytes.HasPrefix(p, []byte("Error reading input:")):
+		stage = "read"
+	case bytes.HasPrefix(p, []byte("Error handling message:")):
+		stage = "dispatch"
+	case bytes.HasPrefix(p, []byte("Error writing notification:")):
+		stage = "notification"
+	}
+	log.Printf("[stdio] stage=%s error=transport_failure", stage)
+	return len(p), nil
+}
+
+func diagnosticErrorKind(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	}
+	var transport net.Error
+	if errors.As(err, &transport) {
+		if transport.Timeout() {
+			return "timeout"
+		}
+		return "network"
+	}
+	return "failure"
 }
 
 func callerFromContext(ctx context.Context, _ bool) string {

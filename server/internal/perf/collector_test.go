@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/alibabacloud/data-agent-mcp-server/internal/logging"
 )
 
 func readRecords(t *testing.T, path string) []map[string]any {
@@ -120,6 +123,21 @@ func TestCollectorDoesNotLogSourcePayloads(t *testing.T) {
 	}
 }
 
+func perfBackups(t *testing.T, path string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var backups []string
+	for _, entry := range entries {
+		if logging.IsBackup(filepath.Base(path), entry.Name()) {
+			backups = append(backups, filepath.Join(filepath.Dir(path), entry.Name()))
+		}
+	}
+	return backups
+}
+
 func TestCollectorRotatesAtMaxBytes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "perf.log")
 	c, err := New(Options{Path: path, Interval: time.Hour, MaxBytes: 1})
@@ -132,8 +150,127 @@ func TestCollectorRotatesAtMaxBytes(t *testing.T) {
 	if recs := readRecords(t, path); len(recs) != 1 || recs[0]["event"] != "three" {
 		t.Fatalf("current file should hold only the newest record: %v", recs)
 	}
-	if recs := readRecords(t, path+".1"); len(recs) != 1 || recs[0]["event"] != "two" {
+	backups := perfBackups(t, path)
+	if len(backups) != 2 {
+		t.Fatal("expected two dated backups", backups)
+	}
+	if recs := readRecords(t, backups[1]); len(recs) != 1 || recs[0]["event"] != "two" {
 		t.Fatalf("rotated file should hold the previous record: %v", recs)
+	}
+	if recs := readRecords(t, backups[0]); len(recs) != 1 || recs[0]["event"] != "one" {
+		t.Fatal("earlier backup lost", recs)
+	}
+	for i := 4; i <= 20; i++ {
+		c.sample(fmt.Sprintf("sample-%02d", i))
+	}
+	backups = perfBackups(t, path)
+	if len(backups) != 7 {
+		t.Fatal("expected seven retained performance backups", backups)
+	}
+	for i, name := range backups {
+		if recs := readRecords(t, name); len(recs) != 1 || recs[0]["event"] != fmt.Sprintf("sample-%02d", i+13) {
+			t.Fatal("performance retention dropped the wrong sample", recs)
+		}
+	}
+	c.file.Close()
+}
+
+func TestCollectorRecoversAfterReopenFailure(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "active")
+	path := filepath.Join(dir, "perf.log")
+	c, err := New(Options{Path: path, MaxBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if c.file != nil {
+			c.file.Close()
+		}
+	}()
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	defer log.SetOutput(previous)
+	c.sample("before")
+	if err := os.Rename(dir, dir+"-moved"); err != nil {
+		t.Fatal(err)
+	}
+	c.sample("failed")
+	c.sample("still-failed")
+	if c.file != nil || strings.Count(output.String(), "unavailable") != 1 {
+		t.Fatal("failure must close the file and avoid repeated warnings")
+	}
+	if err := os.Rename(dir+"-moved", dir); err != nil {
+		t.Fatal(err)
+	}
+	c.sample("recovered")
+	c.sample("shutdown")
+	if got := readRecords(t, path); len(got) != 1 || got[0]["event"] != "shutdown" {
+		t.Fatal("sampling did not resume", got)
+	}
+	backups := perfBackups(t, path)
+	if len(backups) != 2 {
+		t.Fatal("expected dated backups before and after recovery", backups)
+	}
+	if got := readRecords(t, backups[1]); len(got) != 1 || got[0]["event"] != "recovered" {
+		t.Fatal("recovery record missing", got)
+	}
+	if !strings.Contains(output.String(), "file output recovered") || strings.Contains(output.String(), dir) {
+		t.Fatal("recovery diagnostic missing or raw path leaked")
+	}
+}
+
+func TestCollectorRecoversAfterWriteFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "perf.log")
+	c, err := New(Options{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if c.file != nil {
+			c.file.Close()
+		}
+	}()
+	c.sample("before")
+	if err := c.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c.sample("failed")
+	if c.file != nil {
+		t.Fatal("broken handle retained")
+	}
+	c.sample("recovered")
+	got := readRecords(t, path)
+	if len(got) != 2 || got[1]["event"] != "recovered" {
+		t.Fatal("write failure stopped sampling", got)
+	}
+}
+
+func TestCollectorRotationFailureDoesNotAppendPastLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "perf.log")
+	c, err := New(Options{Path: path, MaxBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if c.file != nil {
+			c.file.Close()
+		}
+	}()
+	c.sample("before")
+	if err := os.Mkdir(path+".1", 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.sample("failed")
+	if got := readRecords(t, path); len(got) != 1 || got[0]["event"] != "before" {
+		t.Fatal("failed rotation appended another record", got)
+	}
+	if err := os.Remove(path + ".1"); err != nil {
+		t.Fatal(err)
+	}
+	c.sample("recovered")
+	if got := readRecords(t, path); len(got) != 1 || got[0]["event"] != "recovered" {
+		t.Fatal("rotation did not recover", got)
 	}
 }
 
@@ -145,7 +282,7 @@ func TestNewRejectsEmptyPathAndAppliesDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.opts.Interval != DefaultInterval || c.opts.MaxBytes != DefaultMaxBytes {
+	if c.opts.Interval != 30*time.Second || c.opts.MaxBytes != 67108864 {
 		t.Fatalf("defaults not applied: %+v", c.opts)
 	}
 }

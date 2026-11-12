@@ -7,8 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
+	"time"
 )
+
+const RetainedFiles = 8
+
+const backupTimeFormat = "20060102-150405.000000000"
 
 type Writer struct {
 	mu       sync.Mutex
@@ -135,10 +142,86 @@ func (w *Writer) rotate() error {
 	if err != nil {
 		return err
 	}
-	if err := os.Rename(w.path, w.path+".1"); err != nil {
+	if err := Rotate(w.path); err != nil {
 		return fmt.Errorf("rotate MCP log: %w", err)
 	}
 	return w.open()
+}
+
+func IsBackup(path, candidate string) bool {
+	suffix, ok := strings.CutPrefix(candidate, path+".")
+	if !ok {
+		return false
+	}
+	if len(suffix) == 1 && suffix[0] >= '1' && suffix[0] <= '7' {
+		return true
+	}
+	stamp, err := time.Parse(backupTimeFormat, suffix)
+	return err == nil && stamp.Format(backupTimeFormat) == suffix
+}
+
+func Rotate(path string) error {
+	if _, err := logFileInfo(path); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	type backup struct {
+		path string
+		info os.FileInfo
+	}
+	var backups []backup
+	for _, entry := range entries {
+		if !IsBackup(filepath.Base(path), entry.Name()) {
+			continue
+		}
+		name := filepath.Join(filepath.Dir(path), entry.Name())
+		info, err := logFileInfo(name)
+		if err != nil {
+			return err
+		}
+		backups = append(backups, backup{path: name, info: info})
+	}
+	sort.Slice(backups, func(i, j int) bool {
+		if backups[i].info.ModTime().Equal(backups[j].info.ModTime()) {
+			return backups[i].path < backups[j].path
+		}
+		return backups[i].info.ModTime().Before(backups[j].info.ModTime())
+	})
+	stamp := time.Now().UTC()
+	for {
+		name := path + "." + stamp.Format(backupTimeFormat)
+		reserved, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if os.IsExist(err) {
+			stamp = stamp.Add(time.Nanosecond)
+			continue
+		} else if err != nil {
+			return err
+		}
+		if err := reserved.Close(); err != nil {
+			_ = os.Remove(name)
+			return err
+		}
+		if err := os.Rename(path, name); err != nil {
+			_ = os.Remove(name)
+			return err
+		}
+		break
+	}
+	for len(backups) >= RetainedFiles-1 {
+		oldest := backups[0]
+		info, err := logFileInfo(oldest.path)
+		if err != nil || !os.SameFile(info, oldest.info) {
+			return errors.New("log backup changed before cleanup")
+		}
+		if err := os.Remove(oldest.path); err != nil {
+			return err
+		}
+		backups = backups[1:]
+	}
+	return nil
 }
 
 func (w *Writer) writeFallback(p []byte) (int, error) {
