@@ -11,7 +11,7 @@ alibabacloud-openapi-util==0.2.4
 
 # HTTP 客户端
 requests==2.33.0
-aiohttp==3.13.5
+aiohttp==3.14.4
 
 # 环境变量
 python-dotenv==1.2.2
