@@ -25,7 +25,7 @@ from Tea.exceptions import TeaException
 
 from data_agent.config import DataAgentConfig
 from data_agent.models import SessionInfo, SessionStatus, DataSource, normalize_session_status
-from data_agent.api_adapter import APIAdapter
+from data_agent.api_adapter import APIAdapter, convert_snake_keys_to_camel
 from data_agent.exceptions import (
     ApiError,
     AuthenticationError,
@@ -218,8 +218,8 @@ class DataAgentClient:
         The dms-enterprise endpoint differs from the Data Agent endpoint, so
         we build a dedicated SDK client here (AK/SK mode only).
         """
-        if self._auth_type == "api_key":
-            # API_KEY auth does not map to dms-enterprise; keep the fallback.
+        if self._auth_type in ("api_key", "custom_headers"):
+            # Header-auth modes do not map to dms-enterprise; keep the fallback.
             return {}
 
         region = region_id or self._config.region
@@ -330,8 +330,8 @@ class DataAgentClient:
         Raises:
             ApiError: If the API call fails.
         """
-        if self._auth_type == "api_key":
-            # API_KEY mode has no AK/SK credentials for dms-enterprise
+        if self._auth_type in ("api_key", "custom_headers"):
+            # Header-auth modes have no AK/SK credentials for dms-enterprise
             import warnings
             warnings.warn(
                 "ListTagMetaAsset requires AK/SK credentials. "
@@ -339,7 +339,7 @@ class DataAgentClient:
                 stacklevel=2,
             )
             raise ApiError(
-                "ListTagMetaAsset not available in API_KEY mode (no AK/SK credentials).",
+                "ListTagMetaAsset not available in API_KEY/custom-header mode (no AK/SK credentials).",
                 code="UnsupportedAuthMode",
                 request_id=None,
             )
@@ -390,7 +390,12 @@ class DataAgentClient:
     def _initialize_client(self) -> None:
         """Initialize the underlying SDK client based on authentication type."""
         # Determine authentication type
-        if self._config.api_key:
+        if self._config.custom_headers:
+            # Custom-header auth: plain HTTP with injected headers, no SDK
+            # client and no credential chain.
+            self._sdk_client = None
+            self._auth_type = "custom_headers"
+        elif self._config.api_key:
             # API_KEY authentication - don't initialize the Tea SDK client
             self._sdk_client = None
             self._auth_type = "api_key"
@@ -451,6 +456,10 @@ class DataAgentClient:
             ApiError: If the API call fails.
             AuthenticationError: If authentication fails.
         """
+        if self._auth_type == "custom_headers":
+            # Custom-header auth: every action is posted to the endpoint
+            # configured for it in action_endpoints; no built-in routing.
+            return self._call_api_with_custom_headers(action, params)
         if self._auth_type == "api_key":
             # Handle API_KEY authentication using direct HTTP requests
             return self._call_api_with_api_key(action, version, params, method, body)
@@ -475,14 +484,18 @@ class DataAgentClient:
         # "Invalid Action" on the stream gateway.
         data_plane_actions = ['SendChatMessage', 'GetChatContent']
 
-        # Choose the correct endpoint based on the action type. Both honor the
-        # configured overrides (``endpoint`` for the control plane,
-        # ``stream_endpoint`` for the data plane) so API_KEY traffic can target
-        # non-public gateways; the defaults match the region-derived public hosts.
-        if action in data_plane_actions:
-            base_endpoint = self._config.resolve_api_key_stream_endpoint()
+        # Choose the correct endpoint based on the action type. An explicit
+        # per-action override wins; otherwise both honor the configured
+        # overrides (``endpoint`` for the control plane, ``stream_endpoint``
+        # for the data plane) so API_KEY traffic can target non-public
+        # gateways; the defaults match the region-derived public hosts.
+        action_override = (self._config.action_endpoints or {}).get(action)
+        if action_override:
+            full_url = action_override
+        elif action in data_plane_actions:
+            full_url = f"https://{self._config.resolve_api_key_stream_endpoint()}"
         else:
-            base_endpoint = self._config.endpoint
+            full_url = f"https://{self._config.endpoint}"
 
         # Add the required RegionId parameter to params
         params['RegionId'] = self._config.region
@@ -506,12 +519,6 @@ class DataAgentClient:
 
         prepared_body = APIAdapter.prepare_request_body(body)
 
-        # Build the URL for the API call (without Action and Version in query)
-        base_url = f"https://{base_endpoint}"
-
-        # Construct the URL without action/version in query string since they're in body
-        full_url = base_url
-
         # Set up headers with API_KEY
         headers = {
             'x-api-key': self._config.api_key,
@@ -520,51 +527,145 @@ class DataAgentClient:
             'User-Agent': 'AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill',
         }
 
-        # Add debug logging if enabled via environment variable
+        return self._execute_header_request(
+            action, version, full_url, headers, prepared_body, method
+        )
+
+    def _call_api_with_custom_headers(self, action: str, params: dict) -> dict:
+        """Make a call over the custom-header channel.
+
+        Every action is posted to the endpoint URL configured for it in
+        action_endpoints — the channel has no built-in routing, and an
+        action without an entry fails fast.
+
+        Single attempt, no retry: send is not idempotent on this channel, so
+        a transport failure surfaces to the caller instead of risking a
+        duplicate message. Business errors carry error_code in the response
+        envelope (HTTP is always 200) and are raised as ApiError with the
+        server request ID.
+        """
+        url = (self._config.action_endpoints or {}).get(action)
+        if not url:
+            raise ApiError(
+                f"{action} has no endpoint configured in custom-header "
+                "auth mode; add it to action_endpoints.",
+                code="UnsupportedAuthMode",
+                request_id=None,
+            )
+        headers = {
+            **self._config.custom_headers,
+            'X-Request-Id': uuid.uuid4().hex,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': 'AlibabaCloud-Agent-Skills/alibabacloud-data-agent-skill',
+        }
+        # camelCase wire body; routing/identity ride the URL and auth headers,
+        # so Action/Version/RegionId/DMSUnit/AgentId are not carried.
+        body = {
+            key[0].lower() + key[1:]: value
+            for key, value in params.items()
+            if key not in ("DMSUnit", "AgentId", "RegionId")
+        }
+        processed = self._execute_header_request(
+            action, "", url, headers, body, "POST",
+            http_error_mapper=self._map_custom_headers_http_error,
+        )
+        # Envelopes arrive snake_case or camelCase depending on the backend;
+        # the shared normalizer only decapitalizes, so convert snake keys
+        # here (a no-op on already-camelCase input).
+        processed = convert_snake_keys_to_camel(processed)
+        error_code = processed.get("errorCode")
+        if error_code and error_code != "Success":
+            raise ApiError(
+                processed.get("errorMessage") or str(error_code),
+                code=str(error_code),
+                request_id=processed.get("requestId"),
+            )
+        if str(processed.get("success", "")).lower() == "false":
+            raise ApiError(
+                processed.get("errorMessage") or "Custom-endpoint request failed.",
+                code=str(processed.get("errorCode") or "EndpointRequestFailed"),
+                request_id=processed.get("requestId"),
+            )
+        return processed
+
+    @staticmethod
+    def _map_custom_headers_http_error(e: requests.exceptions.RequestException) -> Exception:
+        response = getattr(e, "response", None)
+        status = response.status_code if response is not None else None
+        if status in (401, 403):
+            return AuthenticationError(
+                f"Authentication rejected by the custom endpoint (HTTP {status}). "
+                "The injected auth headers are missing, invalid or expired; "
+                "refresh the credentials and retry."
+            )
+        error_msg = f"API call failed: {str(e)}"
+        if response is not None:
+            error_msg += f", Status: {status}, Body: {response.text[:500]}"
+        return ApiError(error_msg, code="HTTPRequestError", request_id=None)
+
+    def _execute_header_request(
+        self,
+        action: str,
+        version: str,
+        url: str,
+        headers: dict,
+        body: dict,
+        method: str = "POST",
+        http_error_mapper: Optional[Callable[[requests.exceptions.RequestException], Exception]] = None,
+    ) -> dict:
+        """Shared transport for header-authenticated profiles (POP / custom-header).
+
+        Executes the request, normalizes the response keys to camelCase and
+        maps transport failures. ``http_error_mapper`` customizes the exception
+        raised on HTTP errors; the default preserves the POP profile behavior.
+        """
         if _is_debug_api_enabled():
             import pprint
-            auth_type_display = "API_KEY" if self._auth_type == "api_key" else "AK/SK"
+            auth_type_display = {
+                "api_key": "API_KEY",
+                "custom_headers": "CUSTOM_HEADERS",
+            }.get(self._auth_type, "AK/SK")
             print(f"[DEBUG] API Call: {action}")
             print(f"[DEBUG] Authentication Type: {auth_type_display}")
             print(f"[DEBUG] Method: {method}")
-            print(f"[DEBUG] URL: {full_url}")
-            print(f"[DEBUG] Headers: {pprint.pformat(_redact_sensitive_values(headers))}")
-            if prepared_body:
-                print(f"[DEBUG] Body: {pprint.pformat(_redact_sensitive_values(prepared_body))}")
+            print(f"[DEBUG] URL: {url}")
+            log_headers = headers
+            if self._auth_type == "custom_headers" and self._config.custom_headers:
+                # Injected header names are deployment facts; their values are
+                # secrets regardless of the name, so redact them unconditionally.
+                log_headers = {
+                    k: ("<redacted>" if k in self._config.custom_headers else v)
+                    for k, v in headers.items()
+                }
+            print(f"[DEBUG] Headers: {pprint.pformat(_redact_sensitive_values(log_headers))}")
+            if body:
+                print(f"[DEBUG] Body: {pprint.pformat(_redact_sensitive_values(body))}")
 
         try:
-            # Make the API call - Action and Version are now in the body
             if method.upper() == "GET":
-                # For GET requests, we might still need to put action/version in query
                 query_params = {'Action': action, 'Version': version}
                 import urllib.parse
                 query_string = urllib.parse.urlencode(query_params)
-                full_url_with_params = f"{full_url}?{query_string}"
+                full_url_with_params = f"{url}?{query_string}"
                 response = requests.get(full_url_with_params, headers=headers, timeout=self._config.timeout)
             elif method.upper() == "POST":
-                # For POST requests, Action and Version are in the body
-                response = requests.post(full_url, headers=headers, json=prepared_body, timeout=self._config.timeout)
+                response = requests.post(url, headers=headers, json=body, timeout=self._config.timeout)
             else:
-                # For other methods, default to POST with body
-                response = requests.request(method, full_url, headers=headers, json=prepared_body, timeout=self._config.timeout)
+                response = requests.request(method, url, headers=headers, json=body, timeout=self._config.timeout)
 
-            # Check response status
             response.raise_for_status()
-
-            # Parse response JSON
             response_data = response.json()
-
-            # Process response to convert keys to camelCase
             processed_response = APIAdapter.process_response(response_data, api_action=action)
 
-            # Add debug logging for response if enabled
             if _is_debug_api_enabled():
                 import pprint
                 print(f"[DEBUG] Response for {action}: {pprint.pformat(_redact_sensitive_values(processed_response))}")
 
             return processed_response
         except requests.exceptions.RequestException as e:
-            # Handle HTTP request errors
+            if http_error_mapper is not None:
+                raise http_error_mapper(e) from e
             error_msg = f"API call failed: {str(e)}"
             if hasattr(e, 'response') and e.response is not None:
                 error_msg += f", Status: {e.response.status_code}, Body: {e.response.text[:500]}"
@@ -736,9 +837,9 @@ class DataAgentClient:
             session_config["CustomAgentId"] = custom_agent_id
             session_config["CustomAgentStage"] = custom_agent_stage
 
-        # For API_KEY auth, SessionConfig should be a JSON object, not string
-        # For AK/SK auth, SessionConfig should be a JSON string
-        if self._auth_type == "api_key":
+        # For header auth (API_KEY / custom headers): JSON object
+        # For AK/SK auth: JSON string
+        if self._auth_type in ("api_key", "custom_headers"):
             params["SessionConfig"] = session_config
         else:
             params["SessionConfig"] = json.dumps(session_config)
@@ -927,14 +1028,15 @@ class DataAgentClient:
             params["AgentId"] = agent_id
         if session_id:
             params["SessionId"] = session_id
-        dms_unit = self._resolve_dms_unit()
-        if dms_unit:
-            params["DMSUnit"] = dms_unit
+        if self._auth_type != "custom_headers":
+            dms_unit = self._resolve_dms_unit()
+            if dms_unit:
+                params["DMSUnit"] = dms_unit
         if workspace_id:
             params["WorkspaceId"] = workspace_id
 
         # SessionConfig format depends on auth type
-        # For API_KEY auth: JSON object
+        # For header auth (API_KEY / custom headers): JSON object
         # For AK/SK auth: JSON string
         session_config: dict = {"Language": language}
         if mode:
@@ -949,29 +1051,29 @@ class DataAgentClient:
         if custom_agent_id:
             session_config["CustomAgentId"] = custom_agent_id
             session_config["CustomAgentStage"] = custom_agent_stage or "prod"
-        if self._auth_type == "api_key":
+        if self._auth_type in ("api_key", "custom_headers"):
             params["SessionConfig"] = session_config
         else:
             params["SessionConfig"] = json.dumps(session_config)
 
         # DataSource format depends on auth type
-        # For API_KEY auth: JSON object
+        # For header auth (API_KEY / custom headers): JSON object
         # For AK/SK auth: JSON string
         if data_source:
-            if self._auth_type == "api_key":
+            if self._auth_type in ("api_key", "custom_headers"):
                 params["DataSource"] = data_source.to_api_dict()
             else:
                 params["DataSource"] = json.dumps(data_source.to_api_dict())
 
         if data_sources:
-            if self._auth_type == "api_key":
+            if self._auth_type in ("api_key", "custom_headers"):
                 params["DataSources"] = data_sources
             else:
                 params["DataSources"] = json.dumps(data_sources)
 
         if report_config:
             task_config = {"ReportConfig": report_config}
-            if self._auth_type == "api_key":
+            if self._auth_type in ("api_key", "custom_headers"):
                 params["TaskConfig"] = task_config
             else:
                 params["TaskConfig"] = json.dumps(task_config)
