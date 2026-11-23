@@ -2,7 +2,6 @@ package dataagent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -169,14 +168,8 @@ func TestRequestIDsIncludeResolversAndPages(t *testing.T) {
 				t.Error("resolver or page request lost caller context")
 			}
 			params := make(map[string]any)
-			if c.cred.IsAPIKey() {
-				if err := json.NewDecoder(req.Body).Decode(&params); err != nil {
-					return nil, err
-				}
-			} else {
-				for key, values := range req.URL.Query() {
-					params[key] = values[0]
-				}
+			for key, values := range req.URL.Query() {
+				params[key] = values[0]
 			}
 			action := firstStr(params, "Action")
 			var payload map[string]any
@@ -187,9 +180,7 @@ func TestRequestIDsIncludeResolversAndPages(t *testing.T) {
 				payload = map[string]any{"Route": map[string]any{"RegionId": "unit-1"}}
 			case "InitDataAgentPersonalWorkspace":
 				payload = map[string]any{"Data": map[string]any{"WorkspaceId": "ws-1"}}
-			case "ListDataAgentWorkSpace":
-				payload = map[string]any{"Content": []map[string]any{{"WorkspaceId": "ws-1"}}}
-			case "ListTagMetaAsset", "listTagMetaAsset":
+			case "ListTagMetaAsset":
 				if got := firstStr(params, "TagName"); !strings.HasSuffix(got, "::space:ws-1") {
 					t.Errorf("resolved workspace not used: TagName=%q", got)
 				}
@@ -205,11 +196,7 @@ func TestRequestIDsIncludeResolversAndPages(t *testing.T) {
 			default:
 				t.Fatalf("unexpected action %q", action)
 			}
-			if c.cred.IsAPIKey() {
-				payload = map[string]any{"code": "success", "requestId": action + "-id", "data": payload}
-			} else {
-				payload["RequestID"] = action + "-id"
-			}
+			payload["RequestID"] = action + "-id"
 			return jsonHTTPResponse(t, payload), nil
 		})
 		got, err := c.ListDatabases(ctx, "")
@@ -217,9 +204,6 @@ func TestRequestIDsIncludeResolversAndPages(t *testing.T) {
 			t.Fatalf("ListDatabases: count=%d, error=%v", len(got), err)
 		}
 		actions := []string{"GetUserActiveTenant", "GetActiveRouteUnit", "InitDataAgentPersonalWorkspace", "ListTagMetaAsset", "ListTagMetaAsset"}
-		if c.cred.IsAPIKey() {
-			actions = []string{"ListDataAgentWorkSpace", "listTagMetaAsset", "listTagMetaAsset"}
-		}
 		var want []APIRequest
 		for _, action := range actions {
 			want = append(want, APIRequest{Action: action, RequestID: action + "-id"})
@@ -234,52 +218,49 @@ func TestRequestIDsIncludeResolversAndPages(t *testing.T) {
 	})
 }
 
-// API Key gateway errors must carry the backend request id in all three
-// failure shapes so tool errors are traceable to backend support tickets.
-func TestAPIKeyErrorsCarryRequestID(t *testing.T) {
-	newAPIKeyClient := func(handler roundTripFunc) *Client {
-		c := NewClient(&Credential{APIKey: "ak-test"}, "cn-hangzhou", WithWorkspaceID("ws-1"))
-		c.http = &http.Client{Transport: handler}
-		return c
-	}
-
-	t.Run("http error carries header request id", func(t *testing.T) {
-		c := newAPIKeyClient(func(req *http.Request) (*http.Response, error) {
-			resp := jsonHTTPResponse(t, map[string]any{"Message": "denied"})
-			resp.StatusCode = 403
-			resp.Header.Set("x-acs-request-id", "REQ-HTTP-403")
-			return resp, nil
-		})
-		_, err := c.ListDatabases(context.Background(), "")
-		if err == nil || !strings.Contains(err.Error(), "REQ-HTTP-403") {
-			t.Fatalf("error missing request id: %v", err)
-		}
-	})
-
-	t.Run("success=false carries body requestId", func(t *testing.T) {
-		c := newAPIKeyClient(func(req *http.Request) (*http.Response, error) {
-			return jsonHTTPResponse(t, map[string]any{
-				"success": false, "code": "Forbidden", "msg": "no grant",
-				"requestId": "REQ-BODY-1",
-			}), nil
-		})
-		_, err := c.ListDatabases(context.Background(), "")
-		if err == nil || !strings.Contains(err.Error(), "REQ-BODY-1") {
-			t.Fatalf("error missing body requestId: %v", err)
-		}
-	})
-
-	t.Run("HttpStatusCode>=400 falls back to header", func(t *testing.T) {
-		c := newAPIKeyClient(func(req *http.Request) (*http.Response, error) {
-			resp := jsonHTTPResponse(t, map[string]any{
-				"HttpStatusCode": 400, "Message": "bad param",
+// Signed API errors must carry the backend request id in all three failure
+// shapes so tool errors are traceable to backend support tickets.
+func TestSignedErrorsCarryRequestID(t *testing.T) {
+	testClientAuthModes(t, func(t *testing.T, c *Client) {
+		for _, tt := range []struct {
+			name, body, header, want string
+			status                   int
+		}{
+			{
+				name: "http error carries header request id", status: http.StatusForbidden,
+				body: `{"Message":"denied"}`, header: "REQ-HTTP-403", want: "REQ-HTTP-403",
+			},
+			{
+				name: "success=false carries body requestId", status: http.StatusOK,
+				body: `{"success":false,"code":"Forbidden","msg":"no grant","requestId":"REQ-BODY-1"}`, want: "REQ-BODY-1",
+			},
+			{
+				name: "HttpStatusCode>=400 falls back to header", status: http.StatusOK,
+				body: `{"HttpStatusCode":400,"Message":"bad param"}`, header: "REQ-HDR-400", want: "REQ-HDR-400",
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				useSignedTLSFixture(t, c, func(w http.ResponseWriter, req *http.Request) {
+					switch req.URL.Query().Get("Action") {
+					case "GetUserActiveTenant":
+						fmt.Fprint(w, `{"Tenant":{"Tid":"42"}}`)
+					case "ListTagMetaAsset":
+						if req.URL.Query().Get("Tid") != "42" || req.URL.Query().Get("Version") != "2018-11-01" {
+							t.Error("missing signed DMS tenant or API version")
+						}
+						w.Header().Set("x-acs-request-id", tt.header)
+						w.WriteHeader(tt.status)
+						fmt.Fprint(w, tt.body)
+					default:
+						t.Errorf("unexpected action %q", req.URL.Query().Get("Action"))
+						http.Error(w, "unexpected action", http.StatusBadRequest)
+					}
+				})
+				_, err := c.ListDatabases(context.Background(), "")
+				if err == nil || !strings.Contains(err.Error(), tt.want) {
+					t.Fatalf("error missing request id %q: %v", tt.want, err)
+				}
 			})
-			resp.Header.Set("x-acs-request-id", "REQ-HDR-400")
-			return resp, nil
-		})
-		_, err := c.ListDatabases(context.Background(), "")
-		if err == nil || !strings.Contains(err.Error(), "REQ-HDR-400") {
-			t.Fatalf("error missing header fallback request id: %v", err)
 		}
 	})
 }

@@ -1,16 +1,21 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/alibabacloud/data-agent-mcp-server/internal/dataagent"
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/alibabacloud/data-agent-mcp-server/internal/tenant"
@@ -44,7 +49,7 @@ func ParseRequestLogLevel(v string) RequestLogLevel {
 	case "", "basic", "true", "1":
 		return RequestLogBasic
 	default:
-		log.Printf("unknown request log level %q, using basic", v)
+		log.Printf("unknown request log level %s, using basic", quoteForLog(v))
 		return RequestLogBasic
 	}
 }
@@ -78,25 +83,38 @@ func (s *Server) ApplyRequestLogConfig(configured string) {
 // sensitiveArgKeys are argument names whose values are never logged. The
 // identity token is not an argument and is never logged at all.
 var sensitiveArgKeys = map[string]bool{
-	"api_key":    true,
-	"apikey":     true,
-	"token":      true,
-	"auth_token": true,
-	"secret":     true,
-	"password":   true,
-	"credential": true,
+	"api_key":       true,
+	"apikey":        true,
+	"token":         true,
+	"auth_token":    true,
+	"secret":        true,
+	"password":      true,
+	"credential":    true,
+	"accesskey":     true,
+	"access_key":    true,
+	"authorization": true,
+	"signature":     true,
+	"jwt":           true,
+	"cookie":        true,
 }
 
-const maxLoggedValueLen = 160
+const (
+	maxLoggedValueLen = 128
+	maxLoggedArgsLen  = 4096
+	maxLoggedNodes    = 64
+	maxLoggedDepth    = 8
+)
 
 // callRecord tracks one tool call so the completion line can report the
 // outcome and how long the call took.
 type callRecord struct {
-	srv    *Server
-	id     string
-	tool   string
-	caller string
-	start  time.Time
+	srv      *Server
+	id       string
+	tool     string
+	caller   string
+	start    time.Time
+	stage    string
+	upstream *dataagent.RequestIDs
 }
 
 // startToolCall emits the request line and returns a record used to emit the
@@ -109,9 +127,10 @@ func (s *Server) startToolCall(ctx context.Context, req mcp.CallToolRequest) *ca
 	rec := &callRecord{
 		srv:    s,
 		id:     newRequestID(),
-		tool:   req.Params.Name,
-		caller: callerFromContext(ctx, s.jwtIdentity),
+		tool:   quoteForLog(req.Params.Name),
+		caller: quoteForLog(callerFromContext(ctx, s.jwtIdentity)),
 		start:  time.Now(),
+		stage:  "tool",
 	}
 
 	if s.reqLog >= RequestLogFull {
@@ -129,40 +148,77 @@ func (r *callRecord) finish(res *mcp.CallToolResult, err error) {
 		return
 	}
 	outcome := "ok"
-	detail := ""
 	switch {
 	case err != nil:
 		outcome = "error"
-		detail = " detail=" + quoteForLog(err.Error())
 	case res != nil && res.IsError:
 		outcome = "tool_error"
-		detail = " detail=" + quoteForLog(resultText(res))
+	}
+	detail := ""
+	if outcome != "ok" {
+		kind := "tool_failure"
+		if err != nil {
+			kind = diagnosticErrorKind(err)
+		}
+		detail = fmt.Sprintf(" stage=%s error=%s", r.stage, kind)
+	}
+	if r.upstream != nil {
+		requests := r.upstream.LogSnapshot()
+		if len(requests) > 0 {
+			last := requests[len(requests)-1]
+			detail += fmt.Sprintf(" upstream_calls=%d action=%s upstream_request_id=%s", len(requests), quoteForLog(last.Action), quoteForLog(last.RequestID))
+		}
 	}
 	log.Printf("[req:%s] <- %s %s duration=%s%s",
 		r.id, r.tool, outcome, time.Since(r.start).Round(time.Millisecond), detail)
 }
 
-// callerFromContext describes who issued the call. On the HTTP transports the
-// identity headers are in the context; stdio has no identity, so the caller is
-// the local process. The identity token is deliberately never included.
-//
-// jwtMode reports whether identity comes from a signed token. In that mode the
-// plain headers are not trustworthy and verification has not run yet when this
-// line is written, so the header values are deliberately not presented as the
-// caller — doing so would attribute a rejected request to whoever the sender
-// claimed to be.
-func callerFromContext(ctx context.Context, jwtMode bool) string {
-	if c := tenant.ClaimsFromContext(ctx); c != nil {
-		return identityLabel(c.UserID, c.Email)
+type stdioTransportError struct{ cause error }
+
+func (e *stdioTransportError) Error() string {
+	return fmt.Sprintf("stdio transport failed (%s)", diagnosticErrorKind(e.cause))
+}
+
+func (e *stdioTransportError) Unwrap() error { return e.cause }
+
+type stdioLogWriter struct{}
+
+func (stdioLogWriter) Write(p []byte) (int, error) {
+	stage := "transport"
+	switch {
+	case bytes.HasPrefix(p, []byte("Error reading input:")):
+		stage = "read"
+	case bytes.HasPrefix(p, []byte("Error handling message:")):
+		stage = "dispatch"
+	case bytes.HasPrefix(p, []byte("Error writing notification:")):
+		stage = "notification"
 	}
-	if jwtMode {
-		if tenant.JWTFromContext(ctx) != "" {
-			return "jwt(unverified)"
+	log.Printf("[stdio] stage=%s error=transport_failure", stage)
+	return len(p), nil
+}
+
+func diagnosticErrorKind(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	}
+	var transport net.Error
+	if errors.As(err, &transport) {
+		if transport.Timeout() {
+			return "timeout"
 		}
-		return "-"
+		return "network"
 	}
-	user, email, _ := tenant.IdentityFromContext(ctx)
-	return identityLabel(user, email)
+	return "failure"
+}
+
+func callerFromContext(ctx context.Context, _ bool) string {
+	if p := tenant.PrincipalFromContext(ctx); p != nil {
+		return p.ID
+	}
+	return "-"
 }
 
 func identityLabel(user, email string) string {
@@ -178,34 +234,77 @@ func identityLabel(user, email string) string {
 	}
 }
 
-// formatArgs renders arguments in a stable order with sensitive values
-// replaced and long values truncated.
 func formatArgs(args map[string]any) string {
-	if len(args) == 0 {
-		return "{}"
-	}
-	keys := make([]string, 0, len(args))
-	for k := range args {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	nodes := maxLoggedNodes
+	return logValue(args, 0, &nodes)
+}
 
-	var b strings.Builder
-	b.WriteByte('{')
-	for i, k := range keys {
-		if i > 0 {
-			b.WriteByte(' ')
-		}
-		b.WriteString(k)
-		b.WriteByte('=')
-		if isSensitiveArg(k) {
-			b.WriteString("<redacted>")
-			continue
-		}
-		b.WriteString(quoteForLog(fmt.Sprintf("%v", args[k])))
+func logValue(value any, depth int, nodes *int) string {
+	if depth >= maxLoggedDepth || *nodes <= 0 {
+		return `"<truncated>"`
 	}
-	b.WriteByte('}')
-	return b.String()
+	*nodes--
+	switch value := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(value))
+		for k := range value {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var b strings.Builder
+		b.WriteByte('{')
+		for i, key := range keys {
+			item := `"<redacted>"`
+			if !isSensitiveArg(key) {
+				item = logValue(value[key], depth+1, nodes)
+			}
+			entry := quoteForLog(key) + ":" + item
+			if b.Len()+len(entry)+32 > maxLoggedArgsLen || *nodes <= 0 {
+				if i > 0 {
+					b.WriteByte(',')
+				}
+				b.WriteString(`"<truncated>":true`)
+				break
+			}
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(entry)
+		}
+		b.WriteByte('}')
+		return b.String()
+	case []any:
+		var b strings.Builder
+		b.WriteByte('[')
+		for i, element := range value {
+			item := logValue(element, depth+1, nodes)
+			if b.Len()+len(item)+24 > maxLoggedArgsLen || *nodes <= 0 {
+				if i > 0 {
+					b.WriteByte(',')
+				}
+				b.WriteString(`"<truncated>"`)
+				break
+			}
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(item)
+		}
+		b.WriteByte(']')
+		return b.String()
+	case string:
+		lower := strings.ToLower(value)
+		if strings.Contains(lower, "http://") || strings.Contains(lower, "https://") {
+			return `"<url omitted>"`
+		}
+		return quoteForLog(value)
+	case nil:
+		return "null"
+	case bool, int, int32, int64, uint, uint32, uint64, float32, float64, json.Number:
+		return quoteForLog(fmt.Sprint(value))
+	default:
+		return `"<unsupported>"`
+	}
 }
 
 func isSensitiveArg(key string) bool {
@@ -222,14 +321,16 @@ func isSensitiveArg(key string) bool {
 	return false
 }
 
-// quoteForLog collapses newlines and truncates so one call stays on one line.
 func quoteForLog(s string) string {
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	s = strings.ReplaceAll(s, "\r", "")
 	if len(s) > maxLoggedValueLen {
-		s = s[:maxLoggedValueLen] + "...(truncated)"
+		end := maxLoggedValueLen
+		for end > 0 && !utf8.RuneStart(s[end]) {
+			end--
+		}
+		s = s[:end] + "...(truncated)"
 	}
-	return strconv.Quote(s)
+	encoded, _ := json.Marshal(s)
+	return string(encoded)
 }
 
 // tagError appends the server-side request id to a tool error's text so a
@@ -264,4 +365,22 @@ func newRequestID() string {
 		return "00000000"
 	}
 	return hex.EncodeToString(b[:])
+}
+
+func (s *Server) logGatewayCall(spec gatewayToolSpec, caller *tenant.GatewayCaller, result gatewayEnvelope, started time.Time) {
+	if s.reqLog == RequestLogOff {
+		return
+	}
+	identity, group, role := "-", "", ""
+	if caller != nil {
+		identity = identityLabel(caller.UserID, caller.Email)
+		group, role = caller.Group, caller.RoleArn
+	}
+	code := ""
+	if result.Error != nil {
+		code = result.Error.Code
+	}
+	log.Printf("[req:%s] gateway tool=%s action=%s caller=%s group=%s role=%s status=%s code=%s upstream_request_id=%s duration=%s",
+		quoteForLog(result.RequestID), quoteForLog(spec.name), quoteForLog(spec.action), quoteForLog(identity), quoteForLog(group), quoteForLog(role),
+		quoteForLog(result.Status), quoteForLog(code), quoteForLog(result.UpstreamRequestID), time.Since(started).Round(time.Millisecond))
 }

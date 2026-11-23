@@ -1,11 +1,7 @@
 package session
 
 import (
-	"encoding/json"
-	"log"
 	"maps"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -625,51 +621,25 @@ func (s *State) Snapshot() StateSnapshot {
 
 // ---------- Persistence ----------
 
-func (s *State) Persist(dir string) (err error) {
+// Persist is a standalone rooted writer. Managers and watchers share their
+// already-open store instead, so renaming the configured root cannot redirect IO.
+func (s *State) Persist(dir string) error {
+	if err := ValidateSessionID(s.GetSessionID()); err != nil {
+		return err
+	}
+	store, err := openSessionStore(dir)
+	if err != nil {
+		return err
+	}
+	defer store.root.Close()
+	return s.persist(store)
+}
+
+func (s *State) persist(store *sessionStore) error {
 	// Serialize snapshot creation as well as writes so an older snapshot cannot win.
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
-	snap := s.Snapshot()
-	defer func() {
-		if err != nil {
-			log.Printf("[session:%s] persist failed: %v", snap.SessionID, err)
-		}
-	}()
-
-	sessionDir := filepath.Join(dir, snap.SessionID)
-	if err = os.MkdirAll(sessionDir, 0o755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return err
-	}
-	file, err := os.CreateTemp(sessionDir, ".status-*")
-	if err != nil {
-		return err
-	}
-	tmp := file.Name()
-	defer os.Remove(tmp)
-	if _, err = file.Write(data); err != nil {
-		file.Close()
-		return err
-	}
-	if err = file.Sync(); err != nil {
-		file.Close()
-		return err
-	}
-	if err = file.Close(); err != nil {
-		return err
-	}
-	if err = os.Rename(tmp, filepath.Join(sessionDir, "status.json")); err != nil {
-		return err
-	}
-	directory, err := os.Open(sessionDir)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
+	return store.persist(s.Snapshot())
 }
 
 // stateFromSnapshot reconstructs a mutable State from a persisted snapshot.
@@ -727,20 +697,16 @@ func stateFromSnapshot(snap *StateSnapshot) *State {
 	return s
 }
 
-// LoadState reads a persisted state from {dir}/{sessionID}/status.json.
-// Returns nil if the file does not exist or cannot be parsed.
+// LoadState reads a validated snapshot through a root handle. It returns nil
+// for missing, inaccessible, malformed, or mismatched state, without disclosure.
 func LoadState(dir, sessionID string) *StateSnapshot {
-	path := filepath.Join(dir, sessionID, "status.json")
-
-	data, err := os.ReadFile(path)
+	if ValidateSessionID(sessionID) != nil {
+		return nil
+	}
+	store, err := openSessionStoreMode(dir, false)
 	if err != nil {
 		return nil
 	}
-
-	var snap StateSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return nil
-	}
-
-	return &snap
+	defer store.root.Close()
+	return loadState(store, sessionID)
 }

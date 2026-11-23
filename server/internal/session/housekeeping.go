@@ -17,6 +17,11 @@ const (
 //
 // It blocks until ctx is canceled.
 func (m *Manager) RunHousekeeping(ctx context.Context) {
+	ctx, done, err := m.begin(ctx)
+	if err != nil {
+		return
+	}
+	defer done()
 	ticker := time.NewTicker(housekeepingInterval)
 	defer ticker.Stop()
 
@@ -64,10 +69,18 @@ func (m *Manager) doHousekeeping() {
 // reconcileWithServer checks the server-side session status and updates the
 // local state if the server reports the session as finished.
 func (m *Manager) reconcileWithServer(sessionID string, entry *watcherEntry) {
-	before := entry.state.Snapshot()
-	info, err := m.client.DescribeSession(m.watchContext(), sessionID, before.WorkspaceID)
+	if ValidateSessionID(sessionID) != nil || entry.state.GetSessionID() != sessionID {
+		return
+	}
+	ctx, done, err := m.begin(m.watchContext())
 	if err != nil {
-		log.Printf("[housekeeping] DescribeSession(%s) error: %v", sessionID, err)
+		return
+	}
+	defer done()
+	before := entry.state.Snapshot()
+	info, err := m.client.DescribeSession(ctx, sessionID, before.WorkspaceID)
+	if err != nil {
+		log.Printf("[housekeeping] DescribeSession(%q) failed", logToken(sessionID))
 		return
 	}
 	if info == nil {
@@ -81,9 +94,8 @@ func (m *Manager) reconcileWithServer(sessionID string, entry *watcherEntry) {
 	if serverStatus != "STOPPED" && serverStatus != "FINISHED" && serverStatus != "COMPLETED" {
 		return
 	}
-	operation := m.sessionOperation(sessionID)
-	operation.Lock()
-	defer operation.Unlock()
+	unlock := m.lockSessionOperation(sessionID)
+	defer unlock()
 	m.mu.RLock()
 	current := m.watchers[sessionID]
 	m.mu.RUnlock()
@@ -101,7 +113,7 @@ func (m *Manager) reconcileWithServer(sessionID string, entry *watcherEntry) {
 		return
 	}
 	entry.state.SetCompleted()
-	entry.state.Persist(m.sessDir)
+	entry.state.persist(m.store)
 	entry.watcher.exited = true
 	entry.cancel()
 	entry.watcher.opMu.Unlock()

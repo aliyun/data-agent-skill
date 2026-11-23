@@ -9,6 +9,32 @@ import (
 	"unicode/utf8"
 )
 
+func TestAgentReply(t *testing.T) {
+	for _, eventType := range []string{EventData, EventContentFinish} {
+		for _, tc := range []struct{ content, want string }{
+			{`{"content":"Total employees: 42"}`, "Total employees: 42"},
+			{`{"content":"分析权限快照缺失或不匹配"}`, "分析权限快照缺失或不匹配"},
+			{"Plain chat reply", "Plain chat reply"},
+			{`{"content":""}`, ""},
+			{`{"content":null}`, ""},
+			{`{"content":{"internal":"not user text"}}`, ""},
+			{`{}`, ""},
+			{"", ""},
+		} {
+			t.Run(eventType+"/"+tc.content, func(t *testing.T) {
+				result := Parse(eventType, CatAgentReply, tc.content, "json")
+				wantAction := ActionConclusion
+				if tc.want == "" {
+					wantAction = ActionNone
+				}
+				if result.Action != wantAction || result.Content != tc.want || result.Category != CatAgentReply {
+					t.Fatalf("agent reply parsed incorrectly: %+v", result)
+				}
+			})
+		}
+	}
+}
+
 func TestSSEFinish(t *testing.T) {
 	r := Parse(EventSSEFinish, "", "", "")
 	assertAction(t, r, ActionStreamEnded, "SSE_FINISH -> ActionStreamEnded")

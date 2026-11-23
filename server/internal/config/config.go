@@ -8,11 +8,18 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
+	"github.com/alibabacloud/data-agent-mcp-server/internal/logging"
 	"gopkg.in/yaml.v3"
 )
 
@@ -20,6 +27,8 @@ import (
 // The same shape is used for the global default (identity.default) and for
 // named groups (identity.groups.<name>).
 type IdentityGroup struct {
+	TenantID string `yaml:"tenant_id"`
+	AgentID  string `yaml:"agent_id"`
 	// RoleArn is the RAM role assumed for every user of this group (required).
 	RoleArn string `yaml:"role_arn"`
 	// WorkspaceID pins sessions of this group to a workspace (optional).
@@ -32,7 +41,7 @@ type IdentityGroup struct {
 	// Legacy values ASK_DATA/ANALYSIS/INSIGHT are auto-mapped.
 	Mode string `yaml:"mode"`
 	// Users lists group members by upstream user id or email. Required for
-	// named groups; ignored on the default group (which catches everyone).
+	// named groups; ignored on the default group.
 	Users []string `yaml:"users"`
 }
 
@@ -45,13 +54,7 @@ type IdentityHeaders struct {
 	Token string `yaml:"token"` // default: x-aily-token
 }
 
-// JWT configures verification of the upstream-signed identity token.
-//
-// Feishu Aily signs the end-user identity with a platform-generated HS256
-// secret and sends it as a header on every MCP request. Several upstream
-// agents can share one MCP Server while each signs with its own secret, so
-// more than one key may be accepted — a token is valid if any configured
-// secret verifies it.
+// JWT keys share signing authority; absent JWTs may use trusted Header identity.
 type JWT struct {
 	Enabled bool `yaml:"enabled"`
 	// Secret is a single HMAC key, shown in the platform's MCP editor and used
@@ -107,12 +110,14 @@ func (i Identity) Prefix() string {
 // and executes all calls under it.
 //
 // Two ways to map users to RAM roles:
-//  1. Default (global sharing): identity.default carries one role plus
-//     optional workspace/agent/mode defaults for every identified user.
+//  1. Default: identity.default carries one role plus session defaults for
+//     unmatched users (shared, or restricted by explicit tenant/agent scope).
 //  2. Groups: each identity.groups.<name> lists its users and carries its
 //     own role and defaults. Group membership wins over the default.
 type Identity struct {
-	Enabled bool `yaml:"enabled"`
+	Enabled    bool   `yaml:"enabled"`
+	Namespace  string `yaml:"namespace"`
+	MaxTenants int    `yaml:"max_tenants"`
 	// JWT enables verification of the upstream-signed identity token.
 	JWT JWT `yaml:"jwt"`
 	// SessionNameClaim selects which identity field becomes the STS
@@ -121,8 +126,8 @@ type Identity struct {
 	// so pick the field your audit process recognises. Group membership is
 	// always matched on user_id and email, independent of this setting.
 	SessionNameClaim string `yaml:"session_name_claim"`
-	// RequireIdentity rejects requests without identity headers instead of
-	// falling back to the default (server) identity.
+	// RequireIdentity must be true for all remote transports. Missing identity
+	// never falls back to the process-wide SDK credentials.
 	RequireIdentity bool `yaml:"require_identity"`
 	// AuthToken, when non-empty, must match the token header on every
 	// request — it authenticates that the request really comes from the
@@ -142,9 +147,8 @@ type Identity struct {
 	SessionNamePrefix *string `yaml:"session_name_prefix"`
 	// Headers overrides the identity header names (defaults: x-aily-*).
 	Headers IdentityHeaders `yaml:"headers"`
-	// Default is the global-sharing group: identified users that belong to
-	// no named group fall back to it. Nil/empty role means unmatched users
-	// are rejected (fail-closed).
+	// Default applies to unmatched verified identities; explicit scopes restrict it.
+	// Nil means reject unmatched users.
 	Default *IdentityGroup `yaml:"default"`
 	// Groups maps group name -> group config. A user may belong to exactly
 	// one group (validated at startup).
@@ -157,17 +161,41 @@ type STS struct {
 	SessionExpiration int    `yaml:"session_expiration"` // seconds, default 3600
 }
 
-// Log configures server logging. Everything goes to stderr, so on stdio the
-// host agent captures it and on the HTTP transports the process supervisor
-// (systemd, container runtime) does.
+// DefaultLogMaxBytes is the default server log rotation size.
+const DefaultLogMaxBytes = 64 << 20
+
+// Log configures server logging to stderr or a rotating file.
 type Log struct {
+	Enabled  bool   `yaml:"enabled"`
+	File     string `yaml:"file"`      // default ~/.data-agent/server.log
+	MaxBytes int64  `yaml:"max_bytes"` // bytes per file; current plus seven dated backups
 	// Requests selects how much of every tool call is logged:
-	//   basic (default) — tool name, caller, outcome, duration
-	//   full            — adds arguments with sensitive values redacted;
-	//                     arguments carry user questions, so prefer it for
-	//                     troubleshooting rather than steady-state operation
-	//   off             — no per-call logging
+	//   basic — tool name, caller, outcome, duration (default remotely)
+	//   full  — adds arguments with sensitive values redacted;
+	//           arguments carry user questions, so prefer it for
+	//           troubleshooting rather than steady-state operation
+	//   off   — no per-call logging (default under stdio)
 	Requests string `yaml:"requests"`
+	// Perf periodically samples host/process/runtime/server metrics into a
+	// dedicated JSON-lines file (not stderr) for post-incident analysis.
+	Perf Perf `yaml:"perf"`
+}
+
+// Perf configures the periodic performance sampler.
+type Perf struct {
+	Enabled         bool   `yaml:"enabled"`
+	File            string `yaml:"file"`             // default ~/.data-agent/perf.log
+	IntervalSeconds int    `yaml:"interval_seconds"` // default 30, minimum 1
+	MaxBytes        int64  `yaml:"max_bytes"`        // default 64 MiB; current plus seven dated backups
+}
+
+// AgentGateway configures the fixed Agentic OpenAPI metadata tools.
+type AgentGateway struct {
+	Enabled               bool   `yaml:"enabled"`
+	DataSourcesEnabled    bool   `yaml:"data_sources_enabled"`
+	Endpoint              string `yaml:"endpoint"`
+	RequestTimeoutSeconds int    `yaml:"request_timeout_seconds"`
+	MaxResponseBytes      int64  `yaml:"max_response_bytes"`
 }
 
 // Config holds all server configuration.
@@ -178,9 +206,13 @@ type Config struct {
 	// CustomAgentID is the default custom agent for sessions that do not name
 	// one, mirroring workspace_id. An identity group's custom_agent_id wins
 	// over this, and an explicit tool argument wins over both.
-	CustomAgentID string `yaml:"custom_agent_id"`
-	SessionsDir   string `yaml:"sessions_dir"`
-	APIKey        string `yaml:"api_key"`
+	CustomAgentID        string       `yaml:"custom_agent_id"`
+	SessionsDir          string       `yaml:"sessions_dir"`
+	APIKey               string       `yaml:"api_key"`
+	APIKeyEndpoint       string       `yaml:"api_key_endpoint"`
+	APIKeyStreamEndpoint string       `yaml:"api_key_stream_endpoint"`
+	AgentGateway         AgentGateway `yaml:"agent_gateway"`
+	HTTP                 HTTP         `yaml:"http"`
 	// DMSEnterpriseEndpoint overrides the dms-enterprise host used by the
 	// 2018-11-01 metadata APIs (database/table/instance discovery, import
 	// tagging, GetActiveRouteUnit). Empty = dms-enterprise.{region}.aliyuncs.com.
@@ -189,14 +221,8 @@ type Config struct {
 	// (2025-04-14): session create/send/status and the AK/SK SSE stream.
 	// Empty = dms.{region}.aliyuncs.com.
 	DataAgentEndpoint string `yaml:"data_agent_endpoint"`
-	// APIKeyEndpoint overrides the API Key control-plane host.
-	// Empty = dataagent-{region}.aliyuncs.com. Only used with api_key auth.
-	APIKeyEndpoint string `yaml:"api_key_endpoint"`
-	// APIKeyStreamEndpoint overrides the API Key data-plane (streaming) host.
-	// Empty = dataagent-stream-{region}.aliyuncs.com. Only used with api_key auth.
-	APIKeyStreamEndpoint string `yaml:"api_key_stream_endpoint"`
-	STS                  STS    `yaml:"sts"`
-	Log                  Log    `yaml:"log"`
+	STS               STS    `yaml:"sts"`
+	Log               Log    `yaml:"log"`
 	// Identity is the multi-tenant identity section. The legacy section
 	// name "aily" is still accepted as an alias.
 	Identity       Identity  `yaml:"identity"`
@@ -213,41 +239,32 @@ func homeDir() string {
 // LoadDotEnv loads KEY=VALUE pairs into the process environment without
 // overriding variables that are already set. Search order:
 // $DATA_AGENT_ENV_FILE, then ./.env. Missing files are silently skipped.
-func LoadDotEnv() {
-	paths := []string{}
+func LoadDotEnv() error {
+	paths := []string{".env"}
 	if p := os.Getenv("DATA_AGENT_ENV_FILE"); p != "" {
-		paths = append(paths, p)
+		paths = []string{p}
 	}
-	paths = append(paths, ".env")
-
 	for _, p := range paths {
-		data, err := os.ReadFile(p)
-		if err != nil {
+		data, err := readConfigFile(p, dotenvContainsSecret)
+		if os.IsNotExist(err) {
 			continue
 		}
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") {
+		if err != nil {
+			return fmt.Errorf("dotenv: %w", errSecretFile)
+		}
+		for key, value := range dotenvValues(data) {
+			// A loaded file must not relax checks on files read later.
+			if key == "DOTENV_UNSAFE_FILES_ALLOW" {
 				continue
 			}
-			line = strings.TrimPrefix(line, "export ")
-			key, value, ok := strings.Cut(line, "=")
-			if !ok {
-				continue
+			if _, set := os.LookupEnv(key); !set {
+				if err := os.Setenv(key, value); err != nil {
+					return errors.New("invalid dotenv entry")
+				}
 			}
-			key = strings.TrimSpace(key)
-			value = strings.TrimSpace(value)
-			// Strip optional surrounding quotes.
-			if len(value) >= 2 && (value[0] == '"' && value[len(value)-1] == '"' ||
-				value[0] == '\'' && value[len(value)-1] == '\'') {
-				value = value[1 : len(value)-1]
-			}
-			if key == "" || os.Getenv(key) != "" {
-				continue
-			}
-			os.Setenv(key, value)
 		}
 	}
+	return nil
 }
 
 // configPath resolves the YAML config file location:
@@ -270,29 +287,75 @@ func configPath() string {
 	return ""
 }
 
+func decodeConfig(data []byte, cfg *Config) error {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	var documents []*yaml.Node
+	for {
+		var doc yaml.Node
+		if err := decoder.Decode(&doc); err == io.EOF {
+			break
+		} else if err != nil {
+			return errors.New("invalid server configuration YAML")
+		}
+		documents = append(documents, &doc)
+	}
+	if len(documents) == 0 {
+		return nil
+	}
+	if len(documents) != 1 {
+		return errors.New("server configuration must contain one YAML document")
+	}
+	if err := documents[0].Decode(cfg); err != nil {
+		// Decoder errors may include raw scalar values, including secrets.
+		return errors.New("invalid server configuration YAML")
+	}
+	return nil
+}
+
+func LoadAuthToken(path string) (string, error) {
+	data, err := readConfigFile(expandHome(path), yamlContainsSecret)
+	if os.IsNotExist(err) {
+		return "", errors.New("client configuration file not found")
+	}
+	if err != nil {
+		return "", fmt.Errorf("client configuration: %w", errSecretFile)
+	}
+	var cfg Config
+	if err := decodeConfig(data, &cfg); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(cfg.Identity.AuthToken) == "" {
+		return "", errors.New("identity.auth_token is missing or empty in client configuration")
+	}
+	return cfg.Identity.AuthToken, nil
+}
+
 // Load reads configuration with priority: env vars > .env > config file > defaults.
 // Call LoadDotEnv before Load so .env values are visible as env vars.
 func Load() (Config, string, error) {
 	cfg := Config{
-		Region:      "cn-hangzhou",
-		SessionsDir: filepath.Join(homeDir(), ".data-agent", "sessions"),
-		STS:         STS{SessionExpiration: 3600},
+		Region:       "cn-hangzhou",
+		SessionsDir:  filepath.Join(homeDir(), ".data-agent", "sessions"),
+		STS:          STS{SessionExpiration: 3600},
+		Log:          Log{MaxBytes: DefaultLogMaxBytes},
+		AgentGateway: AgentGateway{RequestTimeoutSeconds: 30, MaxResponseBytes: 4194304},
+		HTTP:         DefaultHTTP(),
+		Identity:     Identity{MaxTenants: 128},
 	}
-
 	// 1. Config file (lowest priority). yaml.v3 also parses legacy JSON.
 	// A missing file is not an error (matches the previous JSON loader);
 	// unreadable or malformed files are.
 	path := configPath()
 	if path != "" {
-		data, err := os.ReadFile(path)
+		data, err := readConfigFile(path, yamlContainsSecret)
 		switch {
 		case os.IsNotExist(err):
 			path = ""
 		case err != nil:
-			return cfg, path, fmt.Errorf("read config %s: %w", path, err)
+			return cfg, path, fmt.Errorf("server configuration: %w", errSecretFile)
 		default:
-			if err := yaml.Unmarshal(data, &cfg); err != nil {
-				return cfg, path, fmt.Errorf("parse config %s: %w", path, err)
+			if err := decodeConfig(data, &cfg); err != nil {
+				return cfg, path, err
 			}
 			if cfg.Region == "" {
 				cfg.Region = "cn-hangzhou"
@@ -322,6 +385,9 @@ func Load() (Config, string, error) {
 	if v := os.Getenv("DATA_AGENT_ENDPOINT"); v != "" {
 		cfg.DataAgentEndpoint = v
 	}
+	if v := os.Getenv("DATA_AGENT_API_KEY"); v != "" {
+		cfg.APIKey = v
+	}
 	if v := os.Getenv("DATA_AGENT_API_KEY_ENDPOINT"); v != "" {
 		cfg.APIKeyEndpoint = v
 	}
@@ -336,9 +402,6 @@ func Load() (Config, string, error) {
 	}
 	if v := os.Getenv("DATA_AGENT_SESSIONS_DIR"); v != "" {
 		cfg.SessionsDir = v
-	}
-	if v := os.Getenv("DATA_AGENT_API_KEY"); v != "" {
-		cfg.APIKey = v
 	}
 	if v := os.Getenv("AILY_SHARED_SECRET"); v != "" {
 		cfg.Identity.AuthToken = v
@@ -364,17 +427,149 @@ func Load() (Config, string, error) {
 			}
 		}
 	}
+	if v := os.Getenv("DATA_AGENT_LOG"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "on":
+			cfg.Log.Enabled = true
+		case "0", "false", "off":
+			cfg.Log.Enabled = false
+		default:
+			return cfg, path, errors.New("DATA_AGENT_LOG must be 1/true/on or 0/false/off")
+		}
+	}
+	if v, ok := os.LookupEnv("DATA_AGENT_LOG_FILE"); ok {
+		cfg.Log.File = v
+	}
+	if v := os.Getenv("DATA_AGENT_LOG_MAX_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return cfg, path, errors.New("DATA_AGENT_LOG_MAX_BYTES must be a positive integer")
+		}
+		cfg.Log.MaxBytes = n
+	}
 	if v := os.Getenv("DATA_AGENT_LOG_REQUESTS"); v != "" {
 		cfg.Log.Requests = v
 	}
+	if v := os.Getenv("DATA_AGENT_PERF_LOG"); v != "" {
+		cfg.Log.Perf.Enabled = v != "0" && !strings.EqualFold(v, "false") && !strings.EqualFold(v, "off")
+	}
+	if v := os.Getenv("DATA_AGENT_PERF_LOG_FILE"); v != "" {
+		cfg.Log.Perf.File = v
+	}
+	if v := os.Getenv("DATA_AGENT_PERF_LOG_INTERVAL"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return cfg, path, errors.New("DATA_AGENT_PERF_LOG_INTERVAL must be a positive integer")
+		}
+		cfg.Log.Perf.IntervalSeconds = n
+	}
 
 	cfg.SessionsDir = expandHome(cfg.SessionsDir)
+	if cfg.Log.File == "" {
+		cfg.Log.File = filepath.Join(homeDir(), ".data-agent", "server.log")
+	}
+	cfg.Log.File = expandHome(cfg.Log.File)
+	if cfg.Log.MaxBytes <= 0 {
+		return cfg, path, errors.New("log.max_bytes must be a positive integer")
+	}
+	if cfg.Log.Perf.File == "" {
+		cfg.Log.Perf.File = filepath.Join(homeDir(), ".data-agent", "perf.log")
+	}
+	cfg.Log.Perf.File = expandHome(cfg.Log.Perf.File)
+	if cfg.Log.Perf.IntervalSeconds < 0 || cfg.Log.Perf.MaxBytes < 0 {
+		return cfg, path, errors.New("log.perf interval_seconds and max_bytes must not be negative")
+	}
+	if cfg.Log.Enabled && cfg.Log.Perf.Enabled {
+		if err := validateLogFiles(cfg.Log.File, cfg.Log.Perf.File); err != nil {
+			return cfg, path, err
+		}
+	}
 	cfg.ApplyDefaults()
+	// Load starts with defaults, so zero here is an explicitly invalid limit,
+	// not an absent setting. Do not silently replace it, even while disabled.
+	if cfg.AgentGateway.RequestTimeoutSeconds == 0 || cfg.AgentGateway.MaxResponseBytes == 0 {
+		return cfg, path, errors.New("agent_gateway limits must be positive")
+	}
 
-	if err := cfg.validate(); err != nil {
+	if err := cfg.HTTP.validate(); err != nil {
+		return cfg, path, err
+	}
+	if cfg.Identity.MaxTenants <= 0 {
+		return cfg, path, errors.New("identity.max_tenants must be positive")
+	}
+	if err := cfg.ValidateTransport(os.Getenv("MCP_TRANSPORT")); err != nil {
 		return cfg, path, err
 	}
 	return cfg, path, nil
+}
+
+func validateLogFiles(serverFile, perfFile string) error {
+	type logPath struct {
+		resolved string
+		info     os.FileInfo
+	}
+	var groups [2][]logPath
+	for group, file := range []string{serverFile, perfFile} {
+		paths := []string{file}
+		for i := 1; i < logging.RetainedFiles; i++ {
+			paths = append(paths, file+"."+strconv.Itoa(i))
+		}
+		entries, err := os.ReadDir(filepath.Dir(file))
+		if err != nil && !os.IsNotExist(err) {
+			return errors.New("invalid log file path")
+		}
+		for _, entry := range entries {
+			if logging.IsBackup(filepath.Base(file), entry.Name()) {
+				paths = append(paths, filepath.Join(filepath.Dir(file), entry.Name()))
+			}
+		}
+		for _, path := range paths {
+			resolved, err := resolveLogPath(path)
+			if err != nil {
+				return errors.New("invalid log file path")
+			}
+			info, err := os.Stat(path)
+			if err != nil && !os.IsNotExist(err) {
+				return errors.New("invalid log file path")
+			}
+			groups[group] = append(groups[group], logPath{resolved: resolved, info: info})
+		}
+	}
+	if logging.IsBackup(groups[0][0].resolved, groups[1][0].resolved) || logging.IsBackup(groups[1][0].resolved, groups[0][0].resolved) {
+		return errors.New("log.file and log.perf.file must not overlap, including rotation backups")
+	}
+	for _, server := range groups[0] {
+		for _, perf := range groups[1] {
+			if server.resolved == perf.resolved || (server.info != nil && perf.info != nil && os.SameFile(server.info, perf.info)) {
+				return errors.New("log.file and log.perf.file must not overlap, including rotation backups")
+			}
+		}
+	}
+	return nil
+}
+
+func resolveLogPath(path string) (string, error) {
+	var suffix string
+	for {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err == nil {
+			return filepath.Abs(filepath.Join(resolved, suffix))
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		// A dangling symlink could target a log created later during startup.
+		if _, statErr := os.Lstat(path); statErr == nil {
+			return "", err
+		}
+		// Resolve the existing ancestor even when the log directory is not created yet.
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", err
+		}
+		suffix = filepath.Join(filepath.Base(path), suffix)
+		path = parent
+	}
 }
 
 // ApplyDefaults merges the legacy "aily" alias section and fills
@@ -390,6 +585,9 @@ func (c *Config) ApplyDefaults() {
 		}
 	}
 	c.LegacyIdentity = nil
+	if c.Identity.Enabled && c.Identity.Namespace == "" {
+		c.Identity.Namespace = "default"
+	}
 	// Legacy "shared_secret" key feeds AuthToken unless auth_token/env is set.
 	if c.Identity.AuthToken == "" && c.Identity.LegacySharedSecret != "" {
 		c.Identity.AuthToken = c.Identity.LegacySharedSecret
@@ -440,40 +638,59 @@ func isValidSessionNameClaim(name string) bool {
 }
 
 func (c *Config) validate() error {
-	if c.Identity.Enabled {
-		if c.APIKey != "" {
-			return fmt.Errorf("identity multi-tenant mode requires AK/SK base credentials for STS AssumeRole; api_key auth is not supported")
+	if c.APIKey != "" && (c.Identity.Enabled || c.AgentGateway.Enabled) {
+		return errors.New("identity and agent_gateway require AK/STS credentials; API Key is supported only in local single-identity mode")
+	}
+	if c.Identity.Namespace != "" && !ValidNamespace(c.Identity.Namespace) {
+		return errors.New("invalid identity.namespace")
+	}
+	if c.Identity.MaxTenants < 0 {
+		return errors.New("identity.max_tenants must be positive")
+	}
+	if c.HTTP != (HTTP{}) {
+		if err := c.HTTP.validate(); err != nil {
+			return err
 		}
+	}
+	g := c.AgentGateway
+	if g.DataSourcesEnabled && !g.Enabled {
+		return errors.New("agent_gateway.data_sources_enabled requires agent_gateway.enabled")
+	}
+	if g.RequestTimeoutSeconds < 0 || int64(g.RequestTimeoutSeconds) > math.MaxInt64/int64(time.Second) ||
+		g.MaxResponseBytes < 0 || g.MaxResponseBytes == math.MaxInt64 {
+		return errors.New("agent_gateway limits must be positive and within supported bounds")
+	}
+	if g.Enabled {
+		if g.RequestTimeoutSeconds == 0 || g.MaxResponseBytes == 0 {
+			return errors.New("agent_gateway limits must be positive")
+		}
+		switch c.Region {
+		case "cn-shenzhen", "cn-beijing", "cn-shanghai", "cn-hongkong",
+			"ap-southeast-1", "cn-hangzhou", "us-west-1", "us-east-1":
+		default:
+			return errors.New("agent_gateway requires a region with a published official DMS endpoint")
+		}
+		if g.Endpoint != "dms."+c.Region+".aliyuncs.com" {
+			return errors.New("agent_gateway.endpoint must be the explicit official DMS host for the configured region")
+		}
+	}
+	if c.Identity.Enabled {
 		if (c.Identity.Default == nil || c.Identity.Default.RoleArn == "") && len(c.Identity.Groups) == 0 {
 			return fmt.Errorf("identity.enabled requires identity.default.role_arn or at least one identity.groups entry")
 		}
 		if c.Identity.JWT.Enabled && len(c.Identity.JWT.AllSecrets()) == 0 {
 			return fmt.Errorf("identity.jwt.enabled requires identity.jwt.secret or identity.jwt.secrets (or env IDENTITY_JWT_SECRET / IDENTITY_JWT_SECRETS)")
 		}
-		// A request without a JWT falls back to the forgeable identity headers,
-		// so auth_token is what keeps a caller from skipping the token to reach
-		// that path. Require it whenever identity mode is on.
+		// The platform token is required in both modes; JWT absence never
+		// changes the administrator-selected authentication mode.
 		if c.Identity.AuthToken == "" {
 			return fmt.Errorf("identity.enabled requires identity.auth_token (or env IDENTITY_AUTH_TOKEN) to authenticate the upstream; the identity headers are otherwise forgeable")
 		}
 		if !isValidSessionNameClaim(c.Identity.SessionNameClaim) {
-			return fmt.Errorf("identity.session_name_claim %q is not one of %s",
-				c.Identity.SessionNameClaim, strings.Join(validSessionNameClaims, ", "))
+			return errors.New("invalid identity.session_name_claim; select a supported identity field")
 		}
-		seen := map[string]string{}
-		for name, g := range c.Identity.Groups {
-			if g.RoleArn == "" {
-				return fmt.Errorf("identity.groups.%s: role_arn is required", name)
-			}
-			if len(g.Users) == 0 {
-				return fmt.Errorf("identity.groups.%s: users is required (use identity.default for the catch-all group)", name)
-			}
-			for _, u := range g.Users {
-				if prev, dup := seen[u]; dup {
-					return fmt.Errorf("identity user %q belongs to both group %q and %q; a user may belong to exactly one group", u, prev, name)
-				}
-				seen[u] = name
-			}
+		if err := c.validateScopes(); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -485,24 +702,6 @@ func (c *Config) STSEndpoint() string {
 		return c.STS.Endpoint
 	}
 	return fmt.Sprintf("sts.%s.aliyuncs.com", c.Region)
-}
-
-// ResolveGroup maps an upstream user id/email to its group configuration.
-// Named-group membership (matched by user id or email) wins over the global
-// default group. Returns the group name ("default" for the catch-all) or an
-// error when nothing matches (fail-closed).
-func (c *Config) ResolveGroup(userID, email string) (string, IdentityGroup, error) {
-	for name, g := range c.Identity.Groups {
-		for _, u := range g.Users {
-			if (userID != "" && u == userID) || (email != "" && u == email) {
-				return name, g, nil
-			}
-		}
-	}
-	if c.Identity.Default != nil && c.Identity.Default.RoleArn != "" {
-		return "default", *c.Identity.Default, nil
-	}
-	return "", IdentityGroup{}, fmt.Errorf("no identity group for user %q (email %q) and no identity.default configured", userID, email)
 }
 
 func expandHome(p string) string {

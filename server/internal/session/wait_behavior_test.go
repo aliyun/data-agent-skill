@@ -38,7 +38,7 @@ func newWaitTestManager(t *testing.T) (*Manager, *State) {
 		Status:    StatusRunning,
 		changed:   make(chan struct{}),
 	}
-	m := NewManager(nil, t.TempDir())
+	m := testManager(t, nil, t.TempDir())
 	m.watchers["s1"] = &watcherEntry{state: state, cancel: func() {}}
 	return m, state
 }
@@ -281,9 +281,9 @@ func TestSendMessageOnFinishedSessionTakesRevivePath(t *testing.T) {
 		Status:    StatusCompleted, // terminal → watcher goroutine has exited
 		changed:   make(chan struct{}),
 	}
-	m := NewManager(nil, t.TempDir())
+	m := testManager(t, nil, t.TempDir())
 	m.watchers["s1"] = &watcherEntry{
-		watcher: NewWatcher(state, nil, m.sessDir),
+		watcher: newWatcher(state, nil, m.store),
 		state:   state,
 		cancel:  func() {},
 	}

@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	credential "github.com/aliyun/credentials-go/credentials"
 
 	"github.com/alibabacloud/data-agent-mcp-server/internal/config"
-	"github.com/alibabacloud/data-agent-mcp-server/internal/dataagent"
 )
 
 const testAuthToken = "upstream-secret"
@@ -39,19 +39,41 @@ func jwtRegistry(t *testing.T, sessionClaim string, groups map[string]config.Ide
 func identityRegistry(t *testing.T, id config.Identity) (*Registry, *[]string) {
 	t.Helper()
 
-	cfg := config.Config{Region: "cn-hangzhou", Identity: id}
+	id.Namespace = "test-domain"
+	id.RequireIdentity = true
+	id.MaxTenants = 128
+	if id.JWT.Enabled {
+		if id.Default != nil {
+			id.Default.TenantID = bigTenantID
+			id.Default.AgentID = "agent_abc"
+		}
+		for name, g := range id.Groups {
+			g.TenantID = bigTenantID
+			g.AgentID = "agent_abc"
+			id.Groups[name] = g
+		}
+	}
+	cfg := config.Config{Region: "cn-hangzhou", SessionsDir: t.TempDir(), Identity: id, HTTP: config.DefaultHTTP()}
 	cfg.ApplyDefaults()
 	if err := cfgValidate(t, &cfg); err != nil {
 		t.Fatalf("config invalid: %v", err)
 	}
 
-	r := NewRegistry(context.Background(), cfg, &dataagent.Credential{
-		AccessKeyID: "ak", AccessKeySecret: "sk",
+	baseCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	r := NewRegistry(baseCtx, cfg, &fakeProvider{})
+	t.Cleanup(func() {
+		if err := r.Close(); err != nil {
+			t.Error(err)
+		}
 	})
 
 	var asked []string
+	var askedMu sync.Mutex
 	r.newProviderFn = func(sessionValue, roleArn string) (credential.Credential, error) {
+		askedMu.Lock()
 		asked = append(asked, sessionName(cfg.Identity.Prefix(), sessionValue))
+		askedMu.Unlock()
 		// A static credential keeps currentCredential from calling STS.
 		return credential.NewCredential(new(credential.Config).
 			SetType("access_key").SetAccessKeyId("ak").SetAccessKeySecret("sk"))
@@ -72,9 +94,94 @@ func cfgValidate(t *testing.T, c *config.Config) error {
 
 func jwtCtx(t *testing.T, claims map[string]any) context.Context {
 	t.Helper()
-	token := signToken(t, testSecret, claims, time.Now().Add(time.Hour))
+	scoped := map[string]any{"tenant_id": bigTenantID, "agent_id": "agent_abc"}
+	for k, v := range claims {
+		scoped[k] = v
+	}
+	token := signToken(t, testSecret, scoped, time.Now().Add(time.Hour))
 	// auth_token now guards every request, so carry it alongside the JWT.
 	return WithIdentity(WithJWT(context.Background(), token), "", "", testAuthToken)
+}
+
+func TestLegacyAuthenticationMatrix(t *testing.T) {
+	fields := map[string]any{"user_id": "signed-user", "email": "signed@example.com"}
+	valid := signToken(t, testSecret, fields, time.Now().Add(time.Hour))
+	for _, tc := range []struct {
+		name        string
+		user        string
+		email       string
+		token       string
+		hasJWT      bool
+		jwt         string
+		wantMode    string
+		wantSession string
+	}{
+		{name: "Header user fallback", user: "header-user", token: testAuthToken, wantMode: "headers", wantSession: "header-user"},
+		{name: "Header email", email: "header@example.com", token: testAuthToken, wantMode: "headers", wantSession: "header@example.com"},
+		{name: "Header both", user: "header-user", email: "header@example.com", token: testAuthToken, wantMode: "headers", wantSession: "header@example.com"},
+		{name: "JWT without scopes", token: testAuthToken, hasJWT: true, jwt: valid, wantMode: "jwt", wantSession: "signed@example.com"},
+		{name: "signed identity wins", user: "other-user", email: "other@example.com", token: testAuthToken, hasJWT: true, jwt: valid, wantMode: "jwt", wantSession: "signed@example.com"},
+		{name: "missing identity", token: testAuthToken},
+		{name: "missing platform token", user: "header-user"},
+		{name: "wrong platform token", user: "header-user", token: "wrong"},
+		{name: "JWT missing platform token", hasJWT: true, jwt: valid},
+		{name: "JWT wrong platform token", token: "wrong", hasJWT: true, jwt: valid},
+		{name: "empty JWT", user: "header-user", token: testAuthToken, hasJWT: true},
+		{name: "blank JWT", user: "header-user", token: testAuthToken, hasJWT: true, jwt: "   "},
+		{name: "invalid JWT", user: "header-user", token: testAuthToken, hasJWT: true, jwt: "invalid"},
+		{name: "wrong signature", user: "header-user", token: testAuthToken, hasJWT: true, jwt: signToken(t, "wrong-key", fields, time.Now().Add(time.Hour))},
+		{name: "expired JWT", user: "header-user", token: testAuthToken, hasJWT: true, jwt: signToken(t, testSecret, fields, time.Now().Add(-time.Hour))},
+		{name: "missing expiry", user: "header-user", token: testAuthToken, hasJWT: true, jwt: signToken(t, testSecret, fields, time.Time{})},
+		{name: "JWT missing selected email", user: "header-user", email: "header@example.com", token: testAuthToken, hasJWT: true, jwt: signToken(t, testSecret, map[string]any{"user_id": "signed-user"}, time.Now().Add(time.Hour))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Config{SessionsDir: t.TempDir(), HTTP: config.DefaultHTTP(), Identity: config.Identity{
+				Enabled: true, RequireIdentity: true, AuthToken: testAuthToken, MaxTenants: 128,
+				SessionNameClaim: "email", SessionNamePrefix: new(string),
+				JWT:     config.JWT{Enabled: true, Secret: testSecret},
+				Default: &config.IdentityGroup{RoleArn: "shared-role"},
+			}}
+			cfg.ApplyDefaults()
+			if err := cfg.ValidateTransport("streamable-http"); err != nil {
+				t.Fatal(err)
+			}
+			r := NewRegistry(context.Background(), cfg, fakeProvider{})
+			t.Cleanup(func() { _ = r.Close() })
+			var asked string
+			r.newProviderFn = func(value, role string) (credential.Credential, error) {
+				asked = value
+				if role != "shared-role" {
+					t.Error("unexpected role mapping")
+				}
+				return fakeProvider{}, nil
+			}
+			ctx := WithIdentity(context.Background(), tc.user, tc.email, tc.token)
+			if tc.hasJWT {
+				ctx = WithJWT(ctx, tc.jwt)
+			}
+			verified, err := r.Authenticate(ctx)
+			if asked != "" {
+				t.Fatal("authentication initialized credentials")
+			}
+			if tc.wantMode == "" {
+				if verified != nil || !IsAuthenticationError(err) {
+					t.Fatalf("expected authentication rejection: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			principal := PrincipalFromContext(verified)
+			if principal.AuthMode != tc.wantMode || principal.TenantID != "" || principal.AgentID != "" || principal.ExpiresAt.IsZero() != (tc.wantMode == "headers") {
+				t.Fatal("unexpected legacy principal")
+			}
+			ten, err := r.Resolve(verified)
+			if err != nil || ten == nil || asked != tc.wantSession || ten.roleSessionName != tc.wantSession {
+				t.Fatalf("legacy role session name mismatch: %v", err)
+			}
+		})
+	}
 }
 
 // The claim named by identity.session_name_claim is what ends up in the
@@ -92,7 +199,7 @@ func TestResolveSessionNameFollowsConfiguredClaim(t *testing.T) {
 		t.Run(tc.claim, func(t *testing.T) {
 			r, asked := jwtRegistry(t, tc.claim, nil)
 
-			if _, err := r.Resolve(jwtCtx(t, ailyClaims())); err != nil {
+			if _, err := resolveAuthenticated(r, jwtCtx(t, ailyClaims())); err != nil {
 				t.Fatalf("Resolve: %v", err)
 			}
 			if len(*asked) != 1 {
@@ -117,7 +224,7 @@ func TestResolveGroupMatchingIndependentOfSessionNameClaim(t *testing.T) {
 	}
 	r, asked := jwtRegistry(t, "employee_no", groups)
 
-	tn, err := r.Resolve(jwtCtx(t, ailyClaims()))
+	tn, err := resolveAuthenticated(r, jwtCtx(t, ailyClaims()))
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -131,7 +238,7 @@ func TestResolveGroupMatchingIndependentOfSessionNameClaim(t *testing.T) {
 		t.Errorf("mode = %q, want pro", tn.Defaults.Mode)
 	}
 	// Isolation still keys on the user id...
-	if tn.Key != bigUserID {
+	if tn.Key != expectedPrincipalID(r, bigUserID, "") {
 		t.Errorf("tenant key = %q, want %q", tn.Key, bigUserID)
 	}
 	// ...while the audited session name uses the configured claim.
@@ -147,12 +254,12 @@ func TestResolveAuthTokenGuardsBothPaths(t *testing.T) {
 
 	// JWT path: valid token but wrong auth_token.
 	badAuth := WithIdentity(jwtCtx(t, ailyClaims()), "", "", "wrong")
-	if _, err := r.Resolve(badAuth); err == nil {
+	if _, err := resolveAuthenticated(r, badAuth); err == nil {
 		t.Error("valid JWT was accepted with a wrong auth_token")
 	}
 	// Header path: headers present but wrong auth_token.
 	badAuthHdr := WithIdentity(context.Background(), "ou_alice", "", "wrong")
-	if _, err := r.Resolve(badAuthHdr); err == nil {
+	if _, err := resolveAuthenticated(r, badAuthHdr); err == nil {
 		t.Error("headers were accepted with a wrong auth_token")
 	}
 	if len(*asked) != 0 {
@@ -172,7 +279,7 @@ func TestResolveRejectsUnverifiableTokenNoDowngrade(t *testing.T) {
 	} {
 		// Correct auth_token plus forged headers: a downgrade would succeed.
 		ctx := WithIdentity(WithJWT(context.Background(), raw), bigUserID, "u@example.com", testAuthToken)
-		if _, err := r.Resolve(ctx); err == nil {
+		if _, err := resolveAuthenticated(r, ctx); err == nil {
 			t.Errorf("%s: broken token was accepted", name)
 		}
 	}
@@ -181,25 +288,20 @@ func TestResolveRejectsUnverifiableTokenNoDowngrade(t *testing.T) {
 	}
 }
 
-// With no token the request falls back to the header identity, so an upstream
-// that has not turned on JWT signing keeps working.
-func TestResolveFallsBackToHeadersWhenTokenAbsent(t *testing.T) {
+func TestResolveScopedMappingRejectsHeadersWhenJWTAbsent(t *testing.T) {
 	r, asked := jwtRegistry(t, "user_id", nil)
 
 	for name, ctx := range map[string]context.Context{
 		"no token":    WithIdentity(context.Background(), "ou_alice", "a@example.com", testAuthToken),
 		"empty token": WithIdentity(WithJWT(context.Background(), ""), "ou_alice", "a@example.com", testAuthToken),
 	} {
-		tn, err := r.Resolve(ctx)
-		if err != nil {
-			t.Fatalf("%s: unexpected rejection: %v", name, err)
-		}
-		if tn == nil || tn.Key != "ou_alice" {
-			t.Errorf("%s: tenant = %+v, want key ou_alice", name, tn)
+		tn, err := resolveAuthenticated(r, ctx)
+		if err == nil || tn != nil {
+			t.Fatalf("%s: missing JWT accepted", name)
 		}
 	}
-	if len(*asked) == 0 || (*asked)[0] != "aily-ou_alice" {
-		t.Errorf("RoleSessionName = %v, want aily-ou_alice", *asked)
+	if len(*asked) != 0 {
+		t.Fatal("rejected request initialized provider")
 	}
 }
 
@@ -208,11 +310,11 @@ func TestResolveIgnoresHeadersWhenJWTEnabled(t *testing.T) {
 	r, asked := jwtRegistry(t, "user_id", nil)
 
 	ctx := WithIdentity(jwtCtx(t, ailyClaims()), "ou_attacker", "attacker@example.com", testAuthToken)
-	tn, err := r.Resolve(ctx)
+	tn, err := resolveAuthenticated(r, ctx)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if tn.Key != bigUserID {
+	if tn.Key != expectedPrincipalID(r, bigUserID, "") {
 		t.Errorf("tenant key = %q, want the token's user %q", tn.Key, bigUserID)
 	}
 	if (*asked)[0] != "aily-"+bigUserID {
@@ -241,7 +343,8 @@ func TestResolveSessionNameClaimOnHeaderPath(t *testing.T) {
 				Default:          &config.IdentityGroup{RoleArn: "acs:ram::123:role/da-default"},
 			})
 			ctx := WithIdentity(context.Background(), "ou_alice", "alice@example.com", testAuthToken)
-			if _, err := r.Resolve(ctx); err != nil {
+			_, err := resolveAuthenticated(r, ctx)
+			if err != nil {
 				t.Fatalf("Resolve: %v", err)
 			}
 			if (*asked)[0] != tc.want {
@@ -259,12 +362,12 @@ func TestResolveRejectsEmptySessionNameClaim(t *testing.T) {
 	claims := ailyClaims()
 	claims["enterprise_email"] = "" // the doc notes this is often unset
 
-	_, err := r.Resolve(jwtCtx(t, claims))
+	_, err := resolveAuthenticated(r, jwtCtx(t, claims))
 	if err == nil {
 		t.Fatal("expected rejection when the selected claim is empty")
 	}
-	if !strings.Contains(err.Error(), "enterprise_email") {
-		t.Errorf("error should name the offending claim: %v", err)
+	if !IsAuthenticationError(err) {
+		t.Errorf("expected safe authentication category: %v", err)
 	}
 }
 
@@ -276,7 +379,7 @@ func TestResolveSanitizesSessionName(t *testing.T) {
 	claims := ailyClaims()
 	claims["employee_no"] = "emp/00 1#" + strings.Repeat("x", 80)
 
-	if _, err := r.Resolve(jwtCtx(t, claims)); err != nil {
+	if _, err := resolveAuthenticated(r, jwtCtx(t, claims)); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
 	got := (*asked)[0]
@@ -298,7 +401,7 @@ func TestResolveSessionNameKeepsIDPrecision(t *testing.T) {
 		"user_id": json.Number(bigUserID),
 		"email":   "user@example.com",
 	}
-	if _, err := r.Resolve(jwtCtx(t, claims)); err != nil {
+	if _, err := resolveAuthenticated(r, jwtCtx(t, claims)); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
 	if want := "aily-" + bigUserID; (*asked)[0] != want {
@@ -328,7 +431,7 @@ func TestResolveRoleSessionNamePrefixVariants(t *testing.T) {
 				Default:           &config.IdentityGroup{RoleArn: "acs:ram::123:role/da-default"},
 			})
 			ctx := WithIdentity(context.Background(), "ou_alice", "", testAuthToken)
-			if _, err := r.Resolve(ctx); err != nil {
+			if _, err := resolveAuthenticated(r, ctx); err != nil {
 				t.Fatalf("Resolve: %v", err)
 			}
 			if len(*asked) == 0 || (*asked)[0] != tc.want {

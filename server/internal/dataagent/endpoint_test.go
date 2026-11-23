@@ -2,8 +2,8 @@ package dataagent
 
 import "testing"
 
-// The client talks to four different hosts; each must fall back to the
-// region-derived default and honour an explicit override.
+// The signed API hosts must fall back to region-derived defaults and honour
+// explicit overrides.
 
 func TestDataAgentEndpoint(t *testing.T) {
 	c := NewClient(&Credential{}, "cn-shanghai")
@@ -25,51 +25,53 @@ func TestDataAgentEndpoint(t *testing.T) {
 }
 
 func TestAPIKeyEndpoints(t *testing.T) {
-	c := NewClient(&Credential{}, "cn-shanghai")
-	if got, want := c.APIKeyEndpoint(), "dataagent-cn-shanghai.aliyuncs.com"; got != want {
-		t.Errorf("default api key endpoint = %q, want %q", got, want)
+	for _, region := range []string{"cn-shanghai", "ap-southeast-1"} {
+		for _, opts := range [][]ClientOption{nil, {WithAPIKeyEndpoint(""), WithAPIKeyStreamEndpoint("")}} {
+			c := NewClient(&Credential{APIKey: "synthetic-api-key"}, region, opts...)
+			if c.APIKeyEndpoint() != "dataagent-"+region+".aliyuncs.com" ||
+				c.APIKeyStreamEndpoint() != "dataagent-stream-"+region+".aliyuncs.com" || c.sse.streamEndpoint != c.APIKeyStreamEndpoint() {
+				t.Fatal("API Key default endpoints or SSE propagation changed")
+			}
+		}
 	}
-	if got, want := c.APIKeyStreamEndpoint(), "dataagent-stream-cn-shanghai.aliyuncs.com"; got != want {
-		t.Errorf("default api key stream endpoint = %q, want %q", got, want)
+	c := NewClient(&Credential{}, "cn-shanghai", WithDataAgentEndpoint("signed.example.invalid"),
+		WithAPIKeyEndpoint("control.example.invalid"), WithAPIKeyStreamEndpoint("stream.example.invalid"))
+	if c.APIKeyEndpoint() != "control.example.invalid" || c.APIKeyStreamEndpoint() != "stream.example.invalid" ||
+		c.sse.streamEndpoint != "stream.example.invalid" || c.sse.endpoint != "signed.example.invalid" {
+		t.Fatal("independent endpoint overrides were not propagated")
 	}
+	sse := NewSSEClient(&Credential{}, "cn-shanghai")
+	if sse.streamEndpoint != "dataagent-stream-cn-shanghai.aliyuncs.com" || sse.region != "cn-shanghai" {
+		t.Fatal("standalone SSE defaults changed")
+	}
+}
 
-	const (
-		ctrl   = "dataagent-internal.example.com"
-		stream = "dataagent-stream-internal.example.com"
-	)
-	c = NewClient(&Credential{}, "cn-shanghai",
-		WithAPIKeyEndpoint(ctrl), WithAPIKeyStreamEndpoint(stream))
-	if got := c.APIKeyEndpoint(); got != ctrl {
-		t.Errorf("overridden api key endpoint = %q, want %q", got, ctrl)
-	}
-	if got := c.APIKeyStreamEndpoint(); got != stream {
-		t.Errorf("overridden api key stream endpoint = %q, want %q", got, stream)
+func TestCredentialIsAPIKey(t *testing.T) {
+	for _, tc := range []struct {
+		cred *Credential
+		want bool
+	}{
+		{nil, false}, {&Credential{}, false}, {&Credential{AccessKeyID: "ak", AccessKeySecret: "sk"}, false},
+		{&Credential{APIKey: "key"}, true}, {&Credential{APIKey: "key", AccessKeyID: "ak", AccessKeySecret: "sk"}, true},
+	} {
+		if tc.cred.IsAPIKey() != tc.want {
+			t.Fatal("incorrect authentication selection")
+		}
 	}
 }
 
 // The SSE client builds its own requests, so it must inherit the endpoint
-// overrides instead of deriving hosts from the region on its own.
+// override instead of deriving its host from the region on its own.
 func TestSSEClientInheritsEndpointOverrides(t *testing.T) {
-	const (
-		signed = "dms-vpc.cn-shanghai.aliyuncs.com"
-		stream = "dataagent-stream-internal.example.com"
-	)
-	c := NewClient(&Credential{}, "cn-shanghai",
-		WithDataAgentEndpoint(signed), WithAPIKeyStreamEndpoint(stream))
-
+	const signed = "dms-vpc.cn-shanghai.aliyuncs.com"
+	c := NewClient(&Credential{}, "cn-shanghai", WithDataAgentEndpoint(signed))
 	if got := c.sse.endpoint; got != signed {
 		t.Errorf("sse signed endpoint = %q, want %q", got, signed)
 	}
-	if got := c.sse.streamEndpoint; got != stream {
-		t.Errorf("sse stream endpoint = %q, want %q", got, stream)
-	}
 
-	// Without overrides the SSE client keeps the region defaults.
+	// Without overrides the SSE client keeps the region default.
 	c = NewClient(&Credential{}, "cn-shanghai")
 	if got, want := c.sse.endpoint, "dms.cn-shanghai.aliyuncs.com"; got != want {
 		t.Errorf("sse default signed endpoint = %q, want %q", got, want)
-	}
-	if got, want := c.sse.streamEndpoint, "dataagent-stream-cn-shanghai.aliyuncs.com"; got != want {
-		t.Errorf("sse default stream endpoint = %q, want %q", got, want)
 	}
 }

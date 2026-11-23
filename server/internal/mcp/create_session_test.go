@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -50,6 +52,97 @@ func newCreateServer(groupAgent, serverAgent string) *Server {
 		mgr:           &captureManager{},
 		defaults:      SessionDefaults{CustomAgentID: groupAgent},
 		customAgentID: serverAgent,
+	}
+}
+
+func TestCreateSessionWorkMode(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		value    any
+		supplied bool
+		want     string
+		invalid  bool
+	}{
+		{"omitted", nil, false, "", false},
+		{"empty", "", true, "", false},
+		{"blank", "  ", true, "", false},
+		{"chat", "CHAT", true, "CHAT", false},
+		{"analysis", "ANALYSIS", true, "ANALYSIS", false},
+		{"normalized", " chat ", true, "CHAT", false},
+		{"invalid enum", "synthetic-private-value", true, "", true},
+		{"tier is not work mode", "pro", true, "", true},
+		{"number", 1, true, "", true},
+		{"boolean", false, true, "", true},
+		{"null", nil, true, "", true},
+		{"array", []any{"CHAT"}, true, "", true},
+		{"object", map[string]any{"value": "CHAT"}, true, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := map[string]any{"query": "synthetic query", "custom_agent_id": "custom-agent", "mode": "lite", "plan_mode": "force"}
+			if tc.supplied {
+				args["work_mode"] = tc.value
+			}
+			errText, opts, called := callCreate(t, newCreateServer("", ""), args)
+			if tc.invalid {
+				if called || !strings.Contains(errText, "work_mode") || strings.Contains(errText, "synthetic-private-value") {
+					t.Fatalf("invalid work_mode must be rejected without dispatch or value disclosure: %q", errText)
+				}
+				return
+			}
+			if errText != "" || !called || opts.WorkMode != tc.want {
+				t.Fatalf("work_mode=%q want=%q called=%t error=%q", opts.WorkMode, tc.want, called, errText)
+			}
+			if opts.Mode != "lite" || opts.PlanMode != "force" || !opts.AutoConfirm {
+				t.Fatal("work_mode changed the tier, plan mode or auto confirmation")
+			}
+		})
+	}
+	for _, source := range []map[string]any{
+		{"database_id": "db", "db_name": "synthetic_db", "tables": "synthetic_table"},
+		{"file_id": "file", "file_name": "synthetic.csv"},
+	} {
+		source["query"], source["work_mode"], source["auto_confirm"] = "synthetic query", "CHAT", false
+		errText, opts, called := callCreate(t, newCreateServer("", ""), source)
+		if errText != "" || !called || opts.WorkMode != "CHAT" || opts.AutoConfirm {
+			t.Fatalf("work_mode not preserved for data source: %q", errText)
+		}
+	}
+}
+
+func TestCreateSessionWorkModeSchema(t *testing.T) {
+	data, err := json.Marshal(createSessionTool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tool struct {
+		InputSchema struct {
+			Properties map[string]struct {
+				Type        string   `json:"type"`
+				Enum        []string `json:"enum"`
+				Description string   `json:"description"`
+			} `json:"properties"`
+			Required []string `json:"required"`
+		} `json:"inputSchema"`
+	}
+	if err := json.Unmarshal(data, &tool); err != nil {
+		t.Fatal(err)
+	}
+	property, ok := tool.InputSchema.Properties["work_mode"]
+	if !ok || property.Type != "string" || !reflect.DeepEqual(property.Enum, []string{"ANALYSIS", "CHAT"}) {
+		t.Fatal("work_mode enum is not exposed in the creation schema")
+	}
+	for _, required := range tool.InputSchema.Required {
+		if required == "work_mode" {
+			t.Fatal("work_mode must remain optional")
+		}
+	}
+	for _, instruction := range []string{"CHAT", "more interaction", "first", "SessionConfig.WorkMode", "auto_confirm"} {
+		if !strings.Contains(property.Description, instruction) {
+			t.Fatalf("work_mode description missing %q", instruction)
+		}
+	}
+	if _, ok := sendTool.InputSchema.Properties["work_mode"]; ok {
+		t.Fatal("follow-up tool must not advertise a WorkMode switch ignored by the upstream")
 	}
 }
 
