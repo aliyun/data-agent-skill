@@ -198,6 +198,39 @@ class ConfigResolution(HermeticEnv):
         finally:
             os.unlink(path)
 
+    def test_credentials_file_custom_headers_normalized(self):
+        data = {"env1": {"prof1": {
+            "custom_headers": {f" {HEADER_NAME} ": " tok-file ", "X-Blank": "  ", "X-Num": 7},
+            "action_endpoints": {"SendChatMessage": "send.test/send"},
+        }}}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            path = f.name
+        try:
+            cfg = DataAgentConfig.from_dict(
+                dict(credentials_file=path, credentials_env="env1", credentials_profile="prof1")
+            )
+            self.assertEqual(cfg.custom_headers, {HEADER_NAME: "tok-file", "X-Num": "7"})
+        finally:
+            os.unlink(path)
+
+    def test_credentials_file_all_blank_headers_rejected(self):
+        data = {"env1": {"prof1": {
+            "custom_headers": {"X-Blank": "   "},
+            "action_endpoints": {"SendChatMessage": "send.test/send"},
+        }}}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            path = f.name
+        try:
+            with self.assertRaises(ConfigurationError) as ctx:
+                DataAgentConfig.from_dict(
+                    dict(credentials_file=path, credentials_env="env1", credentials_profile="prof1")
+                )
+            self.assertIn("access_key_id", str(ctx.exception))
+        finally:
+            os.unlink(path)
+
     def test_credentials_file_empty_entry_rejected(self):
         data = {"env1": {"prof1": {"note": "nothing"}}}
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
@@ -313,11 +346,14 @@ class CustomHeaderProfile(HermeticEnv):
         self.assertEqual(resp["data"]["status"], "SENT")
         self.assertEqual(resp["requestId"], "REQ-1")
 
-    def test_dms_unit_resolution_skipped(self):
+    def test_dms_unit_never_on_wire(self):
         with mock.patch.object(
-            DataAgentClient, "_resolve_dms_unit", side_effect=AssertionError("must not be called")
-        ), mock.patch("data_agent.client.requests.post", return_value=ok_response(SUCCESS_ENVELOPE)):
+            DataAgentClient, "_resolve_dms_unit", return_value="cn-hangzhou"
+        ), mock.patch("data_agent.client.requests.post", return_value=ok_response(SUCCESS_ENVELOPE)) as post:
             self.client.send_message(message="hello", session_id="s-1")
+        body = post.call_args.kwargs["json"]
+        self.assertNotIn("dmsUnit", body)
+        self.assertNotIn("DMSUnit", body)
 
     def test_pending_is_success(self):
         envelope = json.loads(json.dumps(SUCCESS_ENVELOPE))

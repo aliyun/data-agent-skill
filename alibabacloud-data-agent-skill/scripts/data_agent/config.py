@@ -28,6 +28,15 @@ def _none_if_blank(value: Optional[str]) -> Optional[str]:
     return value or None
 
 
+def _normalize_custom_headers(headers: dict) -> Optional[dict]:
+    """Coerce header names/values to stripped strings, drop blanks."""
+    return {
+        str(name).strip(): str(value).strip()
+        for name, value in headers.items()
+        if _none_if_blank(name) and _none_if_blank(value)
+    } or None
+
+
 def _load_credentials_entry(
     credentials_file: Optional[str],
     env_name: str,
@@ -188,11 +197,7 @@ class DataAgentConfig:
                 raise ConfigurationError(
                     "custom_headers must be a mapping of header name to value."
                 )
-            self.custom_headers = {
-                str(name).strip(): str(value).strip()
-                for name, value in self.custom_headers.items()
-                if _none_if_blank(name) and _none_if_blank(value)
-            } or None
+            self.custom_headers = _normalize_custom_headers(self.custom_headers)
 
         # Resolve the credentials-file entry before endpoint derivation: an
         # entry carrying "api_key" switches this config into API_KEY mode.
@@ -210,9 +215,13 @@ class DataAgentConfig:
         )
         if not self.api_key and entry_api_key:
             self.api_key = entry_api_key
-        entry_custom_headers = (self._credentials_entry or {}).get("custom_headers")
-        if not self.custom_headers and isinstance(entry_custom_headers, dict) and entry_custom_headers:
-            self.custom_headers = dict(entry_custom_headers)
+        raw_entry_headers = (self._credentials_entry or {}).get("custom_headers")
+        entry_custom_headers = (
+            _normalize_custom_headers(raw_entry_headers)
+            if isinstance(raw_entry_headers, dict) else None
+        )
+        if not self.custom_headers and entry_custom_headers:
+            self.custom_headers = entry_custom_headers
         if self._credentials_entry and not entry_api_key and not entry_custom_headers:
             for required in ("access_key_id", "access_key_secret"):
                 if not _none_if_blank(self._credentials_entry.get(required)):

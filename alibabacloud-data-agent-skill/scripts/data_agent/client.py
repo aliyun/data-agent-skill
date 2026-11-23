@@ -1028,10 +1028,9 @@ class DataAgentClient:
             params["AgentId"] = agent_id
         if session_id:
             params["SessionId"] = session_id
-        if self._auth_type != "custom_headers":
-            dms_unit = self._resolve_dms_unit()
-            if dms_unit:
-                params["DMSUnit"] = dms_unit
+        dms_unit = self._resolve_dms_unit()
+        if dms_unit:
+            params["DMSUnit"] = dms_unit
         if workspace_id:
             params["WorkspaceId"] = workspace_id
 
