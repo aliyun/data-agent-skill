@@ -96,7 +96,7 @@ Neither → **FAIL**. metrics.jsonl is an exception channel (see the data-source
 
 ### R2 Web field linkage
 
-Every non-reserved top-level field of `schema.json` (excluding `metrics`) must carry a source objective mark in `fill_guide.md` (unified mark `Source: objective_N/G<id>`; Chinese packages may write `来源：objective_N/G<id>`). The validator extracts the marks and checks the referenced objective file and gate id exist:
+Every non-reserved top-level field of `schema.json` (excluding the engineering reserved key `__jarvis_metrics__`; a declared `metrics` is an LLM-filled field and counts as ordinary) must carry a source objective mark in `fill_guide.md` (unified mark `Source: objective_N/G<id>`; Chinese packages may write `来源：objective_N/G<id>`). The validator extracts the marks and checks the referenced objective file and gate id exist:
 
 - a field without a source mark in fill_guide.md → **WARN**;
 - a mark pointing to a nonexistent objective/gate → **FAIL**.

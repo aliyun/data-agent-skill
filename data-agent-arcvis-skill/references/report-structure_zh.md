@@ -94,7 +94,7 @@ gates:
 
 ### R2 网页字段联动
 
-`schema.json` 每个非保留顶层字段（排除 `metrics`）必须在 `fill_guide.md` 中标注来源 objective（统一记号 `来源：objective_N/G<id>`）。校验脚本正则提取记号并校验被引用的 objective 文件与 gate id 真实存在：
+`schema.json` 每个非保留顶层字段（排除工程保留键 `__jarvis_metrics__`；声明的 `metrics` 属 LLM 填充字段，按普通字段对待）必须在 `fill_guide.md` 中标注来源 objective（统一记号 `来源：objective_N/G<id>`）。校验脚本正则提取记号并校验被引用的 objective 文件与 gate id 真实存在：
 
 - 字段在 fill_guide.md 中无来源标注 → **WARN**；
 - 标注指向不存在的 objective/gate → **FAIL**。

@@ -20,7 +20,8 @@ except ImportError:  # Python < 3.11 兜底：降级为正则提取关键键
 
 PLACEHOLDER = "__REPORT_DATA__"
 RT_DATA = "__RT_DATA__"
-RESERVED_DATA_KEY = "metrics"
+ENGINE_METRICS_KEY = "__jarvis_metrics__"
+LEGACY_METRICS_KEY = "metrics"
 
 # <jarvis-metric name="..."> 引用（运行期由工程渲染，与平台模板实体解析器保持一致）
 METRIC_REF_RE = re.compile(r"<jarvis-metric[^>]*\bname=\"([^\"]+)\"")
@@ -37,6 +38,14 @@ results: list[str] = []
 
 def report(level: str, msg: str) -> None:
     results.append(f"[{level}] {msg}")
+
+
+def engineering_keys(schema: dict) -> set[str]:
+    """工程注入键：新键恒注入；旧键 metrics 仅在 schema 未声明时双写（声明则归 LLM 填充）。"""
+    keys = {ENGINE_METRICS_KEY}
+    if LEGACY_METRICS_KEY not in (schema.get("properties") or {}):
+        keys.add(LEGACY_METRICS_KEY)
+    return keys
 
 
 def parse_manifest(text: str) -> dict:
@@ -94,10 +103,12 @@ def load_schema(tdir: Path) -> dict | None:
     except Exception as e:  # noqa: BLE001
         report("fail", f"schema.json 不是合法 JSON Schema: {e}")
     props = schema.get("properties") or {}
-    if RESERVED_DATA_KEY in props:
-        report("fail", f"schema.json properties 声明了工程保留键 '{RESERVED_DATA_KEY}'")
+    if ENGINE_METRICS_KEY in props:
+        report("fail", f"schema.json properties 声明了工程保留键 '{ENGINE_METRICS_KEY}'")
     else:
-        report("pass", f"schema.json properties 未占用保留键 '{RESERVED_DATA_KEY}'")
+        report("pass", f"schema.json properties 未占用保留键 '{ENGINE_METRICS_KEY}'")
+    if LEGACY_METRICS_KEY in props:
+        report("pass", f"schema 声明了 {LEGACY_METRICS_KEY}：该键归 LLM 填充，工程注入走 {ENGINE_METRICS_KEY} 且不覆盖它")
     return schema
 
 
@@ -121,7 +132,8 @@ def check_template(tdir: Path, schema: dict | None) -> str | None:
 
     # JS 顶层字段读取 与 schema properties 一致性静态检查
     if schema is not None:
-        declared = set((schema.get("properties") or {}).keys()) | {RESERVED_DATA_KEY}
+        engine_keys = engineering_keys(schema)
+        declared = set((schema.get("properties") or {}).keys()) | engine_keys
         accessed: set[str] = set()
         for alias in ALIAS_RE.findall(html):
             accessed.update(re.findall(rf"\b{re.escape(alias)}\.(\w+)", html))
@@ -132,8 +144,8 @@ def check_template(tdir: Path, schema: dict | None) -> str | None:
         if unknown:
             report("fail", f"template.html 读取了 schema 未声明的顶层字段: {', '.join(unknown)}")
         else:
-            report("pass", f"template.html 读取的顶层字段（{len(accessed)} 个）均在 schema 中声明或为 metrics")
-        unused = sorted(declared - accessed - {RESERVED_DATA_KEY})
+            report("pass", f"template.html 读取的顶层字段（{len(accessed)} 个）均在 schema 中声明或为工程注入键")
+        unused = sorted(declared - accessed - engine_keys)
         if unused:
             report("warn", f"schema 声明但 template.html 未读取的字段: {', '.join(unused)}")
     return html
@@ -220,10 +232,10 @@ def check_sample(tdir: Path, schema: dict | None) -> None:
     try:
         import jsonschema
 
-        # sample 含工程注入的 metrics 键，校验前剔除
-        llm_part = {k: v for k, v in sample.items() if k != RESERVED_DATA_KEY}
+        # sample 含工程注入键，校验前剔除（schema 声明的 metrics 属 LLM 契约，保留参与校验）
+        llm_part = {k: v for k, v in sample.items() if k not in engineering_keys(schema)}
         jsonschema.validate(instance=llm_part, schema=schema)
-        report("pass", "sample_data.json（剔除 metrics 后）通过 schema 校验")
+        report("pass", "sample_data.json（剔除工程注入键后）通过 schema 校验")
     except ImportError:
         report("warn", "本机未装 jsonschema，跳过 sample_data 校验")
     except Exception as e:  # noqa: BLE001

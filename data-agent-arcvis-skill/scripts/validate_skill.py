@@ -67,7 +67,8 @@ GATE_CORE_KEYS = {"id", "type", "title", "check", "severity"}
 CONTRACT_KNOWN_KEYS = {"contract_version", "gates", "metrics_deps", "deliverables", "depends_on"}
 
 WEB_REPORT_REQUIRED_FILES = ("manifest.toml", "schema.json", "template.html")
-SCHEMA_RESERVED_KEYS = {"metrics"}
+# 工程保留键不参与 fill_guide 来源标注；metrics 可声明为 LLM 填充字段，按普通字段要求标注
+SCHEMA_RESERVED_KEYS = {"__jarvis_metrics__"}
 
 
 @dataclass

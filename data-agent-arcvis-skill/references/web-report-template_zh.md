@@ -94,14 +94,15 @@
 4. **写消费 JS**：统一从别名读数，便于静态校验：
    ```javascript
    var D = window.__RT_DATA__ || {};
-   var M = D.metrics || {};
+   var M = D.__jarvis_metrics__ || D.metrics || {};
    ```
+   - `__jarvis_metrics__` 是工程注入 metrics 的命名空间新键（恒写）；`metrics` 是兼容旧键，仅当 schema 未声明 `metrics` 时由工程双写。新模板优先读新键；
    - 图表在 `window load` 后初始化（规避容器宽度 0 的时序竞争），并注册 resize；
    - 每个数据源缺失时降级为占位卡片（"数据暂不可用"），**页面不空白、不抛错**；
    - 每个渲染函数用 try/catch 包裹，单点失败不影响其他模块。
-5. **写 schema.json**：只声明 LLM 填充字段；`properties` **不得出现 `metrics` 键**；大表 / 明细字段优先标记直读（见第四节）。
+5. **写 schema.json**：只声明 LLM 填充字段；`properties` **不得出现工程保留键 `__jarvis_metrics__`**；`metrics` 可以声明为 LLM 填充字段（声明后工程不覆盖该键，工程注入数据改经 `__jarvis_metrics__` 读取）；大表 / 明细字段优先标记直读（见第四节）。
 6. **写 fill_guide.md**：逐字段说明数据来源（分析上下文中的哪类结果）、格式示例、禁止事项，并标注来源 objective；直读字段追加直读记号与列对照（记号见第五节，联动见第七节）。
-7. **做 sample_data.json**：把成品 HTML 里的硬编码值抄回来当样例（含手工 mock 的 `metrics` 键；直读字段按 resolve 后的平铺形态给样例），用于 preview 回归对比。
+7. **做 sample_data.json**：把成品 HTML 里的硬编码值抄回来当样例（含手工 mock 的工程注入键 `__jarvis_metrics__`，schema 未声明 `metrics` 时也可含旧键 `metrics`；直读字段按 resolve 后的平铺形态给样例），用于 preview 回归对比。
 8. **两道审查**（见第八、九节）：结构校验 + 语义 review 全部 pass、浏览器确认视觉一致后才算完成。
 
 ## 四、$read 程序直读（模板侧契约）
@@ -223,8 +224,8 @@ description = "模板描述"        # 建议填写；数据源待补齐等交付
   // —— 以下由 LLM 按 schema.json 填充（直读字段输出 $read 指令，程序 resolve 后注入）——
   "title": "...",
   "summary": "...",
-  // —— 以下由工程注入，schema.json 不得声明 ——
-  "metrics": {
+  // —— 以下由工程注入：新键恒写，schema.json 不得声明 ——
+  "__jarvis_metrics__": {
     "metric_name_1": {
       "sql": "...",
       "columns": ["列1", "列2"],
@@ -232,11 +233,14 @@ description = "模板描述"        # 建议填写；数据源待补齐等交付
       "data_preview": "...",
       "description": "..."
     }
-  }
+  },
+  // —— 兼容旧键：仅当 schema.json properties 未声明 "metrics" 时工程双写，结构与新键一致；
+  //    声明了 "metrics" 时该键归 LLM 填充，工程不覆盖 ——
+  "metrics": { }
 }
 ```
 
-- 纯 BI 模板（无 LLM 填充）：schema `properties` 留空 `{}`，运行期跳过 LLM，template.html 只消费 `data.metrics`；
+- 纯 BI 模板（无 LLM 填充）：schema `properties` 留空 `{}`，运行期跳过 LLM，template.html 消费 `data.metrics`（旧键双写）或 `data.__jarvis_metrics__`；
 - 可选标记：`<jarvis-metric name="xxx" layout="table" title="标题">` 引用 metrics 数据由工程渲染；`{{current_time}}` 运行期替换为当前时间。
 
 ### 6.3 schema.json / fill_guide.md 编写要点
@@ -363,7 +367,7 @@ python scripts/validate_template.py <模板包目录>
 python scripts/preview_template.py <模板包目录>
 ```
 
-校验器覆盖：manifest 必填、schema 合法性与保留键、注入点唯一、`__RT_DATA__` 桥接、JS 字段与 schema 一致性静态检查、`x-direct-read-allowed` 标记合法性、jarvis-metric 交叉核对、metrics.jsonl 行合法性、fill_guide 字段覆盖度、sample_data 与 schema 的符合性（若本机装有 jsonschema）。Python < 3.11 时 manifest 校验自动降级为正则解析（会有 warn 提示）。
+校验器覆盖：manifest 必填、schema 合法性与保留键 `__jarvis_metrics__`（允许声明 `metrics`，归 LLM 填充）、注入点唯一、`__RT_DATA__` 桥接、JS 字段与 schema 一致性静态检查、`x-direct-read-allowed` 标记合法性、jarvis-metric 交叉核对、metrics.jsonl 行合法性、fill_guide 字段覆盖度、sample_data 与 schema 的符合性（若本机装有 jsonschema）。Python < 3.11 时 manifest 校验自动降级为正则解析（会有 warn 提示）。
 
 技能包整体校验（validate_skill.py）会对 report/web_report/ 下每个主题自动调用 validate_template.py，并额外校验第七节的联动契约（R1/R2/R4）。
 
@@ -380,9 +384,9 @@ python scripts/preview_template.py <模板包目录>
 用户环境无 python3 或无法执行脚本时，由 AI **通读模板包文件**，逐项核对以下清单并逐条向用户汇报结论：
 
 - [ ] manifest.toml 含 `report_schema = "standalone"` 与 `schema_version`
-- [ ] schema.json 是合法 JSON，`properties` 不含 `"metrics"` 键
+- [ ] schema.json 是合法 JSON，`properties` 不含工程保留键 `"__jarvis_metrics__"`（`"metrics"` 可声明，归 LLM 填充）
 - [ ] template.html 中注入占位符字面量**恰好出现 1 次**（含注释），且形如 `window.__RT_DATA__ = <占位符>;` 处于 JS 表达式位置
-- [ ] JS 读取的每个 `data.字段` 都在 schema properties 声明（或为 `metrics`）
+- [ ] JS 读取的每个 `data.字段` 都在 schema properties 声明（或为工程注入键 `__jarvis_metrics__` / 未声明时的 `metrics`）
 - [ ] `x-direct-read-allowed` 标记的 orient 取值合法（records/columns/matrix）、column_map 为字符串映射
 - [ ] `<jarvis-metric name>` 均在 metrics.jsonl 有定义；metrics.jsonl 每行合法且 name 唯一
 - [ ] fill_guide.md 覆盖全部 schema 字段
@@ -399,14 +403,14 @@ python scripts/preview_template.py <模板包目录>
 | # | 约束 |
 |---|------|
 | 1 | manifest.toml 可解析且 `report_schema = "standalone"` |
-| 2 | schema.json 是合法 JSON，`properties` 不含保留键 `"metrics"` |
+| 2 | schema.json 是合法 JSON，`properties` 不含工程保留键 `"__jarvis_metrics__"`（`"metrics"` 可声明，归 LLM 填充，工程不覆盖） |
 | 3 | template.html 中 `__REPORT_DATA__` 字面量**恰好 1 次**（按字符串计数，注释里出现也算），且处于 JS 表达式位置 |
 
 ### 软约束（加载不查，靠校验器和自觉，违反则运行期空白/报错）
 
 | # | 约束 | 违反后果 |
 |---|------|----------|
-| 1 | JS 读取的 `data.字段` 必须在 schema properties 声明（或为 `metrics`） | 渲染时 undefined |
+| 1 | JS 读取的 `data.字段` 必须在 schema properties 声明（或为工程注入键 `__jarvis_metrics__` / 未声明时的 `metrics`） | 渲染时 undefined |
 | 2 | `<jarvis-metric name>` 引用需在 metrics.jsonl 定义 | 显示占位卡片 |
 | 3 | metrics.jsonl 每行合法 JSON 且 name 唯一 | 非法行跳过、重名保留首个 |
 | 4 | fill_guide.md 覆盖全部 schema 字段 | 填充质量不可控 |

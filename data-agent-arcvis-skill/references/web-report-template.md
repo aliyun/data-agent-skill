@@ -98,14 +98,15 @@ Decision principles:
 4. **Write the consuming JS**: read uniformly from an alias for static-check friendliness:
    ```javascript
    var D = window.__RT_DATA__ || {};
-   var M = D.metrics || {};
+   var M = D.__jarvis_metrics__ || D.metrics || {};
    ```
+   - `__jarvis_metrics__` is the namespaced engineering-injected metrics key (always written); `metrics` is the legacy compatibility key, dual-written by engineering only when the schema does not declare `metrics`. New templates should prefer the new key;
    - initialize charts after `window load` (avoids the zero-width container timing race) and register resize;
    - degrade each missing data source to a placeholder card ("data unavailable") — **the page never blanks out or throws**;
    - wrap every render function in try/catch so a single point of failure doesn't take out other modules.
-5. **Write schema.json**: declare only LLM-filled fields; `properties` **must not contain a `metrics` key**; prefer marking large-table / detail fields as direct-read (section 4).
+5. **Write schema.json**: declare only LLM-filled fields; `properties` **must not contain the engineering reserved key `__jarvis_metrics__`**; `metrics` may be declared as an LLM-filled field (once declared, engineering never overwrites it and engineering data is read via `__jarvis_metrics__` instead); prefer marking large-table / detail fields as direct-read (section 4).
 6. **Write fill_guide.md**: per field, state the data source (which kind of result in the analysis context), format examples, prohibitions, and the source objective; direct-read fields add the direct-read mark and column mapping (mark format in section 5, linkage in section 7).
-7. **Make sample_data.json**: copy the hard-coded values from the finished HTML back as samples (including a hand-mocked `metrics` key; direct-read fields as the post-resolve flattened shape) for preview regression comparison.
+7. **Make sample_data.json**: copy the hard-coded values from the finished HTML back as samples (including a hand-mocked engineering key `__jarvis_metrics__`, and the legacy `metrics` key when the schema does not declare it; direct-read fields as the post-resolve flattened shape) for preview regression comparison.
 8. **Two reviews** (sections 8 and 9): structural validation + semantic review all pass, and the browser confirms visual fidelity — only then is it done.
 
 ## 4. $read Program Direct-Read (template-side contract)
@@ -229,8 +230,9 @@ description = "template description"  # recommended; delivery notes such as pend
   //    instructions; the program resolves and injects) ——
   "title": "...",
   "summary": "...",
-  // —— injected by engineering; schema.json must not declare it ——
-  "metrics": {
+  // —— injected by engineering: the namespaced key is always written;
+  //    schema.json must not declare it ——
+  "__jarvis_metrics__": {
     "metric_name_1": {
       "sql": "...",
       "columns": ["col1", "col2"],
@@ -238,11 +240,15 @@ description = "template description"  # recommended; delivery notes such as pend
       "data_preview": "...",
       "description": "..."
     }
-  }
+  },
+  // —— legacy compatibility key: dual-written by engineering only when schema.json
+  //    properties does not declare "metrics" (same shape as the new key); when
+  //    declared, "metrics" belongs to LLM filling and engineering never overwrites it ——
+  "metrics": { }
 }
 ```
 
-- pure BI templates (no LLM filling): leave schema `properties` as `{}`; runtime skips the LLM and template.html consumes only `data.metrics`;
+- pure BI templates (no LLM filling): leave schema `properties` as `{}`; runtime skips the LLM and template.html consumes `data.metrics` (legacy dual-write) or `data.__jarvis_metrics__`;
 - optional markers: `<jarvis-metric name="xxx" layout="table" title="Title">` references metrics data rendered by engineering; `{{current_time}}` is replaced with the current time at runtime.
 
 ### 6.3 schema.json / fill_guide.md Essentials
@@ -369,7 +375,7 @@ python scripts/validate_template.py <template-package-directory>
 python scripts/preview_template.py <template-package-directory>
 ```
 
-The validator covers: manifest required keys, schema validity and the reserved key, unique injection point, the `__RT_DATA__` bridge, static checking of JS fields against schema, legality of `x-direct-read-allowed` markers, jarvis-metric cross-checks, metrics.jsonl line legality, fill_guide field coverage, and sample_data conformance to schema (when jsonschema is installed). On Python < 3.11, manifest validation automatically degrades to regex parsing (with a warn).
+The validator covers: manifest required keys, schema validity and the reserved key `__jarvis_metrics__` (declaring `metrics` is allowed — it belongs to LLM filling), unique injection point, the `__RT_DATA__` bridge, static checking of JS fields against schema, legality of `x-direct-read-allowed` markers, jarvis-metric cross-checks, metrics.jsonl line legality, fill_guide field coverage, and sample_data conformance to schema (when jsonschema is installed). On Python < 3.11, manifest validation automatically degrades to regex parsing (with a warn).
 
 Whole-skill validation (validate_skill.py) automatically invokes validate_template.py for every theme under report/web_report/ and additionally validates the section 7 linkage contracts (R1/R2/R4).
 
@@ -386,9 +392,9 @@ Whole-skill validation (validate_skill.py) automatically invokes validate_templa
 When the user's environment has no python3 or cannot run scripts, the AI **reads through the template package files**, checks the following list item by item, and reports conclusions to the user line by line:
 
 - [ ] manifest.toml contains `report_schema = "standalone"` and `schema_version`
-- [ ] schema.json is valid JSON and `properties` contains no `"metrics"` key
+- [ ] schema.json is valid JSON and `properties` contains no engineering reserved key `"__jarvis_metrics__"` (`"metrics"` may be declared — it belongs to LLM filling)
 - [ ] the injection placeholder literal appears **exactly once** in template.html (comments included), shaped like `window.__RT_DATA__ = <placeholder>;` in a JS expression position
-- [ ] every `data.field` read by JS is declared in schema properties (or is `metrics`)
+- [ ] every `data.field` read by JS is declared in schema properties (or is an engineering key: `__jarvis_metrics__` / `metrics` when undeclared)
 - [ ] `x-direct-read-allowed` markers have legal orient values (records/columns/matrix) and column_map is a string mapping
 - [ ] every `<jarvis-metric name>` is defined in metrics.jsonl; every metrics.jsonl line is valid with a unique name
 - [ ] fill_guide.md covers all schema fields
@@ -405,14 +411,14 @@ Preview likewise: when `preview_template.py` cannot run, the AI may hand-seriali
 | # | Constraint |
 |---|------|
 | 1 | manifest.toml parses and `report_schema = "standalone"` |
-| 2 | schema.json is valid JSON and `properties` contains no reserved key `"metrics"` |
+| 2 | schema.json is valid JSON and `properties` contains no engineering reserved key `"__jarvis_metrics__"` (`"metrics"` may be declared — LLM-filled, never overwritten by engineering) |
 | 3 | the `__REPORT_DATA__` literal appears **exactly once** in template.html (string count, comments included), in a JS expression position |
 
 ### Soft Constraints (unchecked at load; rely on the validator and discipline — violation means runtime blanks/errors)
 
 | # | Constraint | Consequence of violation |
 |---|------|----------|
-| 1 | every `data.field` read by JS is declared in schema properties (or is `metrics`) | undefined at render |
+| 1 | every `data.field` read by JS is declared in schema properties (or is an engineering key: `__jarvis_metrics__` / `metrics` when undeclared) | undefined at render |
 | 2 | `<jarvis-metric name>` references must be defined in metrics.jsonl | placeholder card shown |
 | 3 | every metrics.jsonl line is valid JSON with a unique name | invalid lines skipped; duplicates keep the first |
 | 4 | fill_guide.md covers all schema fields | fill quality uncontrolled |
