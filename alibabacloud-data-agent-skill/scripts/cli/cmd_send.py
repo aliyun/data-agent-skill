@@ -43,6 +43,11 @@ def _print_send_result(resp: dict) -> bool:
     print("  Message accepted.")
     if request_id:
         print(f"  RequestId: {request_id}")
+    data = resp.get("data") or {}
+    if data.get("messageId"):
+        print(f"  Message ID: {data['messageId']}")
+    if data.get("status"):
+        print(f"  Acceptance: {data['status']}")
     return True
 
 

@@ -22,6 +22,29 @@ def pascal_to_camel_case(s: str) -> str:
     return s[0].lower() + s[1:] if len(s) > 1 else s.lower()
 
 
+def snake_to_camel_case(s: str) -> str:
+    """Convert snake_case string to camelCase (other shapes pass through)."""
+    parts = s.split("_")
+    return parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])
+
+
+def convert_snake_keys_to_camel(obj: Any) -> Any:
+    """Recursively convert snake_case dictionary keys to camelCase.
+
+    Used by the custom-header profile, whose response envelope is
+    snake_case; keys already in camelCase are unchanged.
+    """
+    if isinstance(obj, dict):
+        return {
+            (snake_to_camel_case(key) if isinstance(key, str) else key):
+                convert_snake_keys_to_camel(value)
+            for key, value in obj.items()
+        }
+    if isinstance(obj, list):
+        return [convert_snake_keys_to_camel(item) for item in obj]
+    return obj
+
+
 def convert_keys_to_pascal(obj: Any, exclude_paths: list = None) -> Any:
     """Recursively convert all dictionary keys to PascalCase.
 

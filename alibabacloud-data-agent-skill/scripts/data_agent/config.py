@@ -28,6 +28,15 @@ def _none_if_blank(value: Optional[str]) -> Optional[str]:
     return value or None
 
 
+def _normalize_custom_headers(headers: dict) -> Optional[dict]:
+    """Coerce header names/values to stripped strings, drop blanks."""
+    return {
+        str(name).strip(): str(value).strip()
+        for name, value in headers.items()
+        if _none_if_blank(name) and _none_if_blank(value)
+    } or None
+
+
 def _load_credentials_entry(
     credentials_file: Optional[str],
     env_name: str,
@@ -107,6 +116,19 @@ class DataAgentConfig:
 
     Attributes:
         api_key: API Key for alternative authentication (optional)
+        custom_headers: Extra authentication headers for the header-auth
+            channel (optional, mapping of header name to value). When set,
+            every request is posted to the per-action endpoint configured
+            in ``action_endpoints`` with these headers attached. Takes
+            precedence over api_key and AK/SK. Values are secrets: never
+            logged or exported.
+        action_endpoints: Per-action endpoints for the header-auth channel
+            (optional, mapping of API action name to full request URL). An
+            action with an entry is posted to that URL verbatim. In API_KEY
+            mode entries override the built-in endpoint routing; in
+            custom-header auth (``custom_headers`` set) they are the only
+            endpoint source — every action needs an entry, and the config
+            fails fast without one.
         region: Region for DMS endpoint (default: cn-hangzhou)
         endpoint: Custom endpoint (auto-generated if not set)
         timeout: API timeout in seconds (default: 300)
@@ -145,6 +167,8 @@ class DataAgentConfig:
     """
 
     api_key: Optional[str] = None
+    custom_headers: Optional[dict] = None
+    action_endpoints: Optional[dict] = None
     region: str = "cn-hangzhou"
     endpoint: Optional[str] = None
     timeout: int = 300
@@ -168,6 +192,12 @@ class DataAgentConfig:
         self.dms_enterprise_endpoint = _none_if_blank(self.dms_enterprise_endpoint)
         self.stream_endpoint = _none_if_blank(self.stream_endpoint)
         self.credentials_file = _none_if_blank(self.credentials_file)
+        if self.custom_headers is not None:
+            if not isinstance(self.custom_headers, dict):
+                raise ConfigurationError(
+                    "custom_headers must be a mapping of header name to value."
+                )
+            self.custom_headers = _normalize_custom_headers(self.custom_headers)
 
         # Resolve the credentials-file entry before endpoint derivation: an
         # entry carrying "api_key" switches this config into API_KEY mode.
@@ -185,16 +215,49 @@ class DataAgentConfig:
         )
         if not self.api_key and entry_api_key:
             self.api_key = entry_api_key
-        if self._credentials_entry and not entry_api_key:
+        raw_entry_headers = (self._credentials_entry or {}).get("custom_headers")
+        entry_custom_headers = (
+            _normalize_custom_headers(raw_entry_headers)
+            if isinstance(raw_entry_headers, dict) else None
+        )
+        if not self.custom_headers and entry_custom_headers:
+            self.custom_headers = entry_custom_headers
+        if self._credentials_entry and not entry_api_key and not entry_custom_headers:
             for required in ("access_key_id", "access_key_secret"):
                 if not _none_if_blank(self._credentials_entry.get(required)):
                     raise ConfigurationError(
                         f"Credentials profile '{self.credentials_env}/"
-                        f"{self.credentials_profile}' must provide either 'api_key' "
-                        f"or both 'access_key_id' and 'access_key_secret'."
+                        f"{self.credentials_profile}' must provide 'custom_headers', "
+                        f"'api_key', or both 'access_key_id' and 'access_key_secret'."
                     )
+        entry_action_endpoints = (self._credentials_entry or {}).get("action_endpoints")
+        if not self.action_endpoints and isinstance(entry_action_endpoints, dict) and entry_action_endpoints:
+            self.action_endpoints = dict(entry_action_endpoints)
+        if self.action_endpoints is not None:
+            if not isinstance(self.action_endpoints, dict):
+                raise ConfigurationError(
+                    "action_endpoints must be a mapping of action name to endpoint URL."
+                )
+            normalized = {}
+            for name, value in self.action_endpoints.items():
+                if not _none_if_blank(name) or not _none_if_blank(value):
+                    continue
+                url = str(value).strip()
+                if "://" not in url:
+                    url = "http://" + url
+                normalized[str(name).strip()] = url.rstrip("/")
+            self.action_endpoints = normalized or None
 
-        if not self.endpoint:
+        if self.custom_headers:
+            # Custom-header auth has no built-in endpoints: every action is
+            # posted to the URL configured for it in action_endpoints.
+            if not self.action_endpoints:
+                raise ConfigurationError(
+                    "custom_headers auth requires action_endpoints "
+                    "(DATA_AGENT_ACTION_ENDPOINTS) mapping each action to "
+                    "its endpoint URL."
+                )
+        elif not self.endpoint:
             if self.api_key:
                 # For API key auth, use the dataagent domain format with /apikey suffix
                 self.endpoint = f"dataagent-{self.region}.aliyuncs.com/apikey"
@@ -299,8 +362,30 @@ class DataAgentConfig:
         else:
             load_dotenv()
 
+        custom_headers = None
+        raw_headers = os.environ.get("DATA_AGENT_CUSTOM_HEADERS")
+        if raw_headers and raw_headers.strip():
+            try:
+                custom_headers = json.loads(raw_headers)
+            except json.JSONDecodeError as e:
+                raise ConfigurationError(
+                    f"DATA_AGENT_CUSTOM_HEADERS is not valid JSON: {e}"
+                )
+
+        action_endpoints = None
+        raw_action_endpoints = os.environ.get("DATA_AGENT_ACTION_ENDPOINTS")
+        if raw_action_endpoints and raw_action_endpoints.strip():
+            try:
+                action_endpoints = json.loads(raw_action_endpoints)
+            except json.JSONDecodeError as e:
+                raise ConfigurationError(
+                    f"DATA_AGENT_ACTION_ENDPOINTS is not valid JSON: {e}"
+                )
+
         return cls(
             api_key=os.environ.get("DATA_AGENT_API_KEY") or None,
+            custom_headers=custom_headers,
+            action_endpoints=action_endpoints,
             region=os.environ.get("DATA_AGENT_REGION", "cn-hangzhou"),
             endpoint=os.environ.get("DATA_AGENT_ENDPOINT"),
             timeout=int(os.environ.get("DATA_AGENT_TIMEOUT", "300")),
@@ -333,6 +418,8 @@ class DataAgentConfig:
         """
         return cls(
             api_key=config_dict.get("api_key"),
+            custom_headers=config_dict.get("custom_headers"),
+            action_endpoints=config_dict.get("action_endpoints"),
             region=config_dict.get("region", "cn-hangzhou"),
             endpoint=config_dict.get("endpoint"),
             timeout=config_dict.get("timeout", 300),
@@ -373,6 +460,8 @@ class DataAgentConfig:
             result["dms_enterprise_endpoint"] = self.dms_enterprise_endpoint
         if self.stream_endpoint:
             result["stream_endpoint"] = self.stream_endpoint
+        if self.action_endpoints:
+            result["action_endpoints"] = self.action_endpoints
         if self.credentials_file:
             result["credentials_file"] = self.credentials_file
         if self.credentials_env != "default":
@@ -380,7 +469,9 @@ class DataAgentConfig:
         if self.credentials_profile != "default":
             result["credentials_profile"] = self.credentials_profile
         # Only indicate auth type
-        if self.api_key:
+        if self.custom_headers:
+            result["auth_type"] = "custom_headers"
+        elif self.api_key:
             result["auth_type"] = "api_key"
         elif self._credentials_entry:
             result["auth_type"] = "credential_file"
